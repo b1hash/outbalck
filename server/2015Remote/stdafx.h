@@ -7,6 +7,10 @@
 
 #define USING_ZSTD 1
 
+// 是否使用 Opus 音频压缩 (需要 opus 库)
+// 设为 1 启用 Opus 解码，设为 0 仅支持 PCM
+#define USING_OPUS 1
+
 #ifndef _SECURE_ATL
 #define _SECURE_ATL 1
 #endif
@@ -96,6 +100,7 @@
 #define WM_UPDATE_ACTIVEWND				WM_USER+3030
 #define WM_SHOWNOTIFY					WM_USER+3031
 #define WM_DISCONNECT					WM_USER+3032
+#define WM_OPENTERMINALDIALOG			WM_USER+3033
 
 #ifdef _UNICODE
 #if defined _M_IX86

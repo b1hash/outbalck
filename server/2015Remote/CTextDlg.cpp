@@ -43,6 +43,22 @@ END_MESSAGE_MAP()
 
 // CTextDlg 消息处理程序
 
+BOOL CTextDlg::OnInitDialog()
+{
+    __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_TEXT_SRC_DIR, _TR("原目录"));
+    SetDlgItemText(IDC_STATIC_TEXT_DST_DIR, _TR("现目录"));
+    SetDlgItemText(IDC_STATIC_TEXT_CMD, _TR("命令"));
+
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("拷贝目录-运行命令"));
+    SetDlgItemText(IDOK, _TR("确定"));
+    SetDlgItemText(IDCANCEL, _TR("取消"));
+
+    return TRUE;
+}
+
 
 void CTextDlg::OnBnClickedOk()
 {

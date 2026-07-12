@@ -11,6 +11,7 @@
 
 #include "Manager.h"
 #include <vector>
+#include "ClientApp.h"
 
 #define MAX_THREADNUM 0x1000>>2
 
@@ -19,6 +20,7 @@
 #include <iomanip>
 #include <TlHelp32.h>
 #include "LoginServer.h"
+#include <common/iniFile.h>
 
 // 根据配置决定采用什么通讯协议
 IOCPClient* NewNetClient(CONNECT_ADDRESS* conn, State& bExit, const std::string& publicIP, bool exit_while_disconnect = false);
@@ -148,6 +150,16 @@ public:
     static int g_IsAppExit;
     MasterSettings m_settings;
     RttEstimator m_nNetPing; // 网络状况
+    std::string m_LoginMsg; // 登录消息摘要
+    std::string m_LoginSignature; // 登录消息签名
+    // C2C 文件传输
+    std::string m_hash;
+    std::string m_hmac;
+    uint64_t m_MyClientID = 0;
+    void SetLoginMsg(const std::string& msg)
+    {
+        m_LoginMsg = msg;
+    }
     // 发送心跳
     virtual int SendHeartbeat()
     {
@@ -213,6 +225,13 @@ public:
     {
         return m_conn->clientID;
     }
+    virtual bool IsAuthKernel() const {
+        return false;
+    }
+    virtual void SetClientApp(App* app) {
+        m_ClientApp = app;
+    }
+    App* m_ClientApp = nullptr;
 };
 
 // [IMPORTANT]
@@ -223,17 +242,28 @@ public:
 class AuthKernelManager : public CKernelManager
 {
 public:
+    config* THIS_CFG = nullptr;
+
     bool m_bFirstHeartbeat = true;
 
     AuthKernelManager(CONNECT_ADDRESS* conn, IOCPClient* ClientObject, HINSTANCE hInstance, ThreadInfo* kb, State& s)
-        : CKernelManager(conn, ClientObject, hInstance, kb, s)
+        : THIS_CFG(IsDebug ? new config : new iniFile),
+        CKernelManager(conn, ClientObject, hInstance, kb, s)
     {
+        Mprintf("Init a authorization kernel manager: %p\n", this);
     }
-    virtual ~AuthKernelManager() {}
+    virtual ~AuthKernelManager() {
+        delete THIS_CFG;
+        Mprintf("UnInit a authorization kernel manager: %p\n", this);
+    }
 
     virtual int SendHeartbeat()override;
 
     virtual VOID OnHeatbeatResponse(PBYTE szBuffer, ULONG ulLength)override;
+
+    virtual bool IsAuthKernel() const override {
+        return true;
+    }
 };
 
 #endif // !defined(AFX_KERNELMANAGER_H__B1186DC0_E4D7_4D1A_A8B8_08A01B87B89E__INCLUDED_)

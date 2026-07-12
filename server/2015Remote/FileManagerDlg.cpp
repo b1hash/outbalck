@@ -7,6 +7,8 @@
 #include "FileTransferModeDlg.h"
 #include "InputDlg.h"
 #include "ZstdArchive.h"
+#include "2015RemoteDlg.h"
+#include <Shlobj.h>
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -61,6 +63,17 @@ CFileManagerDlg::CFileManagerDlg(CWnd* pParent, Server* pIOCPServer, ClientConte
     m_nCounter = 0;
 
     m_bIsStop = false;
+    m_hRecvFile = INVALID_HANDLE_VALUE;
+    m_bSearching = false;
+    m_bSearchStopped = false;
+    m_nSearchResultCount = 0;
+    m_dwSearchStartTime = 0;
+
+    m_bLocalSearching = false;
+    m_bLocalSearchStopped = false;
+    m_nLocalSearchResultCount = 0;
+    m_dwLocalSearchStartTime = 0;
+    m_hLocalSearchThread = NULL;
 }
 
 
@@ -110,6 +123,8 @@ BEGIN_MESSAGE_MAP(CFileManagerDlg, CDialog)
     ON_UPDATE_COMMAND_UI(IDT_REMOTE_NEWFOLDER, OnUpdateRemoteNewfolder)
     ON_UPDATE_COMMAND_UI(IDT_LOCAL_DELETE, OnUpdateLocalDelete)
     ON_UPDATE_COMMAND_UI(IDT_LOCAL_NEWFOLDER, OnUpdateLocalNewfolder)
+    ON_UPDATE_COMMAND_UI(IDT_LOCAL_SEARCH, OnUpdateLocalSearch)
+    ON_UPDATE_COMMAND_UI(IDT_REMOTE_SEARCH, OnUpdateRemoteSearch)
     ON_COMMAND(IDT_REMOTE_COPY, OnRemoteCopy)
     ON_COMMAND(IDT_LOCAL_COPY, OnLocalCopy)
     ON_COMMAND(IDT_LOCAL_DELETE, OnLocalDelete)
@@ -118,6 +133,14 @@ BEGIN_MESSAGE_MAP(CFileManagerDlg, CDialog)
     ON_COMMAND(IDT_LOCAL_STOP, OnLocalStop)
     ON_COMMAND(IDT_LOCAL_NEWFOLDER, OnLocalNewfolder)
     ON_COMMAND(IDT_REMOTE_NEWFOLDER, OnRemoteNewfolder)
+    ON_COMMAND(IDT_LOCAL_DESKTOP, OnLocalDesktop)
+    ON_COMMAND(IDT_LOCAL_DOWNLOADS, OnLocalDownloads)
+    ON_COMMAND(IDT_LOCAL_HOME, OnLocalHome)
+    ON_COMMAND(IDT_LOCAL_SEARCH, OnLocalSearch)
+    ON_COMMAND(IDT_REMOTE_DESKTOP, OnRemoteDesktop)
+    ON_COMMAND(IDT_REMOTE_DOWNLOADS, OnRemoteDownloads)
+    ON_COMMAND(IDT_REMOTE_HOME, OnRemoteHome)
+    ON_COMMAND(IDT_REMOTE_SEARCH, OnRemoteSearch)
     ON_COMMAND(IDM_TRANSFER, OnTransfer)
     ON_COMMAND(IDM_RENAME, OnRename)
     ON_NOTIFY(LVN_ENDLABELEDIT, IDC_LIST_LOCAL, OnEndlabeleditListLocal)
@@ -131,9 +154,13 @@ BEGIN_MESSAGE_MAP(CFileManagerDlg, CDialog)
     ON_NOTIFY(NM_RCLICK, IDC_LIST_LOCAL, OnRclickListLocal)
     ON_NOTIFY(NM_RCLICK, IDC_LIST_REMOTE, OnRclickListRemote)
     ON_MESSAGE(WM_MY_MESSAGE, OnMyMessage)
+    ON_MESSAGE(WM_LOCAL_SEARCH_DONE, OnLocalSearchDone)
+    ON_MESSAGE(WM_LOCAL_SEARCH_PROGRESS, OnLocalSearchProgress)
     //}}AFX_MSG_MAP
     ON_COMMAND(ID_FILEMANGER_COMPRESS, &CFileManagerDlg::OnFilemangerCompress)
     ON_COMMAND(ID_FILEMANGER_UNCOMPRESS, &CFileManagerDlg::OnFilemangerUncompress)
+    ON_COMMAND(IDM_TRANSFER_S, &CFileManagerDlg::OnTransferV2ToRemote)
+    ON_COMMAND(IDM_TRANSFER_R, &CFileManagerDlg::OnTransferV2ToLocal)
 END_MESSAGE_MAP()
 
 /////////////////////////////////////////////////////////////////////////////
@@ -172,6 +199,9 @@ int	GetIconIndex(LPCTSTR lpFileName, DWORD dwFileAttributes)
 BOOL CFileManagerDlg::OnInitDialog()
 {
     __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_LOCAL, _TR("本地"));
+    SetDlgItemText(IDC_STATIC_REMOTE, _TR("远程"));
 
     // TODO: Add extra initialization here
 
@@ -198,8 +228,8 @@ BOOL CFileManagerDlg::OnInitDialog()
     m_wndToolBar_Local.LoadTrueColorToolBar
     (
         24,    //加载真彩工具条
-        IDB_TOOLBAR,
-        IDB_TOOLBAR,
+        IDB_TOOLBAR_ENABLE,
+        IDB_TOOLBAR_ENABLE,
         IDB_TOOLBAR_DISABLE
     );
     // 添加下拉按钮
@@ -215,8 +245,8 @@ BOOL CFileManagerDlg::OnInitDialog()
     m_wndToolBar_Remote.LoadTrueColorToolBar
     (
         24,    //加载真彩工具条
-        IDB_TOOLBAR,
-        IDB_TOOLBAR,
+        IDB_TOOLBAR_ENABLE,
+        IDB_TOOLBAR_ENABLE,
         IDB_TOOLBAR_DISABLE
     );
     // 添加下拉按钮
@@ -305,6 +335,12 @@ void CFileManagerDlg::UpdateWindowsPos()
 
 void CFileManagerDlg::FixedLocalDriveList()
 {
+    // 停止正在进行的本地搜索
+    if (m_bLocalSearching) {
+        m_bLocalSearching = false;
+        m_bLocalSearchStopped = true;
+    }
+
     char	DriveString[256];
     char	*pDrive = NULL;
     m_list_local.DeleteAllItems();
@@ -371,6 +407,12 @@ void CFileManagerDlg::OnDblclkListLocal(NMHDR* pNMHDR, LRESULT* pResult)
 
 void CFileManagerDlg::FixedLocalFileList(CString directory)
 {
+    // 导航时停止正在进行的本地搜索
+    if (m_bLocalSearching) {
+        m_bLocalSearching = false;
+        m_bLocalSearchStopped = true;
+    }
+
     if (directory.GetLength() == 0) {
         int	nItem = m_list_local.GetSelectionMark();
 
@@ -900,6 +942,30 @@ void CFileManagerDlg::OnReceiveComplete()
         // 刷新远程文件列表
         GetRemoteFileList(".");
         break;
+    case TOKEN_SEARCH_FILE_LIST: // 搜索结果列表
+        if (m_bSearchStopped) break; // 已停止，丢弃在途数据
+        try {
+            FixedRemoteSearchFileList
+            (
+                m_ContextObject->m_DeCompressionBuffer.GetBuffer(0),
+                m_ContextObject->m_DeCompressionBuffer.GetBufferLen() - 1
+            );
+        } catch (...) {
+            Mprintf("[ERROR] Search list exception\n");
+        }
+        break;
+    case TOKEN_SEARCH_FILE_FINISH: // 搜索完成
+        if (m_bSearchStopped) {
+            m_bSearchStopped = false; // 收到结束标记，重置停止标志
+            break;
+        }
+        m_bSearching = false;
+        m_list_remote.EnableWindow(TRUE);
+        {
+            DWORD dwElapsed = (GetTickCount() - m_dwSearchStartTime) / 1000;
+            ShowMessage(_TRF("搜索 \"%s\" 在 %s 完成，共 %d 个结果 (耗时 %d秒)"), m_strSearchName, m_strSearchPath, m_nSearchResultCount, dwElapsed);
+        }
+        break;
     default:
         SendException();
         break;
@@ -908,6 +974,14 @@ void CFileManagerDlg::OnReceiveComplete()
 
 void CFileManagerDlg::GetRemoteFileList(CString directory)
 {
+    // 导航到目录时停止正在进行的远程搜索
+    if (m_bSearching) {
+        BYTE bStop = COMMAND_FILES_SEARCH_STOP;
+        m_ContextObject->Send2Client(&bStop, 1);
+        m_bSearching = false;
+        m_bSearchStopped = true; // 丢弃在途搜索数据
+    }
+
     if (directory.GetLength() == 0) {
         int	nItem = m_list_remote.GetSelectionMark();
 
@@ -1044,6 +1118,97 @@ void CFileManagerDlg::FixedRemoteFileList(BYTE *pbBuffer, DWORD dwBufferLen)
     ShowMessage(_TRF("远程：装载目录 %s 完成"), m_Remote_Path);
 }
 
+void CFileManagerDlg::FixedRemoteSearchFileList(BYTE *pbBuffer, DWORD dwBufferLen)
+{
+    // 第一批结果到达时，初始化搜索列表
+    if (!m_bSearching) {
+        m_bSearching = true;
+        m_nSearchResultCount = 0;
+        m_IconCache.clear();
+
+        // 预缓存文件夹图标
+        m_IconCache["*folder*"] = GetIconIndex(NULL, FILE_ATTRIBUTE_DIRECTORY);
+
+        // 重新设置ImageList
+        SHFILEINFO sfi = {};
+        HIMAGELIST hImageListLarge = (HIMAGELIST)SHGetFileInfo(NULL, 0, &sfi, sizeof(SHFILEINFO), SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
+        HIMAGELIST hImageListSmall = (HIMAGELIST)SHGetFileInfo(NULL, 0, &sfi, sizeof(SHFILEINFO), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+        ListView_SetImageList(m_list_remote.m_hWnd, hImageListLarge, LVSIL_NORMAL);
+        ListView_SetImageList(m_list_remote.m_hWnd, hImageListSmall, LVSIL_SMALL);
+
+        // 重建标题 (搜索模式: 名称、大小、修改日期、路径)
+        m_list_remote.DeleteAllItems();
+        while (m_list_remote.DeleteColumn(0) != 0);
+        m_list_remote.InsertColumnL(0, "名称",   LVCFMT_LEFT, 180);
+        m_list_remote.InsertColumnL(1, "大小",   LVCFMT_LEFT, 90);
+        m_list_remote.InsertColumnL(2, "修改日期", LVCFMT_LEFT, 115);
+        m_list_remote.InsertColumnL(3, "路径",   LVCFMT_LEFT, 220);
+    }
+
+    m_list_remote.SetRedraw(FALSE);
+
+    if (dwBufferLen != 0) {
+        char *pList = (char *)(pbBuffer + 1);
+        for (char *pBase = pList; pList - pBase < (int)(dwBufferLen - 1);) {
+            int nType = *pList ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+            char *pszFullPath = ++pList;
+
+            // 从完整路径中提取文件名
+            CString csFullPath(pszFullPath);
+            int nPos = csFullPath.ReverseFind('\\');
+            CString csFileName = (nPos >= 0) ? csFullPath.Right(csFullPath.GetLength() - nPos - 1) : csFullPath;
+            CString csDir = (nPos >= 0) ? csFullPath.Left(nPos) : "";
+
+            // 按扩展名缓存图标，避免重复调用SHGetFileInfo
+            int nIcon;
+            if (nType == FILE_ATTRIBUTE_DIRECTORY) {
+                nIcon = m_IconCache["*folder*"];
+            } else {
+                CString csExt;
+                int nDot = csFileName.ReverseFind('.');
+                csExt = (nDot >= 0) ? csFileName.Mid(nDot) : "*noext*";
+                csExt.MakeLower();
+                auto it = m_IconCache.find((LPCSTR)csExt);
+                if (it != m_IconCache.end()) {
+                    nIcon = it->second;
+                } else {
+                    nIcon = GetIconIndex((LPCSTR)csExt, nType);
+                    m_IconCache[(LPCSTR)csExt] = nIcon;
+                }
+            }
+
+            int nItem = m_list_remote.InsertItem(m_nSearchResultCount, csFileName, nIcon);
+            m_list_remote.SetItemData(nItem, nType == FILE_ATTRIBUTE_DIRECTORY);
+
+            pList += lstrlen(pszFullPath) + 1;
+
+            // 文件大小
+            DWORD dwFileSizeHigh = 0, dwFileSizeLow = 0;
+            memcpy(&dwFileSizeHigh, pList, 4);
+            memcpy(&dwFileSizeLow, pList + 4, 4);
+            CString strSize;
+            strSize.FormatL("%10d KB", (dwFileSizeHigh * (MAXDWORD + long long(1))) / 1024 + dwFileSizeLow / 1024 + (dwFileSizeLow % 1024 ? 1 : 0));
+            m_list_remote.SetItemText(nItem, 1, strSize);
+
+            // 修改日期
+            FILETIME ftLastWrite;
+            memcpy(&ftLastWrite, pList + 8, sizeof(FILETIME));
+            CTime time(ftLastWrite);
+            m_list_remote.SetItemText(nItem, 2, time.FormatL("%Y-%m-%d %H:%M"));
+
+            // 路径
+            m_list_remote.SetItemText(nItem, 3, csDir);
+
+            pList += 16;
+            m_nSearchResultCount++;
+        }
+    }
+
+    m_list_remote.SetRedraw(TRUE);
+    DWORD dwElapsed = (GetTickCount() - m_dwSearchStartTime) / 1000;
+    ShowMessage(_TRF("搜索 \"%s\" 在 %s ... 已找到 %d 个 (%d秒)"), m_strSearchName, m_strSearchPath, m_nSearchResultCount, dwElapsed);
+}
+
 void CFileManagerDlg::ShowMessage(const char *lpFmt, ...)
 {
     char *buff = new char[1024];
@@ -1070,6 +1235,363 @@ void CFileManagerDlg::OnRemotePrev()
 {
     // TODO: Add your command handler code here
     GetRemoteFileList("..");
+}
+
+void CFileManagerDlg::OnLocalDesktop()
+{
+    char path[MAX_PATH];
+    if (SHGetSpecialFolderPathA(m_hWnd, path, CSIDL_DESKTOPDIRECTORY, FALSE)) {
+        m_Local_Path = path;
+        if (m_Local_Path.Right(1) != "\\")
+            m_Local_Path += "\\";
+        FixedLocalFileList(".");
+    }
+}
+
+void CFileManagerDlg::OnLocalDownloads()
+{
+    char path[MAX_PATH];
+    if (SHGetSpecialFolderPathA(m_hWnd, path, CSIDL_PROFILE, FALSE)) {
+        m_Local_Path.Format("%s\\Downloads\\", path);
+        FixedLocalFileList(".");
+    }
+}
+
+void CFileManagerDlg::OnLocalHome()
+{
+    char path[MAX_PATH];
+    if (SHGetSpecialFolderPathA(m_hWnd, path, CSIDL_PROFILE, FALSE)) {
+        m_Local_Path = path;
+        if (m_Local_Path.Right(1) != "\\")
+            m_Local_Path += "\\";
+        FixedLocalFileList(".");
+    }
+}
+
+// 通配符匹配 (支持 * 和 ?, 大小写不敏感)
+bool CFileManagerDlg::WildcardMatch(LPCTSTR pattern, LPCTSTR str)
+{
+    while (*pattern) {
+        if (*pattern == '*') {
+            pattern++;
+            if (!*pattern) return true;
+            while (*str) {
+                if (WildcardMatch(pattern, str)) return true;
+                str++;
+            }
+            return false;
+        } else if (*pattern == '?') {
+            if (!*str) return false;
+            pattern++;
+            str++;
+        } else {
+            if (tolower((unsigned char)*pattern) != tolower((unsigned char)*str)) return false;
+            pattern++;
+            str++;
+        }
+    }
+    return *str == '\0';
+}
+
+#define LOCAL_SEARCH_MAX_DEPTH    32
+#define LOCAL_SEARCH_MAX_RESULTS  10000
+
+struct LocalSearchContext {
+    CFileManagerDlg *pDlg;
+    CString searchPath;
+    CString searchName;
+};
+
+static bool LocalShouldSkipDirectory(DWORD dwAttributes)
+{
+    if ((dwAttributes & FILE_ATTRIBUTE_HIDDEN) && (dwAttributes & FILE_ATTRIBUTE_SYSTEM))
+        return true;
+    if (dwAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return true;
+    return false;
+}
+
+DWORD WINAPI CFileManagerDlg::LocalSearchThreadProc(LPVOID lpParam)
+{
+    LocalSearchContext *pCtx = (LocalSearchContext *)lpParam;
+    pCtx->pDlg->LocalSearchWorker();
+    delete pCtx;
+    return 0;
+}
+
+void CFileManagerDlg::LocalSearchWorker()
+{
+    char szPattern[MAX_PATH];
+    if (m_strLocalSearchName.Find('*') < 0 && m_strLocalSearchName.Find('?') < 0)
+        wsprintf(szPattern, "*%s*", (LPCSTR)m_strLocalSearchName);
+    else
+        lstrcpy(szPattern, (LPCSTR)m_strLocalSearchName);
+
+    struct SearchDir {
+        CString path;
+        int depth;
+    };
+    std::vector<SearchDir> dirStack;
+    dirStack.push_back({m_strLocalSearchPath, 0});
+
+    auto *pResults = new std::vector<LocalSearchItem>();
+    DWORD dwLastProgressTime = GetTickCount();
+    int nLastProgressCount = 0;
+
+    while (!dirStack.empty() && m_bLocalSearching && (int)pResults->size() < LOCAL_SEARCH_MAX_RESULTS) {
+        SearchDir cur = dirStack.back();
+        dirStack.pop_back();
+        if (cur.depth > LOCAL_SEARCH_MAX_DEPTH) continue;
+
+        WIN32_FIND_DATA fd;
+        HANDLE hFind = FindFirstFile(cur.path + "*.*", &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+
+        std::vector<SearchDir> subdirs;
+        do {
+            if (!m_bLocalSearching) break;
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+
+            BOOL bIsDir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+
+            if (WildcardMatch(szPattern, fd.cFileName) && (int)pResults->size() < LOCAL_SEARCH_MAX_RESULTS) {
+                LocalSearchItem item;
+                item.fileName = fd.cFileName;
+                item.dir = cur.path;
+                item.bIsDir = bIsDir;
+                int nDot = item.fileName.ReverseFind('.');
+                item.ext = bIsDir ? "*folder*" : ((nDot >= 0) ? item.fileName.Mid(nDot) : "*noext*");
+                item.ext.MakeLower();
+                item.sizeHigh = fd.nFileSizeHigh;
+                item.sizeLow = fd.nFileSizeLow;
+                item.ftWrite = fd.ftLastWriteTime;
+                pResults->push_back(item);
+            }
+
+            if (bIsDir && !LocalShouldSkipDirectory(fd.dwFileAttributes))
+                subdirs.push_back({cur.path + fd.cFileName + "\\", cur.depth + 1});
+        } while (FindNextFile(hFind, &fd));
+        FindClose(hFind);
+
+        for (int i = (int)subdirs.size() - 1; i >= 0; i--)
+            dirStack.push_back(subdirs[i]);
+
+        // 数量增加500+或距上次更新超过2秒，则更新进度
+        int nCount = (int)pResults->size();
+        DWORD dwNow = GetTickCount();
+        if (nCount - nLastProgressCount >= 500 || (nCount > nLastProgressCount && dwNow - dwLastProgressTime >= 2000)) {
+            ::PostMessage(m_hWnd, WM_LOCAL_SEARCH_PROGRESS, (WPARAM)nCount, 0);
+            nLastProgressCount = nCount;
+            dwLastProgressTime = dwNow;
+        }
+    }
+
+    // 搜索完成，将所有结果一次性发送给UI线程
+    // wParam: 1=正常完成, 0=被停止
+    BOOL bCompleted = dirStack.empty() || (int)pResults->size() >= LOCAL_SEARCH_MAX_RESULTS;
+    ::SendMessage(m_hWnd, WM_LOCAL_SEARCH_DONE, bCompleted, (LPARAM)pResults);
+}
+
+LRESULT CFileManagerDlg::OnLocalSearchProgress(WPARAM wParam, LPARAM lParam)
+{
+    if (!m_bLocalSearching || m_bLocalSearchStopped) return 0;
+    DWORD dwElapsed = (GetTickCount() - m_dwLocalSearchStartTime) / 1000;
+    ShowMessage(_TRF("搜索 \"%s\" 在 %s ... 已找到 %d 个 (%d秒)"),
+                m_strLocalSearchName, m_strLocalSearchPath, (int)wParam, dwElapsed);
+    return 0;
+}
+
+LRESULT CFileManagerDlg::OnLocalSearchDone(WPARAM wParam, LPARAM lParam)
+{
+    auto *pResults = (std::vector<LocalSearchItem> *)lParam;
+
+    // 搜索被停止或已导航离开，丢弃结果
+    if (m_bLocalSearchStopped) {
+        delete pResults;
+        return 0;
+    }
+
+    // 插入所有结果
+    m_list_local.SetRedraw(FALSE);
+    for (size_t i = 0; i < pResults->size(); i++) {
+        const LocalSearchItem &item = (*pResults)[i];
+        int nType = item.bIsDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+
+        int nIcon;
+        auto it = m_LocalIconCache.find((LPCSTR)item.ext);
+        if (it != m_LocalIconCache.end()) {
+            nIcon = it->second;
+        } else {
+            nIcon = GetIconIndex((LPCSTR)item.ext, nType);
+            m_LocalIconCache[(LPCSTR)item.ext] = nIcon;
+        }
+
+        int nItem = m_list_local.InsertItem(m_nLocalSearchResultCount, item.fileName, nIcon);
+        m_list_local.SetItemData(nItem, item.bIsDir ? 1 : 0);
+
+        CString strSize;
+        __int64 fileSize = ((__int64)item.sizeHigh << 32) | item.sizeLow;
+        strSize.Format("%10d KB", (int)(fileSize / 1024 + (fileSize % 1024 ? 1 : 0)));
+        m_list_local.SetItemText(nItem, 1, strSize);
+
+        CTime time(item.ftWrite);
+        m_list_local.SetItemText(nItem, 2, time.Format("%Y-%m-%d %H:%M"));
+
+        CString dir = item.dir;
+        if (dir.GetLength() > 3 && dir.Right(1) == "\\")
+            dir = dir.Left(dir.GetLength() - 1);
+        m_list_local.SetItemText(nItem, 3, dir);
+
+        m_nLocalSearchResultCount++;
+    }
+    m_list_local.SetRedraw(TRUE);
+
+    DWORD dwElapsed = (GetTickCount() - m_dwLocalSearchStartTime) / 1000;
+    if (wParam) // 正常完成
+        ShowMessage(_TRF("搜索 \"%s\" 在 %s 完成，共 %d 个结果 (耗时 %d秒)"),
+                    m_strLocalSearchName, m_strLocalSearchPath, m_nLocalSearchResultCount, dwElapsed);
+    else // 被停止
+        ShowMessage(_TRF("搜索 \"%s\" 在 %s 已停止，共 %d 个结果 (耗时 %d秒)"),
+                    m_strLocalSearchName, m_strLocalSearchPath, m_nLocalSearchResultCount, dwElapsed);
+
+    m_bLocalSearching = false;
+    m_list_local.EnableWindow(TRUE);
+    delete pResults;
+    return 0;
+}
+
+void CFileManagerDlg::OnLocalSearch()
+{
+    CInputDlg dlg(this);
+    dlg.Init(_TR("搜索文件"), _TR("请输入搜索关键词"));
+    if (dlg.DoModal() == IDOK && !dlg.m_str.IsEmpty()) {
+        if (m_Local_Path.GetLength() == 0)
+            return;
+
+        // 停止远程搜索
+        if (m_bSearching) {
+            m_bSearchStopped = true;
+            m_bSearching = false;
+            m_list_remote.EnableWindow(TRUE);
+            BYTE bStop = COMMAND_FILES_SEARCH_STOP;
+            m_ContextObject->Send2Client(&bStop, 1);
+        }
+
+        // 停止上一次本地搜索
+        if (m_bLocalSearching) {
+            m_bLocalSearching = false;
+            m_bLocalSearchStopped = true;
+        }
+        // 等待旧线程结束 (同时处理消息避免SendMessage死锁)
+        if (m_hLocalSearchThread) {
+            while (MsgWaitForMultipleObjects(1, &m_hLocalSearchThread, FALSE, 5000, QS_ALLINPUT) == WAIT_OBJECT_0 + 1) {
+                MSG msg;
+                while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+            CloseHandle(m_hLocalSearchThread);
+            m_hLocalSearchThread = NULL;
+        }
+
+        // 重置状态
+        m_bLocalSearching = true;
+        m_bLocalSearchStopped = false;
+        m_nLocalSearchResultCount = 0;
+        m_dwLocalSearchStartTime = GetTickCount();
+        m_strLocalSearchPath = m_Local_Path;
+        m_strLocalSearchName = dlg.m_str;
+        m_LocalIconCache.clear();
+        m_LocalIconCache["*folder*"] = GetIconIndex(NULL, FILE_ATTRIBUTE_DIRECTORY);
+
+        // 初始化列表列 (搜索模式: 名称、大小、修改日期、路径)
+        SHFILEINFO sfi = {};
+        HIMAGELIST hImageListLarge = (HIMAGELIST)SHGetFileInfo(NULL, 0, &sfi, sizeof(SHFILEINFO), SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
+        HIMAGELIST hImageListSmall = (HIMAGELIST)SHGetFileInfo(NULL, 0, &sfi, sizeof(SHFILEINFO), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+        ListView_SetImageList(m_list_local.m_hWnd, hImageListLarge, LVSIL_NORMAL);
+        ListView_SetImageList(m_list_local.m_hWnd, hImageListSmall, LVSIL_SMALL);
+
+        m_list_local.DeleteAllItems();
+        while (m_list_local.DeleteColumn(0) != 0);
+        m_list_local.InsertColumnL(0, "名称",   LVCFMT_LEFT, 180);
+        m_list_local.InsertColumnL(1, "大小",   LVCFMT_LEFT, 90);
+        m_list_local.InsertColumnL(2, "修改日期", LVCFMT_LEFT, 115);
+        m_list_local.InsertColumnL(3, "路径",   LVCFMT_LEFT, 220);
+
+        m_list_local.EnableWindow(FALSE);
+        ShowMessage(_TRF("正在搜索 \"%s\" 在 %s ..."), m_strLocalSearchName, m_strLocalSearchPath);
+
+        // 启动搜索线程
+        LocalSearchContext *pCtx = new LocalSearchContext;
+        pCtx->pDlg = this;
+        m_hLocalSearchThread = CreateThread(NULL, 0, LocalSearchThreadProc, (LPVOID)pCtx, 0, NULL);
+    }
+}
+
+void CFileManagerDlg::OnRemoteDesktop()
+{
+    m_Remote_Path = "%USERPROFILE%\\Desktop\\";
+    GetRemoteFileList(".");
+}
+
+void CFileManagerDlg::OnRemoteDownloads()
+{
+    m_Remote_Path = "%USERPROFILE%\\Downloads\\";
+    GetRemoteFileList(".");
+}
+
+void CFileManagerDlg::OnRemoteHome()
+{
+    m_Remote_Path = "%USERPROFILE%\\";
+    GetRemoteFileList(".");
+}
+
+void CFileManagerDlg::OnRemoteSearch()
+{
+    // 停止本地搜索
+    if (m_bLocalSearching) {
+        m_bLocalSearching = false;
+        m_bLocalSearchStopped = true;
+        m_list_local.EnableWindow(TRUE);
+    }
+
+    // 如果正在远程搜索，先停止
+    if (m_bSearching) {
+        BYTE bStop = COMMAND_FILES_SEARCH_STOP;
+        m_ContextObject->Send2Client(&bStop, 1);
+        m_bSearching = false;
+    }
+
+    CInputDlg dlg(this);
+    dlg.Init(_TR("搜索文件"), _TR("请输入搜索关键词"));
+    if (dlg.DoModal() == IDOK && !dlg.m_str.IsEmpty()) {
+        if (m_Remote_Path.GetLength() == 0)
+            return;
+
+        // 重置搜索状态 (m_bSearching 将在第一个 TOKEN_SEARCH_FILE_LIST 到达时设为 true)
+        m_bSearching = false;
+        m_bSearchStopped = false;
+        m_nSearchResultCount = 0;
+        m_dwSearchStartTime = GetTickCount();
+
+        // 构建搜索数据包: [COMMAND_SEARCH_FILE][SearchPath\0][SearchFileName\0]
+        CString searchPath = m_Remote_Path;
+        CString searchName = dlg.m_str;
+        m_strSearchPath = searchPath;
+        m_strSearchName = searchName;
+        int nPathLen = searchPath.GetLength() + 1;
+        int nNameLen = searchName.GetLength() + 1;
+        int nPacketSize = 1 + nPathLen + nNameLen;
+        BYTE *bPacket = (BYTE *)LocalAlloc(LPTR, nPacketSize);
+        bPacket[0] = COMMAND_SEARCH_FILE;
+        memcpy(bPacket + 1, searchPath.GetBuffer(0), nPathLen);
+        memcpy(bPacket + 1 + nPathLen, searchName.GetBuffer(0), nNameLen);
+        m_ContextObject->Send2Client(bPacket, nPacketSize);
+        LocalFree(bPacket);
+        m_list_remote.EnableWindow(FALSE);
+        ShowMessage(_TRF("正在搜索 %s ..."), searchName);
+    }
 }
 
 void CFileManagerDlg::OnLocalView()
@@ -1207,6 +1729,18 @@ void CFileManagerDlg::OnUpdateLocalNewfolder(CCmdUI* pCmdUI)
     pCmdUI->Enable(m_Local_Path.GetLength() && m_list_local.IsWindowEnabled());
 }
 
+void CFileManagerDlg::OnUpdateLocalSearch(CCmdUI* pCmdUI)
+{
+    // 有本地路径、列表可用、且没有搜索正在进行
+    pCmdUI->Enable(m_Local_Path.GetLength() && m_list_local.IsWindowEnabled() && !m_bLocalSearching && !m_bSearching);
+}
+
+void CFileManagerDlg::OnUpdateRemoteSearch(CCmdUI* pCmdUI)
+{
+    // 有远程路径、列表可用、且没有搜索正在进行
+    pCmdUI->Enable(m_Remote_Path.GetLength() && m_list_remote.IsWindowEnabled() && !m_bSearching && !m_bLocalSearching);
+}
+
 void CFileManagerDlg::OnUpdateLocalCopy(CCmdUI* pCmdUI)
 {
     // TODO: Add your command update UI handler code here
@@ -1223,8 +1757,7 @@ void CFileManagerDlg::OnUpdateLocalCopy(CCmdUI* pCmdUI)
 void CFileManagerDlg::OnUpdateLocalStop(CCmdUI* pCmdUI)
 {
     // TODO: Add your command update UI handler code here
-    pCmdUI->Enable(!m_list_local.IsWindowEnabled() && m_bIsUpload);
-
+    pCmdUI->Enable((!m_list_local.IsWindowEnabled() && m_bIsUpload) || m_bLocalSearching);
 }
 
 void CFileManagerDlg::OnUpdateRemotePrev(CCmdUI* pCmdUI)
@@ -1261,7 +1794,7 @@ void CFileManagerDlg::OnUpdateRemoteNewfolder(CCmdUI* pCmdUI)
 void CFileManagerDlg::OnUpdateRemoteStop(CCmdUI* pCmdUI)
 {
     // TODO: Add your command update UI handler code here
-    pCmdUI->Enable(!m_list_remote.IsWindowEnabled() && !m_bIsUpload);
+    pCmdUI->Enable((!m_list_remote.IsWindowEnabled() && !m_bIsUpload) || m_bSearching);
 }
 
 bool CFileManagerDlg::FixedUploadDirectory(LPCTSTR lpPathName)
@@ -1359,8 +1892,8 @@ void CFileManagerDlg::OnLocalCompress()
     std::string target = m_Local_Path.GetString() + ToPekingDateTime(0) + ".zsta";
     zsta::Error err = zsta::CZstdArchive::Compress(paths, target);
     if (err != zsta::Error::Success) {
-        MessageBoxAPI_L(m_hWnd, "压缩失败: " + CString(zsta::CZstdArchive::GetErrorString(err)),
-                      "错误", MB_OK | MB_ICONERROR);
+        MessageBoxAPI_L(m_hWnd, _TR("压缩失败: ") + CString(zsta::CZstdArchive::GetErrorString(err)),
+                        "错误", MB_OK | MB_ICONERROR);
     } else {
         FixedLocalFileList(".");
     }
@@ -1402,8 +1935,8 @@ void CFileManagerDlg::OnLocalUnCompress()
             std::string destDir = GetExtractDir(path);
             zsta::Error err = zsta::CZstdArchive::Extract(path, destDir);
             if (err != zsta::Error::Success) {
-                MessageBoxAPI_L(m_hWnd, "解压失败: " + CString(zsta::CZstdArchive::GetErrorString(err)),
-                              "错误", MB_OK | MB_ICONERROR);
+                MessageBoxAPI_L(m_hWnd, _TR("解压失败: ") + CString(zsta::CZstdArchive::GetErrorString(err)),
+                                "错误", MB_OK | MB_ICONERROR);
             } else {
                 needRefresh = TRUE;
             }
@@ -1607,6 +2140,18 @@ BOOL CFileManagerDlg::SendDeleteJob()
     return TRUE;
 }
 
+// 将远程文件路径转换为本地保存路径
+// strFilePath: 远程文件的完整路径 (客户端返回的，保持原始形式含环境变量)
+// strRemotePath: 远程目录路径 (可能含环境变量如 %USERPROFILE%\Desktop\)
+// strLocalPath: 本地目标目录路径
+// 返回: 本地文件保存路径
+static CString RemotePathToLocal(const CString& strFilePath, const CString& strRemotePath, const CString& strLocalPath)
+{
+    CString strResult = strFilePath;
+    strResult.Replace(strRemotePath, strLocalPath);
+    return strResult;
+}
+
 void CFileManagerDlg::CreateLocalRecvFile()
 {
     // 重置计数器
@@ -1634,10 +2179,8 @@ void CFileManagerDlg::CreateLocalRecvFile()
     // 当前正操作的文件名
     m_strOperatingFile = m_ContextObject->m_DeCompressionBuffer.GetBuffer(9);
 
-    m_strReceiveLocalFile = m_strOperatingFile;
-
     // 得到要保存到的本地的文件路径
-    m_strReceiveLocalFile.Replace(m_Remote_Path, strDestDirectory);
+    m_strReceiveLocalFile = RemotePathToLocal(m_strOperatingFile, m_Remote_Path, strDestDirectory);
 
     // 创建多层目录
     MakeSureDirectoryPathExists(m_strReceiveLocalFile.GetBuffer(0));
@@ -1701,7 +2244,7 @@ void CFileManagerDlg::CreateLocalRecvFile()
 
     //  1字节Token,四字节偏移高四位，四字节偏移低四位
     BYTE	bToken[9];
-    DWORD	dwCreationDisposition; // 文件打开方式
+    DWORD	dwCreationDisposition = CREATE_ALWAYS; // 文件打开方式
     memset(bToken, 0, sizeof(bToken));
     bToken[0] = COMMAND_CONTINUE;
 
@@ -1740,25 +2283,30 @@ void CFileManagerDlg::CreateLocalRecvFile()
     }
     FindClose(hFind);
 
-    HANDLE	hFile =
-        CreateFile
+    // 关闭之前的句柄（如果有）
+    if (m_hRecvFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_hRecvFile);
+        m_hRecvFile = INVALID_HANDLE_VALUE;
+    }
+
+    // 打开文件并保持句柄，直到传输完成
+    m_hRecvFile = CreateFile
         (
             m_strReceiveLocalFile.GetBuffer(0),
             GENERIC_WRITE,
-            FILE_SHARE_WRITE,
+            FILE_SHARE_READ,  // 只允许读共享，防止其他程序写入
             NULL,
             dwCreationDisposition,
             FILE_ATTRIBUTE_NORMAL,
             0
         );
     // 需要错误处理
-    if (hFile == INVALID_HANDLE_VALUE) {
+    if (m_hRecvFile == INVALID_HANDLE_VALUE) {
         m_nOperatingFileLength = 0;
         m_nCounter = 0;
-        MessageBoxAPI_L(m_hWnd, m_strReceiveLocalFile + " 文件创建失败", "警告", MB_OK|MB_ICONWARNING);
+        MessageBoxAPI_L(m_hWnd, m_strReceiveLocalFile + _TR(" 文件创建失败"), "警告", MB_OK|MB_ICONWARNING);
         return;
     }
-    SAFE_CLOSE_HANDLE(hFile);
 
     ShowProgress();
     if (m_bIsStop)
@@ -1772,7 +2320,16 @@ void CFileManagerDlg::CreateLocalRecvFile()
 // 写入文件内容
 void CFileManagerDlg::WriteLocalRecvFile()
 {
-    // 传输完毕
+    // 检查文件句柄是否有效
+    if (m_hRecvFile == INVALID_HANDLE_VALUE) {
+        CString msg;
+        msg.FormatL("%s 文件句柄无效", m_strReceiveLocalFile);
+        ::MessageBox(m_hWnd, msg, _TR("警告"), MB_OK|MB_ICONWARNING);
+        m_bIsStop = true;
+        SendStop();
+        return;
+    }
+
     BYTE	*pData;
     DWORD	dwBytesToWrite;
     DWORD	dwBytesWrite;
@@ -1790,26 +2347,14 @@ void CFileManagerDlg::WriteLocalRecvFile()
 
     dwBytesToWrite = m_ContextObject->m_DeCompressionBuffer.GetBufferLen() - nHeadLength;
 
-    HANDLE	hFile =
-        CreateFile
-        (
-            m_strReceiveLocalFile.GetBuffer(0),
-            GENERIC_WRITE,
-            FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            0
-        );
-
-    SetFilePointer(hFile, dwOffsetLow, &dwOffsetHigh, FILE_BEGIN);
+    SetFilePointer(m_hRecvFile, dwOffsetLow, &dwOffsetHigh, FILE_BEGIN);
 
     int nRet = 0, i = 0;
     for (; i < MAX_WRITE_RETRY; ++i) {
         // 写入文件
         nRet = WriteFile
                (
-                   hFile,
+                   m_hRecvFile,
                    pData,
                    dwBytesToWrite,
                    &dwBytesWrite,
@@ -1820,10 +2365,13 @@ void CFileManagerDlg::WriteLocalRecvFile()
         }
     }
     if (i == MAX_WRITE_RETRY && nRet <= 0) {
-        MessageBoxAPI_L(m_hWnd, m_strReceiveLocalFile + " 文件写入失败!", "警告", MB_OK|MB_ICONWARNING);
+        DWORD dwErr = GetLastError();
+        CString msg;
+        msg.FormatL("%s 文件写入失败 (错误码: %d)", m_strReceiveLocalFile, dwErr);
+        ::MessageBox(m_hWnd, msg, _TR("警告"), MB_OK|MB_ICONWARNING);
         m_bIsStop = true;
     }
-    SAFE_CLOSE_HANDLE(hFile);
+    // 注意：不在这里关闭句柄，等传输完成后在 EndLocalRecvFile 中关闭
     // 为了比较，计数器递增
     m_nCounter += dwBytesWrite;
     ShowProgress();
@@ -1832,7 +2380,10 @@ void CFileManagerDlg::WriteLocalRecvFile()
     else {
         BYTE	bToken[9];
         bToken[0] = COMMAND_CONTINUE;
-        dwOffsetLow += dwBytesWrite;
+        // Fix: use 64-bit arithmetic to handle files > 4GB
+        __int64 newOffset = MAKEINT64(dwOffsetLow, dwOffsetHigh) + dwBytesWrite;
+        dwOffsetHigh = (DWORD)(newOffset >> 32);
+        dwOffsetLow = (DWORD)(newOffset & 0xFFFFFFFF);
         memcpy(bToken + 1, &dwOffsetHigh, sizeof(dwOffsetHigh));
         memcpy(bToken + 5, &dwOffsetLow, sizeof(dwOffsetLow));
         m_ContextObject->Send2Client(bToken, sizeof(bToken));
@@ -1841,6 +2392,12 @@ void CFileManagerDlg::WriteLocalRecvFile()
 
 void CFileManagerDlg::EndLocalRecvFile()
 {
+    // 关闭文件句柄
+    if (m_hRecvFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_hRecvFile);
+        m_hRecvFile = INVALID_HANDLE_VALUE;
+    }
+
     m_nCounter = 0;
     m_strOperatingFile = "";
     m_nOperatingFileLength = 0;
@@ -2016,12 +2573,25 @@ void CFileManagerDlg::OnRemoteStop()
 {
     // TODO: Add your command handler code here
     m_bIsStop = true;
+    // 标记搜索已停止，忽略后续到达的搜索数据
+    if (m_bSearching) {
+        m_bSearchStopped = true;
+        m_bSearching = false;
+        m_list_remote.EnableWindow(TRUE);
+        DWORD dwElapsed = (GetTickCount() - m_dwSearchStartTime) / 1000;
+        ShowMessage(_TRF("搜索已停止，共 %d 个结果 (耗时 %d秒)"), m_nSearchResultCount, dwElapsed);
+    }
+    // 同时发送搜索停止命令到客户端
+    BYTE bBuff = COMMAND_FILES_SEARCH_STOP;
+    m_ContextObject->Send2Client(&bBuff, 1);
 }
 
 void CFileManagerDlg::OnLocalStop()
 {
-    // TODO: Add your command handler code here
     m_bIsStop = true;
+    if (m_bLocalSearching) {
+        m_bLocalSearching = false; // 通知搜索线程停止，由OnLocalSearchDone显示结果
+    }
 }
 
 void CFileManagerDlg::PostNcDestroy()
@@ -2369,6 +2939,14 @@ void CFileManagerDlg::OnRclickListLocal(NMHDR* pNMHDR, LRESULT* pResult)
     } else
         pM->EnableMenuItem(IDM_LOCAL_OPEN, MF_BYCOMMAND | MF_GRAYED);
 
+    // V2传输: 本地列表只能上传到远程，不能从远程下载
+    // 需要选中文件且远程目录已打开（不是驱动器列表）
+    if (pListCtrl->GetSelectedCount() > 0 && !m_Remote_Path.IsEmpty()) {
+        pM->EnableMenuItem(IDM_TRANSFER_S, MF_BYCOMMAND | MF_ENABLED);
+    } else {
+        pM->EnableMenuItem(IDM_TRANSFER_S, MF_BYCOMMAND | MF_GRAYED);
+    }
+    pM->EnableMenuItem(IDM_TRANSFER_R, MF_BYCOMMAND | MF_GRAYED);  // 本地列表不能从远程下载
 
     pM->EnableMenuItem(IDM_REFRESH, MF_BYCOMMAND | MF_ENABLED);
     pM->TrackPopupMenu(TPM_LEFTALIGN, p.x, p.y, this);
@@ -2378,7 +2956,7 @@ void CFileManagerDlg::OnRclickListLocal(NMHDR* pNMHDR, LRESULT* pResult)
 void CFileManagerDlg::OnRclickListRemote(NMHDR* pNMHDR, LRESULT* pResult)
 {
     // TODO: Add your control notification handler code here
-    int	nRemoteOpenMenuIndex = 5;
+    int	nRemoteOpenMenuIndex = 7;  // 由于添加了2个V2菜单项，位置需要调整
     CListCtrl	*pListCtrl = &m_list_remote;
     CMenu	popup;
     popup.LoadMenu(IDR_FILEMANAGER);
@@ -2404,6 +2982,15 @@ void CFileManagerDlg::OnRclickListRemote(NMHDR* pNMHDR, LRESULT* pResult)
             pM->EnableMenuItem(nRemoteOpenMenuIndex, MF_BYPOSITION | MF_ENABLED);
     } else
         pM->EnableMenuItem(nRemoteOpenMenuIndex, MF_BYPOSITION | MF_GRAYED);
+
+    // V2传输: 远程列表只能从远程下载，不能上传到远程
+    // 需要选中文件且本地目录已打开（不是驱动器列表）
+    if (pListCtrl->GetSelectedCount() > 0 && !m_Local_Path.IsEmpty()) {
+        pM->EnableMenuItem(IDM_TRANSFER_R, MF_BYCOMMAND | MF_ENABLED);
+    } else {
+        pM->EnableMenuItem(IDM_TRANSFER_R, MF_BYCOMMAND | MF_GRAYED);
+    }
+    pM->EnableMenuItem(IDM_TRANSFER_S, MF_BYCOMMAND | MF_GRAYED);  // 远程列表不能上传到远程
 
     pM->EnableMenuItem(IDM_REFRESH, MF_BYCOMMAND | MF_ENABLED);
     pM->TrackPopupMenu(TPM_LEFTALIGN, p.x, p.y, this);
@@ -2503,4 +3090,133 @@ bool CFileManagerDlg::MakeSureDirectoryPathExists(LPCTSTR pszDirPath)
 
     free(pszDirCopy);
     return TRUE;
+}
+
+// V2传输: 本地文件上传到远程
+void CFileManagerDlg::OnTransferV2ToRemote()
+{
+    // 收集本地选中的文件列表
+    std::vector<std::string> files;
+    POSITION pos = m_list_local.GetFirstSelectedItemPosition();
+    while (pos) {
+        int nItem = m_list_local.GetNextSelectedItem(pos);
+        CString itemText = m_list_local.GetItemText(nItem, 0);
+
+        // 跳过".."
+        if (itemText == "..")
+            continue;
+
+        CString file = m_Local_Path + itemText;
+
+        // 如果是目录，递归收集文件
+        if (m_list_local.GetItemData(nItem)) {
+            file += '\\';
+            CollectFilesRecursive(file.GetString(), files);
+        } else {
+            files.push_back(file.GetString());
+        }
+    }
+
+    if (files.empty()) {
+        MessageBoxAPI_L(m_hWnd, "没有选中任何文件", "提示", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // 通知客户端目标目录（使用远程当前目录）
+    // 由 SendFilesToClientV2 内部的 COMMAND_C2C_PREPARE 处理
+
+    // 调用V2传输 - 需要通过IP找到主连接（m_ContextObject是子连接）
+    if (g_2015RemoteDlg && m_ContextObject) {
+        // 通过子连接的IP地址找到主连接
+        std::string peerIP = m_ContextObject->GetPeerName();
+        context* mainCtx = g_2015RemoteDlg->FindHostByIP(peerIP);
+        if (mainCtx) {
+            // 使用远程当前目录作为目标目录
+            std::string remoteDir = m_Remote_Path.GetString();
+            g_2015RemoteDlg->SendFilesToClientV2(mainCtx, files, remoteDir);
+            ShowMessage(_TRF("V2传输已启动，共 %d 个文件 -> %s"), (int)files.size(), remoteDir.c_str());
+        } else {
+            ShowMessage(_TRF("找不到主连接: %s"), peerIP.c_str());
+        }
+    }
+}
+
+// V2传输: 远程文件下载到本地
+void CFileManagerDlg::OnTransferV2ToLocal()
+{
+    // 收集远程选中的文件列表
+    std::vector<std::string> remotePaths;
+    POSITION pos = m_list_remote.GetFirstSelectedItemPosition();
+    while (pos) {
+        int nItem = m_list_remote.GetNextSelectedItem(pos);
+        CString itemText = m_list_remote.GetItemText(nItem, 0);
+
+        // 跳过".."
+        if (itemText == "..")
+            continue;
+
+        CString file = m_Remote_Path + itemText;
+
+        // 如果是目录，添加结尾的反斜杠
+        if (m_list_remote.GetItemData(nItem)) {
+            file += '\\';
+        }
+        remotePaths.push_back(file.GetString());
+    }
+
+    if (remotePaths.empty()) {
+        MessageBoxAPI_L(m_hWnd, "没有选中任何文件", "提示", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // 构建命令包: [cmd:1][targetDir\0][file1\0][file2\0]...[fileN\0][\0]
+    std::vector<char> packet;
+    packet.push_back(CMD_DOWN_FILES_V2);
+
+    // 目标目录（本地当前目录）
+    std::string targetDir = m_Local_Path.GetString();
+    packet.insert(packet.end(), targetDir.begin(), targetDir.end());
+    packet.push_back('\0');
+
+    // 文件列表
+    for (const auto& path : remotePaths) {
+        packet.insert(packet.end(), path.begin(), path.end());
+        packet.push_back('\0');
+    }
+    packet.push_back('\0');  // 双null结束
+
+    // 发送命令
+    m_ContextObject->Send2Client((BYTE*)packet.data(), (DWORD)packet.size());
+    ShowMessage(_TRF("V2下载请求已发送，共 %d 个项目"), (int)remotePaths.size());
+}
+
+// 递归收集目录中的所有文件（包括目录本身）
+void CFileManagerDlg::CollectFilesRecursive(const std::string& dirPath, std::vector<std::string>& files)
+{
+    // 先添加目录本身（去掉末尾的反斜杠）
+    std::string dirEntry = dirPath;
+    if (!dirEntry.empty() && (dirEntry.back() == '\\' || dirEntry.back() == '/')) {
+        dirEntry.pop_back();
+    }
+    files.push_back(dirEntry);
+
+    WIN32_FIND_DATAA wfd;
+    std::string searchPath = dirPath + "*.*";
+
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &wfd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do {
+        if (wfd.cFileName[0] != '.') {
+            std::string fullPath = dirPath + wfd.cFileName;
+            if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                CollectFilesRecursive(fullPath + "\\", files);
+            } else {
+                files.push_back(fullPath);
+            }
+        }
+    } while (FindNextFileA(hFind, &wfd));
+
+    FindClose(hFind);
 }

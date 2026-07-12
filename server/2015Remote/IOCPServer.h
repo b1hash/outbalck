@@ -6,6 +6,9 @@
 #include "Server.h"
 #include <Mstcpip.h>
 #include "LangManager.h"
+#include <map>
+#include <set>
+#include <string>
 
 #define	NC_CLIENT_CONNECT		0x0001
 #define	NC_RECEIVE				0x0004
@@ -56,7 +59,24 @@ protected:
     CRITICAL_SECTION	m_cs;
     ContextObjectList	m_ContextConnectionList;
     ContextObjectList	m_ContextFreePoolList;
-	HWND                m_hMainWnd = nullptr;
+    HWND                m_hMainWnd = nullptr;
+
+    // IP 连接限流和封禁
+    struct ConnectionInfo {
+        int count;          // 连接次数
+        time_t windowStart; // 统计窗口起始时间
+    };
+    std::map<std::string, ConnectionInfo> m_ConnectionCount;  // IP -> 连接统计
+    std::map<std::string, time_t> m_BannedIPs;                // IP -> 封禁到期时间
+    CRITICAL_SECTION m_BanLock;
+    // 白名单已移至 IPWhitelist 单例 (common/IPWhitelist.h)
+
+    bool IsIPBanned(const std::string& ip);
+    bool IsIPBlacklisted(const std::string& ip);
+    void RecordConnection(const std::string& ip);
+    void BanIP(const std::string& ip, int seconds);
+    void LoadIPWhitelist();
+    void LoadIPBlacklist();
 
 private:
     static DWORD WINAPI ListenThreadProc(LPVOID lParam);
@@ -123,6 +143,7 @@ public:
     bool m_bIsProcessing;
     HICON m_hIcon;
     BOOL m_bConnected;
+    uint64_t m_ClientID = 0;
     uint64_t m_nDisconnectTime = 0;
     CDialogBase(UINT nIDTemplate, CWnd* pParent, Server* pIOCPServer, CONTEXT_OBJECT* pContext, int nIcon) :
         m_bIsClosed(false), m_bIsProcessing(false),
@@ -131,17 +152,24 @@ public:
         CDialogLang(nIDTemplate, pParent)
     {
         m_bConnected = TRUE;
-		m_nDisconnectTime = 0;
+        m_nDisconnectTime = 0;
         m_IPAddress = pContext->GetPeerName().c_str();
         m_hIcon = nIcon > 0 ? LoadIcon(AfxGetInstanceHandle(), MAKEINTRESOURCE(nIcon)) : NULL;
     }
-    int UpdateContext(CONTEXT_OBJECT* pContext)
+    int UpdateContext(CONTEXT_OBJECT* pContext, uint64_t clientID)
     {
+        if (m_bIsClosed) {
+            Mprintf("%s SayByeBye: %llu [Already Closed]\n", ToPekingTimeAsString(0).c_str(), clientID);
+            BYTE bToken = COMMAND_BYE;
+            return m_ContextObject->Send2Client(&bToken, 1) ? 0 : 0x20260223;
+        }
+        m_ClientID = clientID;
         m_bConnected = TRUE;
         m_nDisconnectTime = 0;
         m_ContextObject = pContext;
         m_iocpServer = pContext->GetServer();
         m_ContextObject->hDlg = this;
+        m_ContextObject->hWnd = GetSafeHwnd();
         return 0;
     }
     virtual ~CDialogBase() {}
@@ -152,7 +180,7 @@ public:
         switch (m_ContextObject->InDeCompressedBuffer.GetBYTE(0)) {
         case TOKEN_CLIENT_MSG: {
             ClientMsg* msg = (ClientMsg*)m_ContextObject->InDeCompressedBuffer.GetBuffer(0);
-            PostMessageA(WM_SHOWERRORMSG, (WPARAM)new CString(msg->text), (LPARAM)new CString(msg->title));
+            PostMessageA(WM_SHOWERRORMSG, (WPARAM)new CString(_L(msg->text)), (LPARAM)new CString(_L(msg->title)));
             return TRUE;
         }
         }
@@ -199,6 +227,9 @@ public:
     BOOL IsClosed() const
     {
         return m_bIsClosed;
+    }
+    uint64_t GetClientID() const {
+        return m_ClientID;
     }
     BOOL SayByeBye()
     {

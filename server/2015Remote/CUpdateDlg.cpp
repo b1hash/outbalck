@@ -11,8 +11,8 @@
 IMPLEMENT_DYNAMIC(CUpdateDlg, CDialogEx)
 
 CUpdateDlg::CUpdateDlg(CWnd* pParent /*=nullptr*/)
-	: CDialogLangEx(IDD_DIALOG_UPDATE, pParent)
-	, m_nSelected(0)
+    : CDialogLangEx(IDD_DIALOG_UPDATE, pParent)
+    , m_nSelected(0)
 {
 
 }
@@ -23,9 +23,9 @@ CUpdateDlg::~CUpdateDlg()
 
 void CUpdateDlg::DoDataExchange(CDataExchange* pDX)
 {
-	__super::DoDataExchange(pDX);
-	DDX_Control(pDX, IDC_COMBO_UPDATE_SELECT, m_ComboUpdateSelect);
-	DDX_CBIndex(pDX, IDC_COMBO_UPDATE_SELECT, m_nSelected);
+    __super::DoDataExchange(pDX);
+    DDX_Control(pDX, IDC_COMBO_UPDATE_SELECT, m_ComboUpdateSelect);
+    DDX_CBIndex(pDX, IDC_COMBO_UPDATE_SELECT, m_nSelected);
 }
 
 
@@ -37,12 +37,19 @@ END_MESSAGE_MAP()
 
 BOOL CUpdateDlg::OnInitDialog()
 {
-	__super::OnInitDialog();
+    __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_UPDATE_TYPE, _TR("目标程序类型:"));
 
-	// TODO:  在此添加额外的初始化
-	m_ComboUpdateSelect.InsertStringL(0, _T("TestRun"));
-	m_ComboUpdateSelect.InsertStringL(1, _T("Ghost"));
-	m_ComboUpdateSelect.SetCurSel(1);
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("升级程序"));
+    SetDlgItemText(IDOK, _TR("确定"));
+    SetDlgItemText(IDCANCEL, _TR("取消"));
 
-	return TRUE;
+    // TODO:  在此添加额外的初始化
+    m_ComboUpdateSelect.InsertStringL(0, _T("TestRun"));
+    m_ComboUpdateSelect.InsertStringL(1, _T("Ghost"));
+    m_ComboUpdateSelect.SetCurSel(1);
+
+    return TRUE;
 }

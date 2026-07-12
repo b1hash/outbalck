@@ -5,27 +5,29 @@
 #include <atlstr.h>
 
 enum {
-    ONLINELIST_IP = 0,          // IPµÄÁĞË³Ğò
-    ONLINELIST_ADDR,            // µØÖ·
-    ONLINELIST_LOCATION,        // µØÀíÎ»ÖÃ
-    ONLINELIST_COMPUTER_NAME,   // ¼ÆËã»úÃû/±¸×¢
-    ONLINELIST_OS,              // ²Ù×÷ÏµÍ³
+    ONLINELIST_IP = 0,          // IPçš„åˆ—é¡ºåº
+    ONLINELIST_ADDR,            // åœ°å€
+    ONLINELIST_LOCATION,        // åœ°ç†ä½ç½®
+    ONLINELIST_COMPUTER_NAME,   // è®¡ç®—æœºå/å¤‡æ³¨
+    ONLINELIST_OS,              // æ“ä½œç³»ç»Ÿ
     ONLINELIST_CPU,             // CPU
-    ONLINELIST_VIDEO,           // ÉãÏñÍ·(ÓĞÎŞ)
-    ONLINELIST_PING,            // PING(¶Ô·½µÄÍøËÙ)
-    ONLINELIST_VERSION,	        // °æ±¾ĞÅÏ¢
-    ONLINELIST_INSTALLTIME,     // °²×°Ê±¼ä
-    ONLINELIST_LOGINTIME,       // »î¶¯´°¿Ú
-    ONLINELIST_CLIENTTYPE,		// ¿Í»§¶ËÀàĞÍ
-    ONLINELIST_PATH,			// ÎÄ¼şÂ·¾¶
+    ONLINELIST_VIDEO,           // æ‘„åƒå¤´(æœ‰æ— )
+    ONLINELIST_PING,            // PING(å¯¹æ–¹çš„ç½‘é€Ÿ)
+    ONLINELIST_VERSION,	        // ç‰ˆæœ¬ä¿¡æ¯
+    ONLINELIST_INSTALLTIME,     // å®‰è£…æ—¶é—´
+    ONLINELIST_LOGINTIME,       // æ´»åŠ¨çª—å£
+    ONLINELIST_CLIENTTYPE,		// å®¢æˆ·ç«¯ç±»å‹
+    ONLINELIST_PATH,			// æ–‡ä»¶è·¯å¾„
     ONLINELIST_PUBIP,
+    ONLINELIST_STARTTIME,
+    ONLINELIST_CAPABILITIES,    // å®¢æˆ·ç«¯èƒ½åŠ›ä½
     ONLINELIST_MAX,
 };
 
 class context
 {
 public:
-    // ´¿Ğéº¯Êı
+    // çº¯è™šå‡½æ•°
     virtual VOID InitMember(SOCKET s, VOID* svr) = 0;
     virtual BOOL Send2Client(PBYTE szBuffer, ULONG ulOriginalLength) = 0;
     virtual CString GetClientData(int index)const = 0;
@@ -39,14 +41,23 @@ public:
     virtual FlagType GetFlagType() const = 0;
     virtual std::string GetGroupName() const = 0;
     virtual uint64_t GetAliveTime()const = 0;
-	virtual void SetLastHeartbeat(uint64_t time) = 0;
+    virtual void SetLastHeartbeat(uint64_t time) = 0;
     virtual uint64_t GetLastHeartbeat() = 0;
     virtual void CancelIO() = 0;
+	virtual std::string GetMasterID() const = 0;
 public:
     virtual ~context() {}
     virtual void Destroy() {}
     virtual BOOL IsLogin() const
     {
         return TRUE;
+    }
+    virtual void SetGroupName(const std::string& group) {}
+
+    // æ£€æŸ¥å®¢æˆ·ç«¯æ˜¯å¦æ”¯æŒ V2 æ–‡ä»¶ä¼ è¾“
+    bool SupportsFileV2() const {
+        CString caps = GetClientData(ONLINELIST_CAPABILITIES);
+        if (caps.IsEmpty()) return false;
+        return (strtoul(caps.GetString(), nullptr, 16) & CLIENT_CAP_V2) != 0;
     }
 };

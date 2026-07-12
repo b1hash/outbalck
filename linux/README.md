@@ -1,0 +1,345 @@
+# SimpleRemoter Linux Client
+
+SimpleRemoter 的 Linux 客户端，支持远程桌面、远程终端、文件管理和进程管理功能。
+
+## 功能特性
+
+- **远程桌面** - 实时屏幕截图传输，支持鼠标/键盘控制，支持多种压缩算法
+- **远程终端** - 基于 PTY 的交互式 Shell
+- **文件管理** - 远程文件浏览、上传、下载
+- **进程管理** - 查看和管理远程进程
+- **守护进程模式** - 支持后台运行 (`-d` 参数)
+
+## 功能实现对比 (Linux vs Windows)
+
+### 已实现
+
+| 功能模块 | Linux 实现 | Windows 对应 | 状态 |
+|---------|-----------|-------------|------|
+| 远程桌面 | `ScreenHandler.h` | `ScreenManager.cpp` | ✅ 完整 (DIFF/RGB565/GRAY) |
+| 进程管理 | `SystemManager.h` | `SystemManager.cpp` | ✅ 完整 |
+| 文件管理 | `FileManager.h` | `FileManager.cpp` | ✅ 完整 |
+| 远程终端 | `PTYHandler` (main.cpp) | `ConPTYManager.cpp` | ✅ 完整 |
+| 心跳/RTT | main.cpp | `KernelManager.cpp` | ✅ 完整 |
+| 用户活动检测 | `ActivityChecker` | `ActivityWindow` | ✅ 完整 |
+| 系统信息采集 | main.cpp | `LoginServer.cpp` | ✅ 完整 |
+| 守护进程 | daemonize() | Windows 服务 | ✅ 完整 |
+| 剪贴板同步 | `ClipboardHandler.h` | `ScreenManager.cpp` | ✅ 服务端↔Linux |
+| V2 文件传输 | `FileTransferV2.h` | `file_upload.h` | ✅ 服务端↔Linux |
+| 配置持久化 | `LinuxConfig` | INI 文件 | ✅ 完整 |
+
+### 未实现
+
+| 功能模块 | Windows 文件 | 命令 | 优先级 | 说明 |
+|---------|-------------|------|-------|------|
+| 会话管理 | `KernelManager.cpp` | `COMMAND_SESSION` | 高 | 关机/重启/注销 |
+| 下载执行 | `KernelManager.cpp` | `COMMAND_DOWN_EXEC` | 高 | 下载并运行程序 |
+| 服务管理 | `ServicesManager.cpp` | `COMMAND_SERVICES` | 中 | systemd 服务列表 |
+| 键盘记录 | `KeyboardManager.cpp` | `COMMAND_KEYBOARD` | 中 | 需要 X11/evdev |
+| 开机自启 | `auto_start.h` | - | 中 | systemd user service |
+| 窗口列表 | `SystemManager.cpp` | `COMMAND_WSLIST` | 低 | X11 窗口枚举 |
+| 音频监听 | `AudioManager.cpp` | `COMMAND_AUDIO` | 低 | 需要 PulseAudio/ALSA |
+| 摄像头 | `VideoManager.cpp` | `COMMAND_WEBCAM` | 低 | 需要 V4L2 |
+| 语音对讲 | `TalkManager.cpp` | `COMMAND_TALK` | 低 | 双向音频传输 |
+| 清除日志 | `KernelManager.cpp` | `COMMAND_CLEAN_EVENT` | 低 | 清除 syslog |
+| 注册表管理 | `RegisterManager.cpp` | `COMMAND_REGEDIT` | - | Linux 不适用 |
+
+### 开发优先级说明
+
+**高优先级** - 日常管理常用功能
+- ~~剪贴板同步：跨平台复制粘贴~~ ✅ 已完成
+- 会话管理：远程关机/重启
+- 下载执行：远程部署程序
+
+**中优先级** - 系统管理功能
+- 服务管理：查看/控制 systemd 服务
+- 键盘记录：输入监控
+- 开机自启：持久化运行
+
+**低优先级** - 硬件相关功能
+- 音频/摄像头/语音：需要额外硬件库支持
+
+## 系统要求
+
+### 显示服务器
+
+| 类型 | 支持状态 | 说明 |
+|------|---------|------|
+| X11 / Xorg | 支持 | 完全支持 |
+| XWayland | 部分支持 | X11 应用可用，原生 Wayland 应用不可见 |
+| Wayland (纯) | 不支持 | 无法工作 |
+
+> **重要**: 本客户端使用 X11 API 进行屏幕捕获，**不支持纯 Wayland 环境**。
+> 如果你使用 GNOME/KDE 等桌面环境，请在登录时选择 "Xorg" 或 "X11" 会话。
+
+### 依赖库
+
+#### 必需 (远程桌面功能)
+
+| 库 | 包名 (Debian/Ubuntu) | 包名 (RHEL/Fedora) | 用途 |
+|----|---------------------|-------------------|------|
+| libX11 | `libx11-6` | `libX11` | X11 核心库，屏幕捕获 |
+
+#### 推荐 (完整远程控制)
+
+| 库 | 包名 (Debian/Ubuntu) | 包名 (RHEL/Fedora) | 用途 |
+|----|---------------------|-------------------|------|
+| libXtst | `libxtst6` | `libXtst` | XTest 扩展，模拟鼠标/键盘输入 |
+
+#### 可选
+
+| 库 | 包名 (Debian/Ubuntu) | 包名 (RHEL/Fedora) | 用途 |
+|----|---------------------|-------------------|------|
+| libXss | `libxss1` | `libXScrnSaver` | 获取用户空闲时间 |
+| xclip | `xclip` | `xclip` | 剪贴板同步 (文本/文件) |
+
+### 一键安装依赖
+
+**Debian / Ubuntu:**
+```bash
+sudo apt update
+sudo apt install libx11-6 libxtst6 libxss1 xclip
+```
+
+**RHEL / CentOS / Fedora:**
+```bash
+sudo dnf install libX11 libXtst libXScrnSaver xclip
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S libx11 libxtst libxss xclip
+```
+
+## 编译
+
+### 编译依赖
+
+```bash
+# Debian/Ubuntu
+sudo apt install build-essential cmake
+
+# RHEL/Fedora
+sudo dnf install gcc-c++ cmake make
+```
+
+### 编译步骤
+
+```bash
+cd linux
+cmake .
+make -j$(nproc)
+```
+
+编译成功后生成可执行文件 `ghost`。
+
+## 使用方法
+
+### 基本用法
+
+```bash
+./ghost [服务器IP] [端口]
+```
+
+### 守护进程模式
+
+```bash
+./ghost -d [服务器IP] [端口]
+```
+
+### 示例
+
+```bash
+# 前台运行，连接到 192.168.1.100:6543
+./ghost 192.168.1.100 6543
+
+# 后台守护进程模式
+./ghost -d 192.168.1.100 6543
+
+# 停止守护进程
+kill $(cat ~/.config/ghost/ghost.pid)
+```
+
+## 常见问题
+
+### Q: 远程桌面功能不工作
+
+**检查项:**
+
+1. **确认使用 X11 会话**
+   ```bash
+   echo $XDG_SESSION_TYPE
+   # 应输出 "x11"，如果是 "wayland" 则不支持
+   ```
+
+2. **确认 DISPLAY 环境变量已设置**
+   ```bash
+   echo $DISPLAY
+   # 应输出类似 ":0" 或 ":1"
+   ```
+
+3. **确认 X11 库已安装**
+   ```bash
+   ldconfig -p | grep libX11
+   # 应输出 libX11.so.6 的路径
+   ```
+
+### Q: 鼠标/键盘控制不工作
+
+安装 XTest 扩展库:
+```bash
+# Debian/Ubuntu
+sudo apt install libxtst6
+
+# RHEL/Fedora
+sudo dnf install libXtst
+```
+
+### Q: 警告 "MIT-SCREEN-SAVER missing"
+
+这是一个无害警告，表示无法获取用户空闲时间。可以忽略，或安装 libXss:
+```bash
+# Debian/Ubuntu
+sudo apt install libxss1
+
+# RHEL/Fedora
+sudo dnf install libXScrnSaver
+```
+
+### Q: 如何在 Wayland 环境下使用?
+
+目前不支持纯 Wayland。需要切换到 X11 会话。
+
+**方法1：登录时选择 X11 会话**
+
+- 在登录界面点击用户名后，右下角会出现齿轮图标 ⚙️
+- 点击齿轮，选择 "Ubuntu on Xorg" 或 "GNOME on Xorg"
+
+**方法2：强制禁用 Wayland（推荐）**
+
+如果找不到齿轮图标，可以修改 GDM 配置强制使用 X11：
+
+```bash
+sudo nano /etc/gdm3/custom.conf
+```
+
+在 `[daemon]` 部分添加：
+
+```ini
+[daemon]
+WaylandEnable=false
+```
+
+保存后重启系统：
+
+```bash
+sudo reboot
+```
+
+这样系统将始终使用 X11，无需每次手动选择。
+
+**KDE 桌面环境：**
+- 登录界面选择 "Plasma (X11)"
+- 或编辑 `/etc/sddm.conf` 设置默认会话
+
+### Q: 如何检查当前会话类型?
+
+```bash
+# 查看会话类型
+echo $XDG_SESSION_TYPE
+
+# 查看显示服务器信息
+loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') -p Type
+```
+
+## 配置文件
+
+配置文件位于 `~/.config/ghost/config.conf`，存储以下信息:
+
+| 配置项 | 说明 | 示例值 |
+|-------|------|-------|
+| `InstallTime` | 首次安装时间 | `1709856000` |
+| `PublicIP` | 公网 IP 缓存 | `1.2.3.4` |
+| `GeoLocation` | 地理位置缓存 | `北京市` |
+| `QualityLevel` | 屏幕质量等级 | `-1` (自适应) |
+
+### 质量等级说明
+
+| 值 | 等级 | FPS | 算法 |
+|----|------|-----|------|
+| -1 | 自适应 | 动态 | 动态 |
+| 0 | Ultra | 30 | DIFF |
+| 1 | High | 25 | DIFF |
+| 2 | Good | 20 | RGB565 |
+| 3 | Medium | 15 | RGB565 |
+| 4 | Low | 10 | RGB565 |
+| 5 | Minimal | 8 | GRAY |
+
+## 剪贴板同步
+
+### 支持的操作
+
+| 方向 | 操作 | 状态 |
+|------|------|------|
+| 服务端 → Linux | 服务端 Ctrl+C，远程窗口 Ctrl+V | ✅ 支持 |
+| Linux → 服务端 | 远程窗口 Ctrl+C，服务端 Ctrl+V | ✅ 支持 |
+| Linux ↔ Linux (C2C) | 远程A Ctrl+C，远程B Ctrl+V | ❌ 暂不支持 |
+
+### 支持的内容类型
+
+| 类型 | 说明 |
+|------|------|
+| 文本 | 纯文本剪贴板内容 |
+| 文件 | 单文件/多文件/文件夹，保留目录结构 |
+
+### 依赖
+
+需要安装 `xclip` 工具：
+```bash
+# Debian/Ubuntu
+sudo apt install xclip
+
+# RHEL/Fedora
+sudo dnf install xclip
+```
+
+### 技术实现
+
+- 文本剪贴板：`xclip -selection clipboard`
+- 文件剪贴板：`xclip -t text/uri-list` 读取文件路径
+- 编码转换：服务端 GBK ↔ Linux UTF-8 自动转换
+
+## 技术细节
+
+### 屏幕捕获流程
+
+1. 使用 `XCopyArea` 将 root window 拷贝到离屏 Pixmap
+2. 使用 `XGetImage` 从 Pixmap 获取图像数据
+3. 转换为 BGRA 格式并翻转行序 (BMP 格式要求)
+4. 计算帧差异，仅传输变化区域
+
+### 屏幕压缩算法
+
+| 算法 | 带宽占用 | 说明 |
+|------|---------|------|
+| DIFF | 4 字节/像素 | 原始 BGRA，最高画质 |
+| RGB565 | 2 字节/像素 | 16位色，节省 50% 带宽 |
+| GRAY | 1 字节/像素 | 灰度，节省 75% 带宽 |
+| H264 | - | 暂不支持，自动降级为 RGB565 |
+
+算法由服务端根据网络状况自适应选择，或可手动指定。
+
+### 输入模拟
+
+使用 XTest 扩展 (`libXtst`) 实现:
+- `XTestFakeMotionEvent` - 鼠标移动
+- `XTestFakeButtonEvent` - 鼠标点击
+- `XTestFakeKeyEvent` - 键盘输入
+
+### 为何不支持 Wayland?
+
+Wayland 出于安全考虑，禁止应用程序:
+- 捕获其他应用的屏幕内容
+- 模拟全局输入事件
+
+这些限制使得传统远程桌面方案无法在纯 Wayland 下工作。

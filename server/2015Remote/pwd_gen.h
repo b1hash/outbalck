@@ -6,9 +6,14 @@
 
 std::string getHardwareID();
 
+// Enhanced hardware ID for VPS (includes UUID and MachineGuid)
+std::string getHardwareID_V2();
+
 std::string hashSHA256(const std::string& data);
 
 std::string genHMAC(const std::string& pwdHash, const std::string& superPass);
+
+std::string genHMACbyHash(const std::string& pwdHash, const std::string& superHash);
 
 std::string getFixedLengthID(const std::string& hash);
 
@@ -20,3 +25,122 @@ std::string getDeviceID(const std::string &hardwareId);
 uint64_t SignMessage(const std::string& pwd, BYTE* msg, int len);
 
 bool VerifyMessage(const std::string& pwd, BYTE* msg, int len, uint64_t signature);
+
+// ============================================================================
+// ECDSA P-256 非对称签名 (v2 授权)
+// ============================================================================
+
+// V2 签名长度 (ECDSA P-256: 64 bytes)
+#define V2_SIGNATURE_SIZE 64
+// V2 公钥长度 (ECDSA P-256: 64 bytes, X+Y coordinates)
+#define V2_PUBKEY_SIZE 64
+// V2 私钥长度 (ECDSA P-256: 32 bytes)
+#define V2_PRIVKEY_SIZE 32
+
+// 生成 V2 密钥对，保存到文件
+// privateKeyFile: 私钥保存路径
+// publicKeyOut: 输出公钥 (64 bytes)，用于内嵌到程序
+// 返回: true 成功
+bool GenerateKeyPairV2(const char* privateKeyFile, BYTE* publicKeyOut);
+
+// 使用私钥签名消息 (类似 SignMessage)
+// privateKeyFile: 私钥文件路径
+// msg: 待签名数据
+// len: 数据长度
+// signatureOut: 输出签名 (64 bytes)
+// 返回: true 成功
+bool SignMessageV2(const char* privateKeyFile, const BYTE* msg, int len, BYTE* signatureOut);
+
+// 使用公钥验证签名 (类似 VerifyMessage)
+// publicKey: 公钥数据 (64 bytes)
+// msg: 原始数据
+// len: 数据长度
+// signature: 签名数据 (64 bytes)
+// 返回: true 验证通过
+bool VerifyMessageV2(const BYTE* publicKey, const BYTE* msg, int len, const BYTE* signature);
+
+// 签名口令 (V2)
+// deviceId: 设备ID (如 "XXXX-XXXX-XXXX-XXXX")
+// password: 口令字符串 (如 "20250301-20261231-0002-XXXXXXXX")
+// privateKeyFile: 私钥文件路径
+// 返回: HMAC 字段值 (如 "v2:BASE64_SIGNATURE")，失败返回空字符串
+std::string signPasswordV2(const std::string& deviceId, const std::string& password, const char* privateKeyFile);
+
+// 验证口令签名 (V2)
+// deviceId: 设备ID
+// password: 口令字符串
+// hmacField: HMAC 字段值 (应以 "v2:" 开头)
+// publicKey: 内嵌公钥 (64 bytes)
+// 返回: true 签名验证通过
+bool verifyPasswordV2(const std::string& deviceId, const std::string& password,
+                      const std::string& hmacField, const BYTE* publicKey);
+
+// Base64 编解码
+std::string base64Encode(const BYTE* data, size_t len);
+bool base64Decode(const std::string& encoded, BYTE* dataOut, size_t* lenOut);
+
+// 格式化公钥为 C 数组代码
+std::string formatPublicKeyAsCode(const BYTE* publicKey);
+
+// ============================================================================
+// Authorization 签名 (多层授权)
+// ============================================================================
+
+// 签名 Authorization（不绑定 deviceID，绑定 snHashPrefix，可在同一第一层的下级间共享）
+// license: 授权信息 (如 "20260317|20270317|0256")
+// snHashPrefix: 第一层 SN/deviceID 的前8字符哈希，用于隔离不同第一层
+// privateKeyFile: 私钥文件路径
+// 返回: 签名字段值 (如 "v2:BASE64_SIGNATURE")，失败返回空字符串
+std::string signAuthorizationV2(const std::string& license, const std::string& snHashPrefix, const char* privateKeyFile);
+
+// 计算 snHashPrefix（用于 Authorization 隔离）
+// deviceID: 第一层的设备ID（如 "XXXX-XXXX-XXXX-XXXX"）
+// 返回: SHA256(deviceID).substr(0, 8)
+std::string computeSnHashPrefix(const std::string& deviceID);
+
+// ============================================================================
+// FRP 自动代理配置生成
+// ============================================================================
+
+// FRP 认证模式
+enum FrpAuthModeGen {
+    FRP_AUTH_MODE_TOKEN = 0,           // 官方 FRP: 直接使用 token (编码为 ENC:xxx)
+    FRP_AUTH_MODE_PRIVILEGE_KEY = 1    // 自定义 FRP: 使用 privilegeKey = MD5(token + timestamp)
+};
+
+// XOR 编码 Token（用于官方 FRP 模式）
+// 格式: "ENC:" + Base64(XOR(token, key))
+// 下级检测到 ENC: 前缀后解码使用
+std::string EncodeFrpToken(const std::string& token);
+
+// XOR 解码 Token
+// 输入: "ENC:xxx" -> 输出: 原始 token
+// 如果不是 ENC: 前缀，返回空字符串
+std::string DecodeFrpToken(const std::string& encoded);
+
+// 检测 privilegeKey 是否为编码的 token
+// 返回: true 如果以 "ENC:" 开头
+bool IsFrpTokenEncoded(const std::string& privilegeKey);
+
+// 日期字符串转 Unix 时间戳（当天 23:59:59 UTC）
+// 输入: "20260323" -> 输出: 1774329599
+time_t FrpDateToTimestamp(const std::string& dateStr);
+
+// 生成 FRP 配置字符串
+// serverAddr: FRPS 服务器地址
+// serverPort: FRPS 服务器端口
+// remotePort: 分配给下级的远程端口
+// frpToken: FRPS 认证 Token
+// expireDate: 有效日期（YYYYMMDD 格式），最大 "20371231"（32位timestamp限制）
+// authMode: 认证模式 (FRP_AUTH_MODE_TOKEN 或 FRP_AUTH_MODE_PRIVILEGE_KEY)
+// 返回: "serverAddr:serverPort-remotePort-expireDate-privilegeKey"
+//       官方模式: privilegeKey = "ENC:xxx" (编码的 token)
+//       自定义模式: privilegeKey = MD5(token + timestamp)
+std::string GenerateFrpConfig(
+    const std::string& serverAddr,
+    int serverPort,
+    int remotePort,
+    const std::string& frpToken,
+    const std::string& expireDate,
+    int authMode = FRP_AUTH_MODE_PRIVILEGE_KEY
+);

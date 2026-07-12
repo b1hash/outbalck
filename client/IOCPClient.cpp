@@ -17,6 +17,9 @@ inline int WSAGetLastError()
     return -1;
 }
 #define USING_COMPRESS 1
+// 注意：Linux 不启用 USING_CTX，因为 libzstd.a (1.5.6) 与 zstd.h (1.5.7) 版本不匹配
+// 可能导致 ZSTD_CCtx 结构体 ABI 不兼容，引发堆损坏
+// 使用无状态 ZSTD_compress/ZSTD_decompress 更安全
 #endif
 #include "IOCPClient.h"
 #include <assert.h>
@@ -94,8 +97,23 @@ VOID IOCPClient::setManagerCallBack(void* Manager,  DataProcessCB dataProcess, O
 
 
 IOCPClient::IOCPClient(const State&bExit, bool exit_while_disconnect, int mask, CONNECT_ADDRESS* conn,
-                       const std::string& pubIP) : g_bExit(bExit)
+                       const std::string& pubIP, void* main) : g_bExit(bExit)
 {
+    // 首次构造时打印 ZSTD 版本信息，帮助诊断版本兼容性问题
+    static bool versionLogged = false;
+    if (!versionLogged) {
+        versionLogged = true;
+        unsigned ver = ZSTD_versionNumber();
+#if USING_CTX
+        Mprintf("[IOCPClient] ZSTD version: %u.%u.%u, USING_CTX=1\n",
+                ver / 10000, (ver / 100) % 100, ver % 100);
+#else
+        Mprintf("[IOCPClient] ZSTD version: %u.%u.%u, USING_CTX=0\n",
+                ver / 10000, (ver / 100) % 100, ver % 100);
+#endif
+    }
+
+    m_main = main;
     int encoder = conn ? conn->GetHeaderEncType() : 0;
     m_sLocPublicIP = pubIP;
     m_ServerAddr = {};
@@ -214,6 +232,7 @@ std::string GetIPAddress(const char *hostName)
 #endif
 }
 
+#ifdef _WIN32
 BOOL ConnectWithTimeout(SOCKET sock, SOCKADDR *addr, int timeout_sec=5)
 {
     // 临时设为非阻塞
@@ -257,6 +276,7 @@ BOOL ConnectWithTimeout(SOCKET sock, SOCKADDR *addr, int timeout_sec=5)
 
     return TRUE;
 }
+#endif
 
 BOOL IOCPClient::ConnectServer(const char* szServerIP, unsigned short uPort)
 {
@@ -337,7 +357,7 @@ BOOL IOCPClient::ConnectServer(const char* szServerIP, unsigned short uPort)
 #endif
     }
     m_bConnected = TRUE;
-    Mprintf("连接服务端成功.\n");
+    Mprintf("连接服务端成功: %s:%d.\n", m_sCurIP.c_str(), (int)port);
 
     if (m_hWorkThread == NULL) {
 #ifdef _WIN32
@@ -347,7 +367,11 @@ BOOL IOCPClient::ConnectServer(const char* szServerIP, unsigned short uPort)
         m_bIsRunning = m_hWorkThread ? TRUE : FALSE;
 #else
         pthread_t id = 0;
-        m_hWorkThread = (HANDLE)pthread_create(&id, nullptr, (void* (*)(void*))IOCPClient::WorkThreadProc, this);
+        int ret = pthread_create(&id, nullptr, (void* (*)(void*))IOCPClient::WorkThreadProc, this);
+        if (ret == 0) {
+            m_bWorkThread = S_RUN;
+            m_bIsRunning = TRUE;
+        }
 #endif
     }
 
@@ -359,7 +383,7 @@ DWORD WINAPI IOCPClient::WorkThreadProc(LPVOID lParam)
     IOCPClient* This = (IOCPClient*)lParam;
     char* szBuffer = new char[MAX_RECV_BUFFER];
     fd_set fd;
-    struct timeval tm = { 2, 0 };
+    struct timeval tm;
     CBuffer m_CompressedBuffer;
 
     while (This->IsRunning()) { // 没有退出，就一直陷在这个循环中
@@ -369,6 +393,9 @@ DWORD WINAPI IOCPClient::WorkThreadProc(LPVOID lParam)
         }
         FD_ZERO(&fd);
         FD_SET(This->m_sClientSocket, &fd);
+        // Linux select() 会修改 timeval，必须每次重置
+        tm.tv_sec = 2;
+        tm.tv_usec = 0;
 #ifdef _WIN32
         int iRet = select(NULL, &fd, NULL, NULL, &tm);
 #else
@@ -421,12 +448,18 @@ bool IOCPClient::ProcessRecvData(CBuffer *m_CompressedBuffer, char *szBuffer, in
 // 如果 f 执行过程中 抛出了异常（比如空指针访问），将被 __except 捕获，返回异常码（如 0xC0000005 表示访问违规）
 int DataProcessWithSEH(DataProcessCB f, void* manager, LPBYTE data, ULONG len)
 {
+#ifdef _WIN32
     __try {
         if (f) f(manager, data, len);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
+#else
+    // 非 Windows 平台暂不支持 SEH 异常处理，直接调用
+    if (f) f(manager, data, len);
+    return 0;
+#endif
 }
 
 
@@ -458,14 +491,28 @@ VOID IOCPClient::OnServerReceiving(CBuffer* m_CompressedBuffer, char* szBuffer, 
             HeaderEncType encType = HeaderEncUnknown;
             FlagType flagType = CheckHead(szPacketFlag, encType);
             if (flagType == FLAG_UNKNOWN) {
-                Mprintf("[ERROR] OnServerReceiving memcmp fail: unknown header '%s'. Mask: %d, Skip: %d.\n",
-                        szPacketFlag, maskType, ret);
+                // 打印诊断信息
+                ULONG bufLen = m_CompressedBuffer->GetBufferLength();
+                Mprintf("[ERROR] Unknown header! bufLen=%lu, first 16 bytes: ", bufLen);
+                for (int i = 0; i < 16 && i < (int)bufLen; ++i) {
+                    Mprintf("%02X ", (unsigned char)src[i]);
+                }
+                Mprintf("\n");
                 m_CompressedBuffer->ClearBuffer();
                 break;
             }
 
             ULONG ulPackTotalLength = 0;
             CopyMemory(&ulPackTotalLength, m_CompressedBuffer->GetBuffer(FLAG_LENGTH), sizeof(ULONG));
+
+            // 包长度合理性检查：防止错误的长度值导致内存问题
+            // 单个包不应超过 50MB，且至少要大于头部长度（支持大型DLL执行代码传输）
+            const ULONG MAX_PACKET_SIZE = 50 * 1024 * 1024;
+            if (ulPackTotalLength <= (ULONG)HDR_LENGTH || ulPackTotalLength > MAX_PACKET_SIZE) {
+                Mprintf("[ERROR] Invalid packet length: %lu (HDR=%d)\n", ulPackTotalLength, HDR_LENGTH);
+                m_CompressedBuffer->ClearBuffer();
+                break;
+            }
 
             //--- 数据的大小正确判断
             ULONG len = m_CompressedBuffer->GetBufferLength();
@@ -475,6 +522,16 @@ VOID IOCPClient::OnServerReceiving(CBuffer* m_CompressedBuffer, char* szBuffer, 
                 m_CompressedBuffer->ReadBuffer((PBYTE)szPacketFlag, FLAG_LENGTH);//读取各种头部 shine
                 m_CompressedBuffer->ReadBuffer((PBYTE) &ulPackTotalLength, sizeof(ULONG));
                 m_CompressedBuffer->ReadBuffer((PBYTE) &ulOriginalLength, sizeof(ULONG));
+
+                // 解压后长度合理性检查
+                if (ulOriginalLength == 0 || ulOriginalLength > MAX_PACKET_SIZE) {
+                    Mprintf("[ERROR] Invalid original length: %lu. Skipping packet.\n", ulOriginalLength);
+                    ULONG skipLen = ulPackTotalLength - HDR_LENGTH;
+                    if (skipLen > 0 && skipLen < len) {
+                        m_CompressedBuffer->Skip(skipLen);
+                    }
+                    continue;
+                }
 
                 ULONG ulCompressedLength = ulPackTotalLength - HDR_LENGTH;
                 const int bufSize = 512;
@@ -494,8 +551,8 @@ VOID IOCPClient::OnServerReceiving(CBuffer* m_CompressedBuffer, char* szBuffer, 
                         Mprintf("[ERROR] DataProcessWithSEH return exception code: [0x%08X]\n", ret);
                     }
                 } else {
-                    Mprintf("[ERROR] uncompress fail: dstLen %d, srcLen %d\n", ulOriginalLength, ulCompressedLength);
-                    m_CompressedBuffer->ClearBuffer();
+                    Mprintf("[ERROR] uncompress fail: dstLen %lu, srcLen %lu\n", ulOriginalLength, ulCompressedLength);
+                    // ReadBuffer 已消费当前包，不需要清空缓冲区
                 }
 
                 if (CompressedBuffer != buf1)delete [] CompressedBuffer;
@@ -517,6 +574,9 @@ BOOL IOCPClient::OnServerSending(const char* szBuffer, ULONG ulOriginalLength, P
 {
     AUTO_TICK(100, std::to_string(ulOriginalLength));
     assert (ulOriginalLength > 0);
+
+    // 整个发送过程需要加锁，防止多线程（视频+音频）数据交错
+    std::lock_guard<std::mutex> lock(m_Locker);
     {
         int cmd = BYTE(szBuffer[0]);
         //乘以1.001是以最坏的也就是数据压缩后占用的内存空间和原先一样 +12
@@ -531,9 +591,7 @@ BOOL IOCPClient::OnServerSending(const char* szBuffer, ULONG ulOriginalLength, P
 #endif
         BYTE			buf[1024];
         LPBYTE			CompressedBuffer = ulCompressedLength>1024 ? new BYTE[ulCompressedLength] : buf;
-        m_Locker.Lock();
         int	iRet = compress(CompressedBuffer, &ulCompressedLength, (PBYTE)szBuffer, ulOriginalLength);
-        m_Locker.Unlock();
         if (Z_FAILED(iRet)) {
             Mprintf("[ERROR] compress failed: srcLen %d, dstLen %d \n", ulOriginalLength, ulCompressedLength);
             if (CompressedBuffer != buf)  delete [] CompressedBuffer;

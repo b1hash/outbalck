@@ -1,4 +1,6 @@
 ﻿#pragma once
+#include <imm.h>
+#include <map>
 #include "IOCPServer.h"
 #include "..\..\client\CursorInfo.h"
 #include "VideoDlg.h"
@@ -39,6 +41,95 @@ extern "C"
 #pragma comment(lib, "Bcrypt.lib")
 #pragma comment(lib, "Strmiids.lib")
 
+// 文件接收消息（用于将工作线程的文件数据转发到主线程处理）
+#define WM_RECVFILEV2_CHUNK    (WM_USER + 0x200)
+#define WM_RECVFILEV2_COMPLETE (WM_USER + 0x201)
+
+// ScreenSpyDlg 系统菜单命令 ID
+enum {
+    IDM_CONTROL = 0x1010,
+    IDM_FULLSCREEN,
+    IDM_SEND_CTRL_ALT_DEL,
+    IDM_TRACE_CURSOR,       // 跟踪显示远程鼠标
+    IDM_BLOCK_INPUT,        // 锁定远程计算机输入
+    IDM_SAVEDIB,            // 保存图片
+    IDM_GET_CLIPBOARD,      // 获取剪贴板
+    IDM_SET_CLIPBOARD,      // 设置剪贴板
+    IDM_ADAPTIVE_SIZE,
+    IDM_SAVEAVI,
+    IDM_SAVEAVI_H264,
+    IDM_SWITCHSCREEN,
+    IDM_MULTITHREAD_COMPRESS,
+    IDM_FPS_10,
+    IDM_FPS_15,
+    IDM_FPS_20,
+    IDM_FPS_25,
+    IDM_FPS_30,
+    IDM_FPS_UNLIMITED,
+    IDM_ORIGINAL_SIZE,
+    IDM_SCREEN_1080P,
+    IDM_REMOTE_CURSOR,
+    IDM_SCROLL_DETECT_OFF,      // 滚动检测：关闭（局域网）
+    IDM_SCROLL_DETECT_2,        // 滚动检测：跨网推荐
+    IDM_SCROLL_DETECT_4,        // 滚动检测：标准模式
+    IDM_SCROLL_DETECT_8,        // 滚动检测：省CPU模式
+    IDM_QUALITY_OFF,            // 关闭质量控制（使用原有算法）
+    IDM_ADAPTIVE_QUALITY,       // 自适应质量
+    IDM_QUALITY_ULTRA,          // 手动质量：Ultra
+    IDM_QUALITY_HIGH,           // 手动质量：High
+    IDM_QUALITY_GOOD,           // 手动质量：Good
+    IDM_QUALITY_MEDIUM,         // 手动质量：Medium
+    IDM_QUALITY_LOW,            // 手动质量：Low
+    IDM_QUALITY_MINIMAL,        // 手动质量：Minimal
+    IDM_ENABLE_SSE2,
+    IDM_FAST_STRETCH,           // 快速缩放模式（降低CPU占用）
+    IDM_CUSTOM_CURSOR,          // 使用自定义光标
+    IDM_RESTORE_CONSOLE,        // RDP会话归位
+    IDM_RESET_VIRTUAL_DESKTOP,  // 重置虚拟桌面
+    IDM_AUDIO_TOGGLE,           // 音频开关
+};
+
+// 状态信息窗口 - 全屏时显示帧率/速度/质量
+class CStatusInfoWnd : public CWnd
+{
+public:
+    CStatusInfoWnd() : m_nOpacityLevel(0), m_bVisible(false), m_bDragging(false) {}
+
+    BOOL Create(CWnd* pParent);
+    void UpdateInfo(double fps, double kbps, const CString& quality);
+    void Show();
+    void Hide();
+    void SetOpacityLevel(int level);
+    void UpdatePosition(const RECT& rcMonitor);
+    void LoadSettings();
+    void SaveSettings();
+
+    bool IsVisible() const { return m_bVisible; }
+    bool IsParentInControlMode();  // 检查父窗口是否处于控制模式
+
+protected:
+    afx_msg void OnPaint();
+    afx_msg BOOL OnEraseBkgnd(CDC* pDC);
+    afx_msg void OnLButtonDown(UINT nFlags, CPoint point);
+    afx_msg void OnLButtonUp(UINT nFlags, CPoint point);
+    afx_msg void OnMouseMove(UINT nFlags, CPoint point);
+    DECLARE_MESSAGE_MAP()
+
+private:
+    CString m_strInfo;
+    int m_nOpacityLevel;
+    bool m_bVisible;
+
+    // 拖动支持
+    bool m_bDragging;
+    CPoint m_ptDragStart;
+
+    // 位置保存
+    double m_dOffsetXRatio = 0.5;
+    int m_nOffsetY = 50;
+    bool m_bHasCustomPosition = false;
+};
+
 // CScreenSpyDlg 对话框
 
 class CScreenSpyDlg : public DialogBase
@@ -46,9 +137,21 @@ class CScreenSpyDlg : public DialogBase
     DECLARE_DYNAMIC(CScreenSpyDlg)
     CToolbarDlg* m_pToolbar = nullptr;
     CMy2015RemoteDlg* m_pParent = nullptr;
-    ScreenSettings m_Settings = { 20 };
 
 public:
+    CStatusInfoWnd* m_pStatusInfoWnd = nullptr;
+    // MaxFPS=20, ScrollDetectInterval=2, Reserved={}, Capabilities=0
+    // MaxFPS=20, CompressThread=0, ScreenStrategy=0, ScreenWidth=0, ScreenHeight=0,
+    // FullScreen=0, RemoteCursor=0, ScrollDetectInterval=2, QualityLevel=-1,
+    // CpuSpeedup=0, ScreenType=0, AudioEnabled=0, Reserved={}, Capabilities=0
+    ScreenSettings m_Settings = { 20, 0, 0, 0, 0, 0, 0, 2, -1, 0, 0, 0, {}, 0 };
+
+public:
+    // 快速缩放模式（全局配置，所有实例共享）
+    static int s_nFastStretch;  // -1=未初始化, 0=关闭, 1=开启
+    static bool GetFastStretchMode();
+    static void SetFastStretchMode(bool bFast);
+
     CScreenSpyDlg(CMy2015RemoteDlg* Parent, Server* IOCPServer=NULL, CONTEXT_OBJECT *ContextObject=NULL);
     virtual ~CScreenSpyDlg();
     virtual BOOL ShouldReconnect()
@@ -65,7 +168,9 @@ public:
     LPBITMAPINFO m_BitmapInfor_Full;
     VOID DrawFirstScreen(void);
     VOID DrawNextScreenDiff(bool keyFrame);
+    VOID DrawScrollFrame(void);
     BOOL         m_bIsFirst;
+    bool         m_bQualitySwitch = false; // 质量切换中，不显示"请等待"
     ULONG m_ulHScrollPos;
     ULONG m_ulVScrollPos;
     // fillMode: 0=不填充, 1=全黑, 2=半透明
@@ -85,9 +190,17 @@ public:
     BOOL  m_bSend;
     ULONG m_ulMsgCount;
     int m_FrameID;
+    HIMC m_hOldIMC = NULL;  // 保存原始 IME 上下文，控制模式切换时使用
     bool m_bHide = false;
+    std::string m_strSaveNotice;     // 截图保存路径提示
+    ULONGLONG m_nSaveNoticeTime = 0; // 截图提示开始时间
+    BOOL m_bUsingFRP = FALSE;
 
-    BOOL SaveSnapshot(void);
+    // 文件接收进度对话框（用于 Linux Ctrl+C -> 服务端 Ctrl+V）
+    // 按 transferID 管理多个并发传输
+    std::map<uint64_t, class CDlgFileSend*> m_FileRecvDlgs;
+
+    void SaveSnapshot(void);
     // 对话框数据
     enum { IDD = IDD_DIALOG_SCREEN_SPY };
 
@@ -102,13 +215,77 @@ public:
     POINT				m_lastMousePoint;// 上次鼠标位置
     BOOL				m_bAdaptiveSize = TRUE;
     HCURSOR				m_hRemoteCursor = NULL;
+    HCURSOR             m_hCustomCursor = NULL;      // 缓存的自定义光标
+    DWORD               m_dwCustomCursorHash = 0;    // 当前自定义光标哈希
+    BOOL                m_bUseCustomCursor = TRUE;   // 是否使用自定义光标
     CRect				m_CRect;
     double				m_wZoom=1, m_hZoom=1;
     bool				m_bMouseTracking = false;
 
     CString             m_aviFile;
     CBmpToAvi	        m_aviStream;
+
+    // 传输速率统计
+    ULONG               m_ulBytesThisSecond = 0;    // 本秒累计字节
+    double              m_dTransferRate = 0;        // 当前速率 (KB/s)
+    // 帧率统计 (使用EMA平滑)
+    ULONG               m_ulFramesThisSecond = 0;   // 本秒累计帧数
+    double              m_dFrameRate = 0;           // 平滑后的帧率 (FPS)
+
+    // 自适应质量
+    struct {
+        bool enabled = false;                // 是否启用自适应 (默认关闭)
+        int currentLevel = QUALITY_HIGH;     // 当前质量等级
+        int currentMaxWidth = 0;             // 当前分辨率限制 (0=原始)
+        int lastRTT = 0;                     // 上次RTT值
+        ULONGLONG lastChangeTime = 0;        // 上次切换时间
+        ULONGLONG lastResChangeTime = 0;     // 上次分辨率变化时间
+        ULONGLONG startTime = 0;             // 启动时间 (用于延迟启动自适应)
+        int stableCount = 0;                 // 稳定计数 (用于防抖)
+    } m_AdaptiveQuality;
+
+    volatile bool m_bResolutionChanging = false;  // 分辨率切换中，阻止解码
+
+    // ========== 音频播放 ==========
+    // m_Settings.AudioEnabled 表示是否启用音频（与客户端同步）
+    BOOL        m_bAudioPlaying = FALSE;     // 音频是否正在播放
+    HWAVEOUT    m_hWaveOut = NULL;           // 波形输出设备句柄
+    WAVEFORMATEX m_AudioFormat = {};         // 音频格式
+    static const int AUDIO_BUFFER_COUNT = 8; // 缓冲区数量（增加到8个）
+    WAVEHDR     m_WaveHdr[AUDIO_BUFFER_COUNT] = {};  // 波形头
+    LPBYTE      m_pAudioBuf[AUDIO_BUFFER_COUNT] = {};// 音频缓冲区
+    int         m_nAudioBufIndex = 0;        // 当前缓冲区索引
+    static const DWORD AUDIO_BUF_SIZE = 8192;  // 8KB 每个缓冲区（更小更频繁）
+
+    // 环形缓冲区（吸收网络抖动）
+    static const DWORD RING_BUF_SIZE = 65536;  // 64KB 环形缓冲区
+    BYTE*       m_pRingBuf = nullptr;        // 环形缓冲区
+    DWORD       m_nRingHead = 0;             // 写入位置
+    DWORD       m_nRingTail = 0;             // 读取位置
+    DWORD       m_nRingDataLen = 0;          // 缓冲数据量
+    int         m_nPrebufferCount = 0;       // 预缓冲计数
+    static const int PREBUFFER_TARGET = 5;   // 预缓冲目标（积累5个包再开始播放，约50ms）
+
+    BYTE        m_nAudioCompression = 0;     // 音频压缩类型 (AudioCompression)
+#if USING_OPUS
+    void*       m_pOpusDecoder = nullptr;    // Opus 解码器
+    short*      m_pOpusDecodeBuffer = nullptr; // Opus 解码输出缓冲区
+#endif
+
+    void OnAudioData(BYTE* pData, UINT32 len);   // 处理音频数据
+    BOOL InitAudioPlayback(const AudioFormat* fmt);  // 初始化音频播放
+    void StopAudioPlayback();                    // 停止音频播放
+    void SendAudioCtrl(BYTE enable, BYTE persist); // 发送音频控制命令
+    void FeedAudioBuffers();                     // 填充音频缓冲区
+
+    int  GetClientRTT();                     // 获取客户端RTT(ms)
+    void EvaluateQuality();                  // 评估并调整质量
+    void ApplyQualityLevel(int level, bool persist = false); // 应用质量等级
+    const char* GetQualityName(int level);   // 获取质量等级名称
+    void UpdateQualityMenuCheck(CMenu* SysMenu = nullptr); // 更新质量菜单勾选状态
+
     void OnTimer(UINT_PTR nIDEvent);
+    void UpdateWindowTitle();
 
     bool Decode(LPBYTE Buffer, int size);
     void EnterFullScreen();
@@ -127,11 +304,22 @@ public:
     afx_msg void OnSize(UINT nType, int cx, int cy);
     afx_msg void OnActivate(UINT nState, CWnd* pWndOther, BOOL bMinimized);
     afx_msg LRESULT OnDisconnect(WPARAM wParam, LPARAM lParam);
+    afx_msg LRESULT OnWaveOutDone(WPARAM wParam, LPARAM lParam);
+    afx_msg LRESULT OnRecvFileV2Chunk(WPARAM wParam, LPARAM lParam);
+    afx_msg LRESULT OnRecvFileV2Complete(WPARAM wParam, LPARAM lParam);
     afx_msg void OnExitFullscreen()
     {
-		BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = FALSE };
-		m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = FALSE };
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
         LeaveFullScreen();
+    }
+    afx_msg void OnShowStatusInfo()
+    {
+        if (m_pStatusInfoWnd) m_pStatusInfoWnd->Show();
+    }
+    afx_msg void OnHideStatusInfo()
+    {
+        if (m_pStatusInfoWnd) m_pStatusInfoWnd->Hide();
     }
 
 protected:

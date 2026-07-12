@@ -7,9 +7,10 @@
 
 #include "Buffer.h"
 #define XXH_INLINE_ALL
-#include "xxhash.h"
+#include "common/xxhash.h"
 #include <WS2tcpip.h>
 #include <common/ikcp.h>
+#include <atomic>
 
 #define PACKET_LENGTH   0x2000
 
@@ -339,11 +340,13 @@ public:
             Zcctx = nullptr;
         }
     }
-    virtual void SetLastHeartbeat(uint64_t time) override {
-		LastHeartbeatTime = time;
-	}
-    virtual uint64_t GetLastHeartbeat() override {
-		return LastHeartbeatTime;
+    virtual void SetLastHeartbeat(uint64_t time) override
+    {
+        LastHeartbeatTime = time;
+    }
+    virtual uint64_t GetLastHeartbeat() override
+    {
+        return LastHeartbeatTime;
     }
     CString  sClientInfo[ONLINELIST_MAX];
     CString  additonalInfo[RES_MAX];
@@ -355,20 +358,25 @@ public:
     CBuffer				InDeCompressedBuffer;	    // 解压后的数据
     CBuffer             OutCompressedBuffer;
     HANDLE              hDlg;                       // 对话框指针
+    HWND                hWnd;                       // 对话框窗口
     OVERLAPPEDPLUS*		olps;						// OVERLAPPEDPLUS
     int					CompressMethod;				// 压缩算法
     HeaderParser		Parser;						// 解析数据协议
     uint64_t			ID;							// 唯一标识
 
     BOOL				m_bProxyConnected;			// 代理是否连接
-    BOOL 				bLogin;						// 是否 login
+    std::string 		MasterID;					// 所属主控ID
     std::string			PeerName;					// 对端IP
     Server*				server;						// 所属服务端
     ikcpcb*				kcp = nullptr;				// 新增，指向KCP会话
     std::string			GroupName;					// 分组名称
     CLock               SendLock;                   // fix #214
     time_t              OnlineTime = 0;             // 上线时间
-	time_t              LastHeartbeatTime = 0;      // 最后心跳时间
+    time_t              LastHeartbeatTime = 0;      // 最后心跳时间
+
+    // 引用计数：跟踪正在处理此对象的工作线程数量，防止竞态条件 (#215)
+    std::atomic<int>    IoRefCount{0};              // I/O 处理引用计数
+    std::atomic<bool>   IsRemoved{false};           // 标记是否已被标记为移除
 
     // 预分配的解压缩缓冲区，避免频繁内存分配
     PBYTE               DecompressBuffer = nullptr;
@@ -382,7 +390,8 @@ public:
     int                 CompressLevel = ZSTD_CLEVEL_DEFAULT;
     ZSTD_CCtx*          Zcctx = nullptr;
 
-    void EnableZstdContext(int level = ZSTD_CLEVEL_DEFAULT) {
+    void EnableZstdContext(int level = ZSTD_CLEVEL_DEFAULT)
+    {
         CAutoCLock L(SendLock);
         CompressLevel = level;
         if (Zcctx == nullptr) {
@@ -390,14 +399,16 @@ public:
             ZSTD_CCtx_setParameter(Zcctx, ZSTD_c_compressionLevel, level);
         }
     }
-    void SetCompressionLevel(int level) {
+    void SetCompressionLevel(int level)
+    {
         CAutoCLock L(SendLock);
         CompressLevel = level;
         if (Zcctx) {
             ZSTD_CCtx_setParameter(Zcctx, ZSTD_c_compressionLevel, level);
         }
     }
-    int GetZstdLevel() const {
+    int GetZstdLevel() const
+    {
         return CompressLevel;
     }
     // 获取或分配解压缩缓冲区
@@ -473,6 +484,7 @@ public:
     {
         memset(szBuffer, 0, sizeof(char) * PACKET_LENGTH);
         hDlg = NULL;
+        hWnd = NULL;
         sClientSocket = s;
         PeerName = ::GetPeerName(sClientSocket);
         memset(&wsaInBuf, 0, sizeof(WSABUF));
@@ -486,11 +498,18 @@ public:
         }
         CompressMethod = COMPRESS_ZSTD;
         Parser.Reset();
-        bLogin = FALSE;
+        MasterID.clear();
         m_bProxyConnected = FALSE;
         server = (Server*)svr;
         OnlineTime = time(0);
-		LastHeartbeatTime = OnlineTime;
+        LastHeartbeatTime = OnlineTime;
+        GroupName.clear();
+        ID = 0;
+        // 重置引用计数和移除标志 (#215)
+        // 顺序重要：先确保 IsRemoved=false（允许新的 I/O 处理），再重置 IoRefCount
+        // 注意：到达这里时，RemoveStaleContext 应该已经等待 IoRefCount==0
+        IsRemoved.store(false, std::memory_order_release);
+        IoRefCount.store(0, std::memory_order_release);
     }
     uint64_t GetAliveTime()const
     {
@@ -535,7 +554,7 @@ public:
     }
     virtual int GetPort() const
     {
-		// 第一次返回套接字，后续返回地址栏端口号
+        // 第一次返回套接字，后续返回地址栏端口号
         if (sClientInfo[ONLINELIST_ADDR].IsEmpty())
             return sClientSocket;
         return atoi(sClientInfo[ONLINELIST_ADDR]);
@@ -543,6 +562,11 @@ public:
     CString GetClientData(int index)  const override
     {
         return sClientInfo[index];
+    }
+    void SetClientData(int index, const CString& data ) {
+        if (index < ONLINELIST_MAX) {
+            sClientInfo[index] = data;
+        }
     }
     void GetAdditionalData(CString(&s)[RES_MAX])  const override
     {
@@ -556,17 +580,24 @@ public:
     }
     void SetAdditionalData(int index, const std::string &value)
     {
-		if (index >= 0 && index < RES_MAX) {
+        if (index >= 0 && index < RES_MAX) {
             additonalInfo[index] = value.c_str();
         }
-	}
+    }
     std::string GetGroupName() const override
     {
         return GroupName;
     }
+    virtual void SetGroupName(const std::string& group)override
+    {
+        GroupName = group;
+    }
     BOOL IsLogin() const override
     {
-        return bLogin;
+        return true;
+    }
+    virtual std::string GetMasterID() const override {
+		return MasterID;
     }
     uint64_t GetClientID() const override
     {
@@ -674,13 +705,6 @@ public:
         auto enc = Parser.GetEncoder2();
         if (enc) enc->Decode((unsigned char*)data, len, param);
     }
-    std::string RemoteAddr() const
-    {
-        sockaddr_in  ClientAddr = {};
-        int ulClientAddrLen = sizeof(sockaddr_in);
-        int s = getpeername(sClientSocket, (SOCKADDR*)&ClientAddr, &ulClientAddrLen);
-        return s != INVALID_SOCKET ? inet_ntoa(ClientAddr.sin_addr) : "";
-    }
     static uint64_t CalculateID(const CString(&data)[ONLINELIST_MAX])
     {
         int idx[] = { ONLINELIST_PUBIP, ONLINELIST_COMPUTER_NAME, ONLINELIST_OS, ONLINELIST_CPU, ONLINELIST_PATH, };
@@ -736,8 +760,8 @@ public:
     {
         char client_ip[INET_ADDRSTRLEN];
 #if (defined(_WIN32_WINNT) && _WIN32_WINNT <= 0x0501)
-		strncpy(client_ip, inet_ntoa(clientAddr.sin_addr), INET_ADDRSTRLEN - 1);
-		client_ip[INET_ADDRSTRLEN - 1] = '\0';
+        strncpy(client_ip, inet_ntoa(clientAddr.sin_addr), INET_ADDRSTRLEN - 1);
+        client_ip[INET_ADDRSTRLEN - 1] = '\0';
 #else
         inet_ntop(AF_INET, &clientAddr.sin_addr, client_ip, INET_ADDRSTRLEN);
 #endif

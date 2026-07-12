@@ -15,15 +15,13 @@
 #include <future>
 #include <emmintrin.h>  // SSE2
 #include "X264Encoder.h"
+#include "ScrollDetector.h"
 #include "common/file_upload.h"
 
-inline bool HasSSE2() {
-#ifdef _DEBUG
-    return false;
-#else
+inline bool HasSSE2()
+{
     auto static has = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE);
     return has;
-#endif
 }
 
 class ThreadPool
@@ -34,7 +32,8 @@ public:
     {
         for (size_t i = 0; i < numThreads; ++i) {
             workers.emplace_back([this] {
-                while (true) {
+                while (true)
+                {
                     std::function<void()> task;
                     {
                         std::unique_lock<std::mutex> lock(this->queueMutex);
@@ -150,6 +149,32 @@ public:
     int             m_nScreenCount;      // 屏幕数量
     BOOL            m_bEnableMultiScreen;// 多显示器支持
 
+    // 滚动检测相关
+    CScrollDetector* m_pScrollDetector;  // 滚动检测器
+    bool            m_bEnableScrollDetect;   // 是否启用滚动检测
+    bool            m_bServerSupportsScroll; // 服务端是否支持滚动
+    bool            m_bLastFrameWasScroll;   // 上一帧是否是滚动帧（用于强制同步）
+    int             m_nScrollDetectInterval; // 滚动检测间隔（0=禁用, 1=每帧, 2=每2帧, ...）
+    int             m_nInstructionSet = 0;
+    int             m_nBitRate = 0;      // H264 编码码率 (kbps), 0=自动
+
+    // 自定义光标相关
+    DWORD           m_dwLastCursorHash = 0;      // 上次发送的光标哈希
+    DWORD           m_dwLastCursorSendTime = 0;  // 上次发送光标的时间
+    bool            m_bPendingCursorImage = false; // 是否有待发送的光标图像
+    BYTE            m_CursorImageBuffer[MAX_CURSOR_SIZE * MAX_CURSOR_SIZE * 4 + 16]; // 光标图像缓冲
+    ULONG           m_ulCursorImageSize = 0;     // 光标图像数据大小
+
+    // bitRate → CRF 映射：码率越高 CRF 越低（质量越好）
+    // 3000→20, 2000→23, 1200→26, 800→30
+    static int BitRateToCRF(int bitRate) {
+        if (bitRate <= 0)    return 23;
+        if (bitRate >= 3000) return 20;
+        if (bitRate >= 2000) return 20 + (3000 - bitRate) * 3 / 1000;
+        if (bitRate >= 800)  return 23 + (2000 - bitRate) * 7 / 1200;
+        return 32;
+    }
+
 protected:
     int             m_nVScreenLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int             m_nVScreenTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -162,7 +187,9 @@ public:
         m_BitmapInfor_Full(nullptr), m_bAlgorithm(algo), m_SendQuality(100),
         m_ulFullWidth(0), m_ulFullHeight(0), m_bZoomed(false), m_wZoom(1), m_hZoom(1),
         m_FrameID(0), m_GOP(DEFAULT_GOP), m_iScreenX(0), m_iScreenY(0), m_biBitCount(n),
-        m_SendKeyFrame(false), m_encoder(nullptr)
+        m_SendKeyFrame(false), m_encoder(nullptr),
+        m_pScrollDetector(nullptr), m_bEnableScrollDetect(false), m_bServerSupportsScroll(false),
+        m_bLastFrameWasScroll(false), m_nScrollDetectInterval(1)
     {
         m_BitmapInfor_Send = nullptr;
         m_BmpZoomBuffer = nullptr;
@@ -203,12 +230,6 @@ public:
             Mprintf("=> 桌面缩放比例: %.2f, %.2f\t分辨率：%d x %d\n", m_wZoom, m_hZoom, m_ulFullWidth, m_ulFullHeight);
             m_wZoom = 1.0 / m_wZoom, m_hZoom = 1.0 / m_hZoom;
         }
-        if (ALGORITHM_H264 == m_bAlgorithm) {
-            m_encoder = new CX264Encoder();
-            if (!m_encoder->open(m_ulFullWidth, m_ulFullHeight, 20, m_ulFullWidth * m_ulFullHeight / 1266)) {
-                Mprintf("Open x264encoder failed!!!\n");
-            }
-        }
 
         m_BlockBuffers = new LPBYTE[m_BlockNum];
         m_BlockSizes = new ULONG[m_BlockNum];
@@ -235,6 +256,7 @@ public:
 
         SAFE_DELETE(m_ThreadPool);
         SAFE_DELETE(m_encoder);
+        SAFE_DELETE(m_pScrollDetector);
     }
 
     virtual int GetScreenCount() const
@@ -242,35 +264,47 @@ public:
         return m_nScreenCount;
     }
 
-	virtual int GetScreenWidth() const
-	{
-		return m_ulFullWidth;
-	}
-	virtual int GetScreenHeight() const
-	{
-		return m_ulFullHeight;
-	}
-	virtual int GetScreenLeft() const {
-		return m_iScreenX;
-	}
-	virtual int GetScreenTop() const {
-		return m_iScreenY;
-	}
+    virtual int GetCurrentWidth() const
+    {
+        return m_BitmapInfor_Send->bmiHeader.biWidth;
+    }
+    virtual int GetCurrentHeight() const
+    {
+        return m_BitmapInfor_Send->bmiHeader.biHeight;
+    }
+    virtual int GetScreenWidth() const
+    {
+        return m_ulFullWidth;
+    }
+    virtual int GetScreenHeight() const
+    {
+        return m_ulFullHeight;
+    }
+    virtual int GetScreenLeft() const
+    {
+        return m_iScreenX;
+    }
+    virtual int GetScreenTop() const
+    {
+        return m_iScreenY;
+    }
 
-	inline int GetVScreenWidth() const
-	{
-		return m_nVScreenWidth;
-	}
+    inline int GetVScreenWidth() const
+    {
+        return m_nVScreenWidth;
+    }
     inline int GetVScreenHeight() const
-	{
-		return m_nVScreenHeight;
-	}
-    inline int GetVScreenLeft() const {
-		return m_nVScreenLeft;
-	}
-    inline int GetVScreenTop() const {
-		return m_nVScreenTop;
-	}
+    {
+        return m_nVScreenHeight;
+    }
+    inline int GetVScreenLeft() const
+    {
+        return m_nVScreenLeft;
+    }
+    inline int GetVScreenTop() const
+    {
+        return m_nVScreenTop;
+    }
 
     virtual bool IsOriginalSize() const
     {
@@ -317,8 +351,10 @@ public:
         // Windows规定一个扫描行所占的字节数必须是4的倍数, 所以用DWORD比较
         LPDWORD	p1 = (LPDWORD)CompareDestData, p2 = (LPDWORD)CompareSourData;
         LPBYTE p = szBuffer;
-        ULONG channel = algo == ALGORITHM_GRAY ? 1 : 4;
-        ULONG ratio = algo == ALGORITHM_GRAY ? 4 : 1;
+        // channel: 输出每像素字节数
+        // ratio: 长度字段的除数 (GRAY/RGB565 发送像素数量，DIFF 发送字节数)
+        ULONG channel = (algo == ALGORITHM_GRAY) ? 1 : (algo == ALGORITHM_RGB565) ? 2 : 4;
+        ULONG ratio = (algo == ALGORITHM_GRAY || algo == ALGORITHM_RGB565) ? 4 : 1;
         for (ULONG i = 0; i < ulCompareLength; i += 4, ++p1, ++p2) {
             if (*p1 == *p2)
                 continue;
@@ -332,7 +368,11 @@ public:
             *(LPDWORD)(p) = index + startPostion;
             *(LPDWORD)(p + sizeof(ULONG)) = ulCount / ratio;
             p += 2 * sizeof(ULONG);
-            if (channel != 1) {
+            if (algo == ALGORITHM_RGB565) {
+                // BGRA → RGB565 转换
+                ConvertBGRAtoRGB565((const BYTE*)pos2, (uint16_t*)p, ulCount / 4);
+                p += ulCount / 2;
+            } else if (channel != 1) {
                 memcpy(p, pos2, ulCount);
                 p += ulCount;
             } else {
@@ -350,12 +390,14 @@ public:
     virtual ULONG CompareBitmap(LPBYTE CompareSourData, LPBYTE CompareDestData, LPBYTE szBuffer,
                                 DWORD ulCompareLength, BYTE algo, int startPostion = 0)
     {
-        if (UsingDXGI() || !HasSSE2())
+        if (m_nInstructionSet == 0 || UsingDXGI() || !HasSSE2())
             return CompareBitmapDXGI(CompareSourData, CompareDestData, szBuffer, ulCompareLength, algo, startPostion);
 
         LPBYTE p = szBuffer;
-        ULONG channel = algo == ALGORITHM_GRAY ? 1 : 4;
-        ULONG ratio = algo == ALGORITHM_GRAY ? 4 : 1;
+        // channel: 输出每像素字节数
+        // ratio: 长度字段的除数 (GRAY/RGB565 发送像素数量，DIFF 发送字节数)
+        ULONG channel = (algo == ALGORITHM_GRAY) ? 1 : (algo == ALGORITHM_RGB565) ? 2 : 4;
+        ULONG ratio = (algo == ALGORITHM_GRAY || algo == ALGORITHM_RGB565) ? 4 : 1;
 
         // SSE2: 每次比较 16 字节 (4 个像素)
         const ULONG SSE_BLOCK = 16;
@@ -436,7 +478,11 @@ public:
             *(LPDWORD)(p + sizeof(ULONG)) = ulCount / ratio;
             p += 2 * sizeof(ULONG);
 
-            if (channel != 1) {
+            if (algo == ALGORITHM_RGB565) {
+                // RGB565 转换：使用 SSE2 优化
+                ConvertBGRAtoRGB565(pos2, (uint16_t*)p, ulCount / 4);
+                p += ulCount / 2;
+            } else if (channel != 1) {
                 memcpy(p, pos2, ulCount);
                 p += ulCount;
             } else {
@@ -467,7 +513,11 @@ public:
                 *(LPDWORD)(p + sizeof(ULONG)) = ulCount / ratio;
                 p += 2 * sizeof(ULONG);
 
-                if (channel != 1) {
+                if (algo == ALGORITHM_RGB565) {
+                    // RGB565 转换
+                    ConvertBGRAtoRGB565((const BYTE*)pos2, (uint16_t*)p, ulCount / 4);
+                    p += ulCount / 2;
+                } else if (channel != 1) {
                     memcpy(p, pos2, ulCount);
                     p += ulCount;
                 } else {
@@ -525,17 +575,147 @@ public:
         return offset;  // 返回缓冲区的大小
     }
 
-    virtual int GetFrameID() const {
+    virtual int GetFrameID() const
+    {
         return m_FrameID;
     }
 
-    virtual LPBYTE GetFirstBuffer() const {
+    virtual LPBYTE GetFirstBuffer() const
+    {
         return m_FirstBuffer;
     }
 
-    virtual int GetBMPSize() const {
+    virtual int GetBMPSize() const
+    {
         assert(m_BitmapInfor_Send);
         return m_BitmapInfor_Send->bmiHeader.biSizeImage;
+    }
+
+    // ===================== 滚动检测相关方法 =====================
+
+    // 启用/禁用滚动检测
+    virtual void EnableScrollDetection(bool enable)
+    {
+        m_bEnableScrollDetect = enable;
+        if (enable && !m_pScrollDetector && m_BitmapInfor_Send) {
+            m_pScrollDetector = new CScrollDetector(
+                m_BitmapInfor_Send->bmiHeader.biWidth,
+                m_BitmapInfor_Send->bmiHeader.biHeight,
+                4  // BGRA
+            );
+        }
+    }
+
+    // 设置服务端能力标志
+    virtual void SetServerCapabilities(uint32_t caps)
+    {
+        m_bServerSupportsScroll = (caps & CAP_SCROLL_DETECT) != 0;
+    }
+
+    // 设置滚动检测间隔（0=禁用, 1=每帧, 2=每2帧, ...）
+    virtual void SetScrollDetectInterval(int interval)
+    {
+        m_nScrollDetectInterval = interval;
+        // 间隔为0时禁用滚动检测
+        if (interval <= 0) {
+            m_bEnableScrollDetect = false;
+        }
+    }
+
+    // 构建滚动帧
+    // scrollAmount > 0: 向下滚动，底部露出新内容
+    // scrollAmount < 0: 向上滚动，顶部露出新内容
+    virtual LPBYTE BuildScrollFrame(int scrollAmount, LPBYTE currentFrame, ULONG* outLength)
+    {
+        BYTE algo = m_bAlgorithm;
+        BYTE direction = (scrollAmount > 0) ? SCROLL_DIR_DOWN : SCROLL_DIR_UP;
+        int absScroll = abs(scrollAmount);
+
+        // 消息头: TOKEN(1) + 算法(1) + 光标位置(8) + 光标类型(1) = 11字节
+        m_RectBuffer[0] = TOKEN_SCROLL_FRAME;
+        LPBYTE data = m_RectBuffer + 1;
+
+        // 写入算法类型
+        data[0] = algo;
+
+        // 写入光标位置
+        POINT CursorPos;
+        GetCursorPos(&CursorPos);
+        CursorPos.x /= m_wZoom;
+        CursorPos.y /= m_hZoom;
+        memcpy(data + 1, &CursorPos, sizeof(POINT));
+
+        // 写入当前光标类型（支持自定义光标）
+        static CCursorInfo m_CursorInfor;
+        BYTE bCursorIndex = CheckAndUpdateCursor(m_CursorInfor);
+        data[1 + sizeof(POINT)] = bCursorIndex;
+
+        ULONG headerOffset = 1 + sizeof(POINT) + sizeof(BYTE);  // 11字节
+
+        // 滚动帧特有字段
+        // 方向(1) + 滚动量(4) + 边缘偏移(4) + 边缘长度(4) = 13字节
+        data[headerOffset] = direction;
+        *(int*)(data + headerOffset + 1) = absScroll;
+
+        int edgeOffset, edgePixelCount;
+        m_pScrollDetector->GetEdgeRegion(scrollAmount, &edgeOffset, &edgePixelCount);
+
+        *(int*)(data + headerOffset + 5) = edgeOffset;
+        *(int*)(data + headerOffset + 9) = edgePixelCount;
+
+        ULONG scrollHeaderSize = 13;  // 滚动特有头部大小
+        LPBYTE edgeData = data + headerOffset + scrollHeaderSize;
+
+        // 复制边缘数据（根据算法格式转换）
+        LPBYTE srcEdge = currentFrame + edgeOffset;
+        ULONG edgeByteSize;
+
+        switch (algo) {
+        case ALGORITHM_RGB565:
+            ConvertBGRAtoRGB565(srcEdge, (uint16_t*)edgeData, edgePixelCount);
+            edgeByteSize = edgePixelCount * 2;
+            break;
+        case ALGORITHM_GRAY:
+            ConvertToGray_SSE2(edgeData, srcEdge, edgePixelCount * 4);
+            edgeByteSize = edgePixelCount;
+            break;
+        case ALGORITHM_DIFF:
+        default:
+            memcpy(edgeData, srcEdge, edgePixelCount * 4);
+            edgeByteSize = edgePixelCount * 4;
+            break;
+        }
+
+        *outLength = 1 + headerOffset + scrollHeaderSize + edgeByteSize;
+
+        // 更新 FirstBuffer：应用滚动并复制新边缘数据
+        ApplyScrollToFirstBuffer(scrollAmount, currentFrame);
+
+        m_FrameID++;
+        return m_RectBuffer;
+    }
+
+    // 将滚动应用到 FirstBuffer（必须与服务端 DrawScrollFrame 操作完全一致）
+    // 这样下一帧的差分计算才能正确反映实际变化
+    virtual void ApplyScrollToFirstBuffer(int scrollAmount, LPBYTE currentFrame)
+    {
+        int stride = m_BitmapInfor_Send->bmiHeader.biWidth * 4;
+        int height = m_BitmapInfor_Send->bmiHeader.biHeight;
+        int absScroll = abs(scrollAmount);
+        LPBYTE first = GetFirstBuffer();
+        int copyHeight = height - absScroll;
+
+        if (scrollAmount > 0) {
+            // 向下滚动：BMP 中低地址移到高地址
+            memmove(first + absScroll * stride, first, copyHeight * stride);
+            // 边缘数据填充到低地址
+            memcpy(first, currentFrame, absScroll * stride);
+        } else {
+            // 向上滚动：BMP 中高地址移到低地址
+            memmove(first, first + absScroll * stride, copyHeight * stride);
+            // 边缘数据填充到高地址
+            memcpy(first + copyHeight * stride, currentFrame + copyHeight * stride, absScroll * stride);
+        }
     }
 
     // SSE2 优化：BGRA 转单通道灰度，一次处理 4 个像素，输出 4 字节
@@ -576,6 +756,75 @@ public:
         }
     }
 
+    // ===================== RGB565 转换函数 =====================
+
+    // BGRA → RGB565 标量版本 (后备，用于不支持 SSE2 的 CPU)
+    // 输入: BGRA 像素数据 (每像素 4 字节)
+    // 输出: RGB565 像素数据 (每像素 2 字节)
+    // RGB565 格式: RRRRRGGG GGGBBBBB (R:5位, G:6位, B:5位)
+    inline void ConvertBGRAtoRGB565_Scalar(const BYTE* src, uint16_t* dst, ULONG pixelCount)
+    {
+        for (ULONG i = 0; i < pixelCount; i++, src += 4, dst++) {
+            // src[0]=B, src[1]=G, src[2]=R, src[3]=A
+            *dst = ((src[2] >> 3) << 11) | ((src[1] >> 2) << 5) | (src[0] >> 3);
+        }
+    }
+
+    // BGRA → RGB565 SSE2 优化版本
+    // 一次处理 4 个像素 (16字节输入 → 8字节输出)
+    inline void ConvertBGRAtoRGB565_SSE2(const BYTE* src, uint16_t* dst, ULONG pixelCount)
+    {
+        ULONG i = 0;
+
+        // SSE2 掩码: 提取 R、G、B 高位
+        __m128i r_mask = _mm_set1_epi32(0x00F80000);  // R: bit16-23 中取高5位
+        __m128i g_mask = _mm_set1_epi32(0x0000FC00);  // G: bit8-15 中取高6位
+        __m128i b_mask = _mm_set1_epi32(0x000000F8);  // B: bit0-7 中取高5位
+
+        // 无符号打包技巧：先减去 0x8000，有符号打包后再加回来
+        __m128i offset32 = _mm_set1_epi32(0x8000);
+        __m128i offset16 = _mm_set1_epi16((short)0x8000);
+
+        // 每次处理 4 个像素
+        for (; i + 4 <= pixelCount; i += 4, src += 16, dst += 4) {
+            // 加载 4 个 BGRA 像素 [B0G0R0A0 | B1G1R1A1 | B2G2R2A2 | B3G3R3A3]
+            __m128i bgra = _mm_loadu_si128((const __m128i*)src);
+
+            // 提取并移位各通道
+            __m128i r = _mm_srli_epi32(_mm_and_si128(bgra, r_mask), 8);   // R >> 8 → bit11-15
+            __m128i g = _mm_srli_epi32(_mm_and_si128(bgra, g_mask), 5);   // G >> 5 → bit5-10
+            __m128i b = _mm_srli_epi32(_mm_and_si128(bgra, b_mask), 3);   // B >> 3 → bit0-4
+
+            // 合并 RGB565 (值范围 0-65535)
+            __m128i rgb565_32 = _mm_or_si128(_mm_or_si128(r, g), b);
+
+            // 无符号 32→16 打包：减去 0x8000 使其变成有符号范围
+            __m128i rgb565_signed = _mm_sub_epi32(rgb565_32, offset32);
+            // 有符号饱和打包 (现在不会截断了)
+            __m128i packed_signed = _mm_packs_epi32(rgb565_signed, _mm_setzero_si128());
+            // 加回 0x8000 还原为无符号值
+            __m128i packed = _mm_add_epi16(packed_signed, offset16);
+
+            // 存储 4 个 RGB565 像素 (8字节)
+            _mm_storel_epi64((__m128i*)dst, packed);
+        }
+
+        // 处理剩余像素 (标量)
+        for (; i < pixelCount; i++, src += 4, dst++) {
+            *dst = ((src[2] >> 3) << 11) | ((src[1] >> 2) << 5) | (src[0] >> 3);
+        }
+    }
+
+    // BGRA → RGB565 运行时分发 (根据 CPU 特性自动选择)
+    inline void ConvertBGRAtoRGB565(const BYTE* src, uint16_t* dst, ULONG pixelCount)
+    {
+        if (m_nInstructionSet && HasSSE2()) {
+            ConvertBGRAtoRGB565_SSE2(src, dst, pixelCount);
+        } else {
+            ConvertBGRAtoRGB565_Scalar(src, dst, pixelCount);
+        }
+    }
+
     virtual LPBITMAPINFO ConstructBitmapInfo(int biBitCount, int biWidth, int biHeight)
     {
         assert(biBitCount == 32);
@@ -608,9 +857,9 @@ public:
         CursorPos.y /= m_hZoom;
         memcpy(data + sizeof(BYTE), (LPBYTE)&CursorPos, sizeof(POINT));
 
-        // 写入当前光标类型
+        // 写入当前光标类型（支持自定义光标）
         static CCursorInfo m_CursorInfor;
-        BYTE	bCursorIndex = m_CursorInfor.getCurrentCursorIndex();
+        BYTE	bCursorIndex = CheckAndUpdateCursor(m_CursorInfor);
         memcpy(data + sizeof(BYTE) + sizeof(POINT), &bCursorIndex, sizeof(BYTE));
         ULONG offset = sizeof(BYTE) + sizeof(POINT) + sizeof(BYTE);
 
@@ -621,6 +870,25 @@ public:
             *ulNextSendLength = 1 + offset;
             return m_RectBuffer;
         }
+
+        // 滚动检测：在非关键帧且启用滚动检测时进行
+        // 注意：H264 模式跳过（编码器内置运动估计会自动处理）
+        // 如果上一帧是滚动帧，则跳过本帧的滚动检测，发送差分帧来同步可能的误差
+        // m_nScrollDetectInterval: 0=禁用, 1=每帧, 2=每2帧, ...
+        bool shouldDetectScroll = !keyFrame && algo != ALGORITHM_H264 &&
+                                  m_bEnableScrollDetect && m_bServerSupportsScroll && m_pScrollDetector &&
+                                  !m_bLastFrameWasScroll && m_nScrollDetectInterval > 0 &&
+                                  (m_FrameID % m_nScrollDetectInterval == 0);
+
+        if (shouldDetectScroll) {
+            int scrollAmount = m_pScrollDetector->DetectVerticalScroll(GetFirstBuffer(), nextData);
+            if (scrollAmount != 0 && abs(scrollAmount) >= MIN_SCROLL_LINES) {
+                // 检测到滚动，构建滚动帧
+                m_bLastFrameWasScroll = true;
+                return BuildScrollFrame(scrollAmount, nextData, ulNextSendLength);
+            }
+        }
+        m_bLastFrameWasScroll = false;
 
 #if SCREENYSPY_IMPROVE
         memcpy(data + offset, &++m_FrameID, sizeof(int));
@@ -644,11 +912,24 @@ public:
                 ToGray(data + offset, nextData, m_BitmapInfor_Send->bmiHeader.biSizeImage);
                 break;
             }
+            case ALGORITHM_RGB565: {
+                // RGB565 关键帧：BGRA 整帧转换为 RGB565
+                ULONG pixelCount = m_BitmapInfor_Send->bmiHeader.biSizeImage / 4;
+                ULONG rgb565Size = pixelCount * 2;
+                ConvertBGRAtoRGB565(nextData, (uint16_t*)(data + offset), pixelCount);
+                *ulNextSendLength = 1 + offset + rgb565Size;
+                break;
+            }
             case ALGORITHM_H264: {
                 uint8_t* encoded_data = nullptr;
                 uint32_t  encoded_size = 0;
-                int err = m_encoder->encode(nextData, 32, 4* m_BitmapInfor_Send->bmiHeader.biWidth,
-                                            m_BitmapInfor_Send->bmiHeader.biWidth, m_BitmapInfor_Send->bmiHeader.biHeight, &encoded_data, &encoded_size);
+                int width = m_BitmapInfor_Send->bmiHeader.biWidth, height = m_BitmapInfor_Send->bmiHeader.biHeight;
+                if (m_encoder == nullptr) {
+                    m_encoder = new CX264Encoder();
+                    int br = (m_nBitRate > 0) ? m_nBitRate : (width * height / 1266);
+                    m_encoder->open(width, height, 20, BitRateToCRF(br));
+                }
+                int err = m_encoder->encode(nextData, 32, 4 * width, width, height, &encoded_data, &encoded_size);
                 if (err) {
                     return nullptr;
                 }
@@ -663,15 +944,22 @@ public:
         } else {
             switch (algo) {
             case ALGORITHM_DIFF:
-            case ALGORITHM_GRAY: {
+            case ALGORITHM_GRAY:
+            case ALGORITHM_RGB565: {
+                // DIFF/GRAY/RGB565 都走差分逻辑，区别在 CompareBitmap 内部处理
                 *ulNextSendLength = 1 + offset + MultiCompareBitmap(nextData, GetFirstBuffer(), data + offset, GetBMPSize(), algo);
                 break;
             }
             case ALGORITHM_H264: {
                 uint8_t* encoded_data = nullptr;
                 uint32_t  encoded_size = 0;
-                int err = m_encoder->encode(nextData, 32, 4 * m_BitmapInfor_Send->bmiHeader.biWidth,
-                                            m_BitmapInfor_Send->bmiHeader.biWidth, m_BitmapInfor_Send->bmiHeader.biHeight, &encoded_data, &encoded_size);
+                int width = m_BitmapInfor_Send->bmiHeader.biWidth, height = m_BitmapInfor_Send->bmiHeader.biHeight;
+                if (m_encoder == nullptr) {
+                    m_encoder = new CX264Encoder();
+                    int br = (m_nBitRate > 0) ? m_nBitRate : (width * height / 1266);
+                    m_encoder->open(width, height, 20, BitRateToCRF(br));
+                }
+                int err = m_encoder->encode(nextData, 32, 4 * width, width, height, &encoded_data, &encoded_size);
                 if (err) {
                     return nullptr;
                 }
@@ -687,6 +975,12 @@ public:
         return m_RectBuffer;
     }
 
+    // 获取屏幕传输算法
+    virtual BYTE GetAlgorithm() const
+    {
+        return m_bAlgorithm;
+    }
+
     // 设置屏幕传输算法
     virtual BYTE SetAlgorithm(int algo)
     {
@@ -695,13 +989,37 @@ public:
         return oldAlgo;
     }
 
-    // 鼠标位置转换
+    // 设置 H264 编码码率 (kbps), 0=自动计算
+    // 返回码率是否变化，调用者需要在变化时 RestartScreen
+    virtual bool SetBitRate(int bitrate)
+    {
+        if (m_nBitRate == bitrate)
+            return false;
+        m_nBitRate = bitrate;
+        return true;
+    }
+
+    virtual int GetBitRate() const
+    {
+        return m_nBitRate;
+    }
+
+    // 鼠标位置转换：将服务端坐标（基于发送分辨率）转换为客户端坐标（原始分辨率）
     virtual void PointConversion(POINT& pt) const
     {
-        if (m_bZoomed) {
-            pt.x *= m_wZoom;
-            pt.y *= m_hZoom;
+        // 1. 处理图像缩小传输的坐标缩放（maxWidth 限制）
+        int sendWidth = m_BitmapInfor_Send->bmiHeader.biWidth;
+        int sendHeight = m_BitmapInfor_Send->bmiHeader.biHeight;
+        if (sendWidth != m_ulFullWidth || sendHeight != m_ulFullHeight) {
+            pt.x = (LONG)(pt.x * (double)m_ulFullWidth / sendWidth + 0.5);
+            pt.y = (LONG)(pt.y * (double)m_ulFullHeight / sendHeight + 0.5);
         }
+        // 2. 处理 DPI 缩放
+        if (m_bZoomed) {
+            pt.x = (LONG)(pt.x * m_wZoom);
+            pt.y = (LONG)(pt.y * m_hZoom);
+        }
+        // 3. 添加屏幕偏移（多显示器）
         pt.x += m_iScreenX;
         pt.y += m_iScreenY;
     }
@@ -710,6 +1028,74 @@ public:
     virtual const LPBITMAPINFO& GetBIData() const
     {
         return m_BitmapInfor_Send;
+    }
+
+    // 获取目标窗口句柄（窗口捕获模式用）
+    // 基类返回 nullptr，子类（如 CWindowCapture）可重写返回目标窗口
+    virtual HWND GetTargetWindow() const
+    {
+        return nullptr;
+    }
+
+    // 自定义光标支持：检查并构建光标图像数据
+    // 返回值：CURSOR_INDEX_CUSTOM(-2) 表示使用自定义光标，0-15 表示标准光标，255(-1) 表示不支持
+    BYTE CheckAndUpdateCursor(CCursorInfo& cursorInfo)
+    {
+        BYTE cursorIndex = cursorInfo.getCurrentCursorIndex();
+
+        if (cursorIndex != (BYTE)-1) {
+            // 标准光标，直接返回
+            return cursorIndex;
+        }
+
+        // 非标准光标 - 先检查节流，避免每帧都做 GDI 操作
+        DWORD now = GetTickCount();
+        if ((now - m_dwLastCursorSendTime) < CURSOR_THROTTLE_MS) {
+            // 节流期内，如果已有缓存的光标就直接使用
+            if (m_dwLastCursorHash != 0) {
+                return CURSOR_INDEX_CUSTOM;
+            }
+        }
+
+        // 获取位图信息（GDI 操作，受节流保护）
+        CursorBitmapInfo info;
+        if (!cursorInfo.getCurrentCursorBitmap(&info)) {
+            return CURSOR_INDEX_UNSUPPORTED;  // 获取失败，回退到不支持
+        }
+
+        // 检查哈希是否变化
+        if (info.hash != m_dwLastCursorHash) {
+            // 构建 CMD_CURSOR_IMAGE 数据包
+            // 格式: [CMD:1][hash:4][hotX:2][hotY:2][w:1][h:1][BGRA:w*h*4]
+            BYTE* buf = m_CursorImageBuffer;
+            buf[0] = CMD_CURSOR_IMAGE;
+            *(DWORD*)(buf + 1) = info.hash;
+            *(WORD*)(buf + 5) = info.hotspotX;
+            *(WORD*)(buf + 7) = info.hotspotY;
+            buf[9] = info.width;
+            buf[10] = info.height;
+            memcpy(buf + 11, info.bgraData, info.dataSize);
+
+            m_ulCursorImageSize = 11 + info.dataSize;
+            m_bPendingCursorImage = true;
+            m_dwLastCursorHash = info.hash;
+        }
+        m_dwLastCursorSendTime = now;
+
+        return CURSOR_INDEX_CUSTOM;  // 使用自定义光标
+    }
+
+    // 获取待发送的光标图像数据
+    // 返回 true 表示有待发送的数据，data 和 size 被填充
+    bool GetPendingCursorImage(BYTE** data, ULONG* size)
+    {
+        if (!m_bPendingCursorImage) {
+            return false;
+        }
+        *data = m_CursorImageBuffer;
+        *size = m_ulCursorImageSize;
+        m_bPendingCursorImage = false;
+        return true;
     }
 
 public: // 纯虚接口
@@ -725,6 +1111,6 @@ public: // 纯虚接口
         if (m_ulFullWidth == m_BitmapInfor_Send->bmiHeader.biWidth && m_ulFullHeight == m_BitmapInfor_Send->bmiHeader.biHeight)
             return bitmap;
         return ScaleBitmap(target, (uint8_t*)bitmap, m_ulFullWidth, m_ulFullHeight, m_BitmapInfor_Send->bmiHeader.biWidth,
-                           m_BitmapInfor_Send->bmiHeader.biHeight);
+                           m_BitmapInfor_Send->bmiHeader.biHeight, m_nInstructionSet);
     }
 };

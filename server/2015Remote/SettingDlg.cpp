@@ -12,20 +12,21 @@
 
 IMPLEMENT_DYNAMIC(CSettingDlg, CDialog)
 
-CSettingDlg::CSettingDlg(CWnd* pParent)
+CSettingDlg::CSettingDlg(CMy2015RemoteDlg* pParent)
     : CDialogLang(CSettingDlg::IDD, pParent)
     , m_nListenPort("6543")
     , m_nMax_Connect(0)
     , m_sScreenCapture(_T("GDI"))
-    , m_sScreenCompress(_T("屏幕差异算法"))
+    , m_sScreenCompress(_T("RGBA->RGB565"))
     , m_nReportInterval(5)
     , m_sSoftwareDetect(_T("摄像头"))
     , m_sPublicIP(_T(""))
-    , m_sUdpOption(_T(""))
+    , m_sUdpOption(_T("UDP"))
     , m_nFrpPort(7000)
     , m_sFrpToken(_T(""))
-    , m_nFileServerPort(0)
+    , m_nFileServerPort(-1)
 {
+    g_2015RemoteDlg = pParent;
 }
 
 CSettingDlg::~CSettingDlg()
@@ -65,7 +66,7 @@ void CSettingDlg::DoDataExchange(CDataExchange* pDX)
     DDX_Control(pDX, IDC_COMBO_VIDEO_WALL, m_ComboVideoWall);
     DDX_Control(pDX, IDC_EDIT_FILESERVER_PORT, m_EditFileServerPort);
     DDX_Text(pDX, IDC_EDIT_FILESERVER_PORT, m_nFileServerPort);
-	DDV_MinMaxInt(pDX, m_nFileServerPort, 1, 65535);
+    DDV_MinMaxInt(pDX, m_nFileServerPort, -1, 65535);
 }
 
 BEGIN_MESSAGE_MAP(CSettingDlg, CDialog)
@@ -76,6 +77,7 @@ BEGIN_MESSAGE_MAP(CSettingDlg, CDialog)
     ON_BN_CLICKED(IDC_RADIO_MAIN_SCREEN, &CSettingDlg::OnBnClickedRadioMainScreen)
     ON_BN_CLICKED(IDC_RADIO_FRP_OFF, &CSettingDlg::OnBnClickedRadioFrpOff)
     ON_BN_CLICKED(IDC_RADIO_FRP_ON, &CSettingDlg::OnBnClickedRadioFrpOn)
+    ON_EN_KILLFOCUS(IDC_EDIT_PUBLIC_IP, &CSettingDlg::OnEnKillfocusEditPublicIp)
 END_MESSAGE_MAP()
 
 
@@ -85,11 +87,70 @@ END_MESSAGE_MAP()
 BOOL CSettingDlg::OnInitDialog()
 {
     __super::OnInitDialog();
-    IPConverter cvt;
-    m_sPublicIP = THIS_CFG.GetStr("settings", "master", "").c_str();
-    m_sPublicIP = m_sPublicIP.IsEmpty() ? cvt.getPublicIP().c_str() : m_sPublicIP;
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_SET_LISTEN_PORT, _TR("监听端口:"));
+    SetDlgItemText(IDC_STATIC_SET_MAX_CONN, _TR("最大连接数:"));
+    SetDlgItemText(IDC_STATIC_SET_TIP1, _TR("操作提示: 1.监听端口支持填写多个，用英文分号分隔；程序同时监听TCP和UDP，且支持基于UDP的KCP；"));
+    SetDlgItemText(IDC_STATIC_SET_TIP2, _TR("操作提示: 2.如果被控端跨网、地区或国家，务必设置公网IP；勾选FRP反向代理并设置服务端口和 token；"));
+    SetDlgItemText(IDC_STATIC_SET_TIP3, _TR("操作提示: 3.如果以下载的方式提供上线载荷 (如图片)，必须设置Web端口，受管机器上线时会下载载荷。"));
+    SetDlgItemText(IDC_STATIC_SET_SCREEN_CAP, _TR("屏幕截图方法:"));
+    SetDlgItemText(IDC_STATIC_SET_IMG_COMP, _TR("图像压缩方法:"));
+    SetDlgItemText(IDC_STATIC_SET_REPORT_INT, _TR("上报间隔:"));
+    SetDlgItemText(IDC_STATIC_SET_SW_DETECT, _TR("软件检测:"));
+    SetDlgItemText(IDC_STATIC_SET_MULTI_MON, _TR("多显示器支持:"));
+    SetDlgItemText(IDC_STATIC_SET_UDP_PARAM, _TR("UDP协议参数:"));
+    SetDlgItemText(IDC_STATIC_SET_FRP_PROXY, _TR("FRP 代理:"));
+    SetDlgItemText(IDC_STATIC_SET_FRP_PORT, _TR("服务端口:"));
+    SetDlgItemText(IDC_STATIC_SET_TOKEN, _TR("token:"));
+    SetDlgItemText(IDC_STATIC_SET_VIDEO_WALL, _TR("多屏上墙:"));
+    SetDlgItemText(IDC_STATIC_SET_DL_PORT, _TR("Web端口:"));
+    SetDlgItemText(IDC_GROUP_SET_GENERAL, _TR("常规设置"));
+    SetDlgItemText(IDC_GROUP_SET_DESKTOP, _TR("桌面管理"));
+    SetDlgItemText(IDC_GROUP_SET_PARAMS, _TR("参数设置"));
+
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("设置"));
+    SetDlgItemText(IDOK, _TR("确定"));
+    SetDlgItemText(IDCANCEL, _TR("取消"));
+    SetDlgItemText(IDC_BUTTON_SETTINGAPPLY, _TR("应用"));
+    SetDlgItemText(IDC_RADIO_FRP_OFF, _TR("否"));
+    SetDlgItemText(IDC_RADIO_FRP_ON, _TR("是"));
+    SetDlgItemText(IDC_RADIO_ALL_SCREEN, _TR("否"));
+    SetDlgItemText(IDC_RADIO_MAIN_SCREEN, _TR("是"));
+
+    // 检测本机 IP 并设置标签和提示
+    std::string localPublicIP, localPrivateIP;
+    g_2015RemoteDlg->m_IPConverter->GetLocalIPs(localPublicIP, localPrivateIP);
+    std::string frpAutoServer = THIS_CFG.GetStr("frp_auto", "server", "");
+    BOOL frpEnabled = THIS_CFG.GetInt("frp", "UseFrp");
+    std::string savedMaster = THIS_CFG.GetStr("settings", "master", "");
+
+    if (!localPublicIP.empty()) {
+        // 场景 1: 本机有公网 IP
+        SetDlgItemText(IDC_STATIC_SET_PUBLIC_IP, _TR("公网地址:"));
+        m_sPublicIP = savedMaster.empty() ? localPublicIP.c_str() : savedMaster.c_str();
+        SetDlgItemText(IDC_STATIC_SET_IP_HINT, _T(""));
+    } else if (!frpAutoServer.empty()) {
+        // 场景 2: 上级配置了 FRP
+        SetDlgItemText(IDC_STATIC_SET_PUBLIC_IP, _TR("公网地址:"));
+        m_sPublicIP = frpAutoServer.c_str();
+        SetDlgItemText(IDC_STATIC_SET_IP_HINT, _T(""));
+    } else if (frpEnabled) {
+        // 场景 3: 启用了本地 FRP（FRP服务器应有公网IP）
+        SetDlgItemText(IDC_STATIC_SET_PUBLIC_IP, _TR("公网地址:"));
+        m_sPublicIP = savedMaster.c_str();
+        SetDlgItemText(IDC_STATIC_SET_IP_HINT, _TR("该地址必须为FRP代理服务器IP"));
+    } else {
+        // 场景 4: 无公网，无 FRP（仅限局域网）
+        SetDlgItemText(IDC_STATIC_SET_PUBLIC_IP, _TR("内网地址:"));
+        m_sPublicIP = savedMaster.empty() ? localPrivateIP.c_str() : savedMaster.c_str();
+        SetDlgItemText(IDC_STATIC_SET_IP_HINT, _TR("跨网使用请配置 FRP 反向代理"));
+    }
+    m_sOriginalMaster = m_sPublicIP;  // 缓存原始值，用于检测修改
     std::string nPort = THIS_CFG.GetStr("settings", "ghost", "6543");
-    m_sUdpOption = THIS_CFG.GetStr("settings", "UDPOption", "0").c_str();
+    std::map<std::string, std::string> udpMap = { {"UDP", "UDP"}, {"KCP", "KCP"} };
+    std::string method = THIS_CFG.GetStr("settings", "UDPOption", "UDP").c_str();
+    m_sUdpOption = udpMap.find(method) == udpMap.end() ? "UDP" : udpMap[method].c_str();
 
     int DXGI = THIS_CFG.GetInt("settings", "DXGI");
 
@@ -108,12 +169,16 @@ BOOL CSettingDlg::OnInitDialog()
     case ALGORITHM_H264:
         m_sScreenCompress = _L(_T("H264压缩算法"));
         break;
+    case ALGORITHM_RGB565:
+        m_sScreenCompress = _L(_T("RGBA->RGB565"));
+        break;
     default:
         break;
     }
     m_ComboScreenCompress.InsertStringL(ALGORITHM_GRAY, "灰度图像传输");
     m_ComboScreenCompress.InsertStringL(ALGORITHM_DIFF, "屏幕差异算法");
     m_ComboScreenCompress.InsertStringL(ALGORITHM_H264, "H264压缩算法");
+    m_ComboScreenCompress.InsertStringL(ALGORITHM_RGB565, "RGBA->RGB565");
 
     m_ComboScreenCapture.InsertStringL(0, "GDI");
     m_ComboScreenCapture.InsertStringL(1, "DXGI");
@@ -136,13 +201,15 @@ BOOL CSettingDlg::OnInitDialog()
         m_sSoftwareDetect = _L(_T("摄像头"));
         break;
     }
-    BOOL all = THIS_CFG.GetInt("settings", "MultiScreen");
+    BOOL all = THIS_CFG.GetInt("settings", "MultiScreen", TRUE);
     ((CButton*)GetDlgItem(IDC_RADIO_ALL_SCREEN))->SetCheck(!all);
     ((CButton*)GetDlgItem(IDC_RADIO_MAIN_SCREEN))->SetCheck(all);
 
     BOOL frp = THIS_CFG.GetInt("frp", "UseFrp");
     ((CButton*)GetDlgItem(IDC_RADIO_FRP_OFF))->SetCheck(!frp);
     ((CButton*)GetDlgItem(IDC_RADIO_FRP_ON))->SetCheck(frp);
+    GetDlgItem(IDC_EDIT_FRP_PORT)->EnableWindow(frp);
+    GetDlgItem(IDC_EDIT_FRP_TOKEN)->EnableWindow(frp);
 #ifndef _WIN64
     GetDlgItem(IDC_RADIO_FRP_OFF)->EnableWindow(FALSE);
     GetDlgItem(IDC_RADIO_FRP_ON)->EnableWindow(FALSE);
@@ -151,7 +218,7 @@ BOOL CSettingDlg::OnInitDialog()
 #endif
     m_nFrpPort = THIS_CFG.GetInt("frp", "server_port", 7000);
     m_sFrpToken = THIS_CFG.GetStr("frp", "token").c_str();
-    m_nFileServerPort = THIS_CFG.GetInt("settings", "FileSvrPort", 80);
+    m_nFileServerPort = THIS_CFG.GetInt("settings", "WebSvrPort", -1);
 
     int size = THIS_CFG.GetInt("settings", "VideoWallSize");
     m_ComboVideoWall.InsertStringL(0, "无");
@@ -192,7 +259,10 @@ void CSettingDlg::OnBnClickedButtonSettingapply()
     THIS_CFG.SetInt("frp", "UseFrp", frp);
     THIS_CFG.SetInt("frp", "server_port", m_nFrpPort);
     THIS_CFG.SetStr("frp", "token", m_sFrpToken.GetString());
-    THIS_CFG.SetInt("settings", "FileSvrPort", m_nFileServerPort);
+    THIS_CFG.SetInt("settings", "WebSvrPort", m_nFileServerPort);
+    if (m_nFileServerPort > 0 && THIS_CFG.GetStr("settings", "Authorization").empty()) {
+        MessageBoxL("Web端口设置无效!\n必须具有有效的授权才能使用Web远程监控!", "提示", MB_ICONWARNING);
+    }
 
     THIS_CFG.SetInt("settings", "VideoWallSize", m_ComboVideoWall.GetCurSel()+1);
 
@@ -256,6 +326,8 @@ void CSettingDlg::OnBnClickedRadioFrpOff()
 {
     BOOL b = ((CButton*)GetDlgItem(IDC_RADIO_FRP_OFF))->GetCheck();
     ((CButton*)GetDlgItem(IDC_RADIO_FRP_ON))->SetCheck(!b);
+	GetDlgItem(IDC_EDIT_FRP_PORT)->EnableWindow(!b);
+    GetDlgItem(IDC_EDIT_FRP_TOKEN)->EnableWindow(!b);
 }
 
 
@@ -263,4 +335,25 @@ void CSettingDlg::OnBnClickedRadioFrpOn()
 {
     BOOL b = ((CButton*)GetDlgItem(IDC_RADIO_FRP_ON))->GetCheck();
     ((CButton*)GetDlgItem(IDC_RADIO_FRP_OFF))->SetCheck(!b);
+    GetDlgItem(IDC_EDIT_FRP_PORT)->EnableWindow(b);
+    GetDlgItem(IDC_EDIT_FRP_TOKEN)->EnableWindow(b);
+}
+
+void CSettingDlg::OnEnKillfocusEditPublicIp()
+{
+    auto bindType = THIS_CFG.GetInt("settings", "BindType", 0);
+    if (bindType == 1 && !THIS_CFG.GetStr("settings", "Password").empty()) {
+        GetDlgItemText(IDC_EDIT_PUBLIC_IP, m_sPublicIP);
+        if (m_sPublicIP != m_sOriginalMaster) {
+            if (IDYES == MessageBox(_TR("修改绑定的公网地址将导致授权失效! 是否继续?"),
+                _TR("提示"), MB_ICONWARNING | MB_YESNO)) {
+                // 用户确认修改，更新缓存值避免重复警告
+                m_sOriginalMaster = m_sPublicIP;
+            } else {
+                // 用户取消，恢复原值
+                m_sPublicIP = m_sOriginalMaster;
+                SetDlgItemText(IDC_EDIT_PUBLIC_IP, m_sPublicIP);
+            }
+        }
+    }
 }

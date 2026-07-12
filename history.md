@@ -584,6 +584,73 @@ Release v1.1.4
 * 修复: #281 检查 CPU 是否支持 SSE2 以避免客户端崩溃
 * 修复: 远程桌面窗口恢复大小问题
 
+**2026.02.01**
+
+发布版本 v1.2.4：
+
+本版本扩展了 PE 编辑功能，新增多语言支持和纯真 IP 数据库，增强客户端列表体验，并修复多项稳定性问题。
+
+* 功能: 将 `Replace Icon` 扩展为 `PE Edit`，使用 "rcedit" 实现
+* 功能: 支持纯真 (QQWRY) IP 数据库
+* 功能: 添加使用标准 FRP 代理客户端端口的菜单
+* 功能: 添加多语言支持（Beta，尚未完成）
+* 功能: 新增 CListCtrlEx 支持列的显示/隐藏
+* 改进: 使用隐私远程桌面时隐藏远程光标
+* 改进: 增强 CClientListDlg 分组功能和用户体验
+* 改进: 远程桌面控制可能失败时通知用户
+* 修复: 向已断开的客户端发送文件时主控崩溃的问题
+* 修复: 将 _TR/_L 结果赋值给 LPCTSTR 时的悬空指针问题
+* 修复: Windows INI 文件读取 API 存在 32KB 限制的问题
+* 修复: #294 需要转换 `IPConverter` 的结果编码
+* 修复: #293 IOCPServer 设置了错误的 keep-alive 时间
+* 修复: #292 RTT 显示 0 或 1 而非实际毫秒值
+* 修复: 鼠标双击无法选中目标文本的问题
+* 修复: 更改屏幕分辨率策略导致 DXGI 崩溃
+* 修复: 密码绑定域名时的主控授权问题
+
+
+**2026.02.11**
+
+发布版本 v1.2.5：
+
+本版本重点优化远程桌面跨网体验，新增 Linux 客户端支持，并增强文件管理功能。
+
+* 功能: 基于 RTT 的自适应质量控制，根据网络延迟自动调整帧率、分辨率和压缩算法
+* 功能: 新增 RGB565 屏幕算法，带宽节省 50%
+* 功能: 滚动检测优化，滚动场景带宽减少 50-80%
+* 功能: 远程桌面标题栏显示实时 FPS 和传输速率
+* 功能: 文件管理器支持本地和远程文件搜索
+* 功能: 支持 ip2region IP 数据库
+* 功能: Linux 客户端支持远程桌面查看
+* 功能: Linux 客户端支持进程和文件管理
+* 功能: 添加 Linux 客户端构建选项
+* 改进: 完善心跳消息并上报活动窗口
+* 改进: 签名登录消息用于客户端验证
+* 改进: 重新分组后自动更新主机列表
+* 修复: 小键盘数字键被识别为方向键的问题
+* 修复: Linux 客户端构建失败的问题
+
+**2026.02.16**
+
+发布版本 v1.2.6：
+
+本版本重点优化远程桌面工具栏体验，增强授权管理功能，并修复多项稳定性问题。
+
+* 功能: 添加状态窗口显示远程连接信息（RTT、帧率、分辨率等）
+* 功能: 实现授权保存和管理逻辑及 UI
+* 功能: 添加菜单启用/禁用 StretchBltMode `HALFTONE` 图像缩放模式
+* 改进: 使用 H.264 时减少网络带宽
+* 改进: 全屏工具栏重写，使用图标按钮替代文本按钮
+* 改进: 工具栏支持 4 个位置（顶部/底部/左侧/右侧）并支持多显示器
+* 改进: 新增切换屏幕、阻止输入、质量等工具栏按钮
+* 改进: 屏幕截图保存时显示屏幕通知横幅
+* 改进: 关闭远程桌面时自动触发重连
+* 改进: 调整质量等级定义并添加禁用选项
+* 修复: 注册表树重新选择时重复子项的问题
+* 修复: Linux 客户端竞态条件导致崩溃
+* 修复: 屏幕缩放时远程控制坐标不正确
+* 修复: CShellDlg::OnCtlColor 中的 GDI 画刷泄漏
+
 ---
 
 [English, since 2025]
@@ -930,3 +997,67 @@ This release enhances remote desktop control experience, optimizes client update
 * Fix: Copy payload file to target directory when installing
 * Fix: #281 Check if CPU has SSE2 to avoid client crash
 * Fix: Remote desktop window restore size issue
+
+**2026.02.01**
+
+Release v1.2.4
+
+This release extends PE editing capabilities, adds multi-language support and QQWRY IP database, enhances client list experience, and fixes several stability issues.
+
+* Feature: Extend `Replace Icon` to `PE Edit` using "rcedit"
+* Feature: Support QQWRY IP database
+* Feature: Add menu to use standard FRP to proxy client's port
+* Feature: Add language support (beta, not completed)
+* Feature: Add CListCtrlEx with column show/hide support
+* Improve: Hide remote cursor while using private remote desktop
+* Improve: Enhance CClientListDlg with grouping and better UX
+* Improve: Notify user if remote desktop control may be failed
+* Fix: Master crash on sending files to client while disconnect
+* Fix: Dangling pointer when assigning _TR/_L result to LPCTSTR
+* Fix: Windows INI file reading API has 32KB limitation
+* Fix: #294 Need to convert the result encoding of `IPConverter`
+* Fix: #293 Wrong keep-alive time set for IOCPServer
+* Fix: #292 RTT display showing 0 or 1 instead of actual milliseconds
+* Fix: Mouse double click can't select the wanted text
+* Fix: Change screen resolution strategy causing DXGI crash
+* Fix: Master Authorization issue while password binding domain
+
+Release v1.2.5
+
+This release focuses on optimizing cross-network remote desktop experience, adding Linux client support, and enhancing file management features.
+
+* Feature: RTT-based adaptive quality control - automatically adjusts FPS, resolution, and compression algorithm based on network latency
+* Feature: Add RGB565 screen algorithm, saving 50% bandwidth
+* Feature: Scroll detection optimization, reducing bandwidth by 50-80% in scrolling scenarios
+* Feature: Display real-time FPS and transfer rate in remote desktop title bar
+* Feature: File Manager supports local and remote file search
+* Feature: Support ip2region IP database
+* Feature: Linux client supports remote desktop viewing
+* Feature: Linux client supports process and file management
+* Feature: Add Linux client building option
+* Improve: Complete heartbeat message and report active window
+* Improve: Sign login message for client verification
+* Improve: Automatically update host list after regroup
+* Fix: Numpad keys act as arrow keys instead of inputting digits
+* Fix: Linux client build failed issue
+
+**2026.02.16**
+
+Release v1.2.6
+
+This release focuses on optimizing remote desktop toolbar experience, enhancing license management features, and fixing several stability issues.
+
+* Feature: Add status window to show remote connection info (RTT, FPS, resolution, etc.)
+* Feature: Implement license save and management logic & UI
+* Feature: Add menu to enable/disable StretchBltMode `HALFTONE` image scaling mode
+* Improve: Reduce network bandwidth while using H.264
+* Improve: Fullscreen toolbar rewrite with icon buttons instead of text buttons
+* Improve: Toolbar supports 4 positions (top/bottom/left/right) with multi-monitor awareness
+* Improve: Add switch screen, block input, quality toolbar buttons
+* Improve: Show on-screen notification banner when screenshot is saved
+* Improve: Reconnection happens when closing remote desktop
+* Improve: Adjust quality level definitions and add disable option
+* Fix: Registry tree duplicates child items on re-selection
+* Fix: Race condition causes Linux client crash
+* Fix: Incorrect remote control coordinates when screen is scaled
+* Fix: GDI brush leak in CShellDlg::OnCtlColor

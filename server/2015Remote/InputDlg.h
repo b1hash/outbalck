@@ -16,6 +16,8 @@ public:
     BOOL Init(LPCTSTR caption, LPCTSTR prompt);
 
     void Init2(LPCTSTR name, LPCTSTR defaultValue);
+    void Init3(LPCTSTR name, LPCTSTR defaultValue);  // 第三个输入框
+    void SetHistoryKey(LPCTSTR historyKey);          // 设置历史记录的配置键名
 
 // 对话框数据
 #ifdef AFX_DESIGN_TIME
@@ -30,6 +32,11 @@ protected:
     HICON m_hIcon;
     CString m_sCaption;
     CString m_sPrompt;
+    CString m_sHistoryKey;  // 历史记录键名
+    CComboBox m_ComboInput; // 主输入框 (ComboBox)
+
+    void LoadHistory();     // 从配置加载历史到下拉列表
+    void SaveHistory();     // 保存当前输入到历史
 
 public:
     CString m_str;
@@ -39,6 +46,12 @@ public:
     CEdit m_Edit2thInput;
     CString m_sItemName;
     CString m_sSecondInput;
+    CStatic m_Static3rdInput;
+    CEdit m_Edit3rdInput;
+    CString m_sItemName3;
+    CString m_sThirdInput;
     CStatic m_StaticTipInfo;
     CString m_sTipInfo;
 };
+
+typedef CInputDialog CInputDlg;

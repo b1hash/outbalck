@@ -153,13 +153,16 @@ BOOL CFileManagerDlg::MyShell_GetImageLists()
 BOOL CFileManagerDlg::OnInitDialog()
 {
     __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_FILE_WINOS_SEARCH, _TR("搜索文件名:"));
+    SetDlgItemText(IDC_STATIC_FILE_WINOS_PATH, _TR("路径："));
 
     RECT	rect;
     GetClientRect(&rect);
 
     // 设置标题
     CString str;
-    str.FormatL(_T("文件管理 - %s"), m_ContextObject->PeerName.c_str()), SetWindowText(str);
+    str.FormatL(_T("文件管理 - %s"), m_ContextObject->GetPeerName().c_str()), SetWindowText(str);
 
     // 创建带进度条的状态栏
     if (!m_wndStatusBar.Create(this) ||
@@ -1234,6 +1237,18 @@ BOOL CFileManagerDlg::SendDeleteJob()
     return TRUE;
 }
 
+// 将远程文件路径转换为本地保存路径
+// strFilePath: 远程文件的完整路径 (客户端返回的，保持原始形式含环境变量)
+// strRemotePath: 远程目录路径 (可能含环境变量如 %USERPROFILE%\Desktop\)
+// strLocalPath: 本地目标目录路径
+// 返回: 本地文件保存路径
+static CString RemotePathToLocal(const CString& strFilePath, const CString& strRemotePath, const CString& strLocalPath)
+{
+    CString strResult = strFilePath;
+    strResult.Replace(strRemotePath, strLocalPath);
+    return strResult;
+}
+
 void CFileManagerDlg::CreateLocalRecvFile()
 {
     // 重置计数器
@@ -1251,10 +1266,8 @@ void CFileManagerDlg::CreateLocalRecvFile()
     // 当前正操作的文件名
     m_strOperatingFile = (TCHAR*)(m_ContextObject->m_DeCompressionBuffer.GetBuffer(9));
 
-    m_strReceiveLocalFile = m_strOperatingFile;
-
     // 得到要保存到的本地的文件路径
-    m_strReceiveLocalFile.Replace(m_Remote_Path, strLpath);
+    m_strReceiveLocalFile = RemotePathToLocal(m_strOperatingFile, m_Remote_Path, strLpath);
     m_strFileName = m_strReceiveLocalFile;
 
     // 创建多层目录
@@ -1320,7 +1333,7 @@ void CFileManagerDlg::CreateLocalRecvFile()
 
     //  1字节Token,四字节偏移高四位，四字节偏移低四位
     BYTE	bToken[9];
-    DWORD	dwCreationDisposition; // 文件打开方式
+    DWORD	dwCreationDisposition = CREATE_ALWAYS; // 文件打开方式
     memset(bToken, 0, sizeof(bToken));
     bToken[0] = COMMAND_CONTINUE;
 
@@ -1370,7 +1383,8 @@ void CFileManagerDlg::CreateLocalRecvFile()
     if (m_hFileRecv == INVALID_HANDLE_VALUE) {
         m_nOperatingFileLength = 0;
         m_nCounter = 0;
-        MessageBoxAPI_L(m_hWnd, m_strReceiveLocalFile + _T(" 文件创建失败"), _T("警告"), MB_OK | MB_ICONWARNING);
+        CString msg = m_strReceiveLocalFile + _TR(" 文件创建失败");
+        ::MessageBox(m_hWnd, msg, _TR("警告"), MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -1426,7 +1440,8 @@ void CFileManagerDlg::WriteLocalRecvFile()
                 break;
         }
         if (i == MAX_WRITE_RETRY && !bResult) {
-            MessageBoxAPI_L(m_hWnd, m_strReceiveLocalFile + _T(" 文件写入失败!"), _T("警告"), MB_OK | MB_ICONWARNING);
+            CString msg = m_strReceiveLocalFile + _TR(" 文件写入失败!");
+            ::MessageBox(m_hWnd, msg, _TR("警告"), MB_OK | MB_ICONWARNING);
             m_bIsStop = true;
         } else {
             dwOffsetLow = 0;

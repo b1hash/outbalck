@@ -18,8 +18,20 @@
 #include "common/header.h"
 #define NO_AES
 #include "common/encrypt.h"
+#ifdef _WIN32
 #include "SafeThread.h"
+#else
+#ifndef SAFE_DELETE
+#define SAFE_DELETE(p) if(NULL !=(p)){ delete (p);(p) = NULL;}
+#endif
+#ifndef SAFE_DELETE_ARRAY
+#define SAFE_DELETE_ARRAY(p) if(NULL !=(p)){ delete[] (p);(p) = NULL;}
+#endif
+#include <sys/socket.h>
+#include <netinet/in.h>
+#endif
 #include "IOCPBase.h"
+#include <mutex>
 
 #define MAX_RECV_BUFFER  1024*32
 #define MAX_SEND_BUFFER  1024*128  // 增大分块大小以提高发送效率
@@ -152,7 +164,7 @@ class IOCPClient : public IOCPBase
 {
 public:
     IOCPClient(const State& bExit, bool exit_while_disconnect = false, int mask=0, CONNECT_ADDRESS *conn=0,
-               const std::string&pubIP="");
+               const std::string&pubIP="", void*main=0);
     virtual ~IOCPClient();
 
     int SendLoginInfo(const LOGIN_INFOR& logInfo)
@@ -223,11 +235,29 @@ public:
         return g_bExit;
     }
     void SetMultiThreadCompress(int threadNum=0);
-    std::string GetClientID() const {
+    std::string GetClientID() const
+    {
         return m_conn ? std::to_string(m_conn->clientID) : "";
     }
-    std::string GetPublicIP() const {
+    std::string GetPublicIP() const
+    {
         return m_sLocPublicIP;
+    }
+    CONNECT_ADDRESS* GetConnectionAddress() const
+    {
+        return m_conn;
+    }
+    IOCPManager* GetManager() const
+    {
+        return (IOCPManager*)m_Manager;
+    }
+    void* GetMain() const
+    {
+        return m_main;
+    }
+    void SetVerifyInfo(const std::string& msg, const std::string& hmac) {
+        m_LoginMsg = msg;
+        m_LoginSignature = hmac;
     }
 protected:
     virtual int ReceiveData(char* buffer, int bufSize, int flags)
@@ -254,7 +284,7 @@ protected:
     BOOL				m_bIsRunning;
     BOOL				m_bConnected;
 
-    CLock               m_Locker;
+    std::mutex          m_Locker;
 #if USING_CTX
     ZSTD_CCtx*			m_Cctx;						// 压缩上下文
     ZSTD_DCtx*			m_Dctx;						// 解压上下文
@@ -273,4 +303,9 @@ protected:
     BOOL				m_EncoderType;
     std::string			m_sLocPublicIP;
     CONNECT_ADDRESS     *m_conn = NULL;
+
+    void                *m_main = NULL;
+public:
+    std::string         m_LoginMsg;             // 登录消息摘要
+    std::string         m_LoginSignature;       // 登录消息签名
 };

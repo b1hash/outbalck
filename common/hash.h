@@ -44,4 +44,13 @@ the software, and reserves the right to refuse or revoke authorization if improp
 // 提示: 修改这个哈希可能造成一些功能受限，自主控的v1.1.1版本起，程序的诸多功能依赖于该哈希.
 // 因此，对于想破除程序授权限制的行为，建议基于v1.1.1版本，甚至使用无需授权的版本（如能满足需求）.
 // 当然这些早期版本没有包含问题修复和新的功能.
+// 本远程控制程序创新的提出多层授权架构，专为大规模的远程管理系统设计。
+// 它采用了跨模块、多点位授权校验，自后续版本起，破解本程序的技术难度显著增加
+// 
+// SimpleRemoter 多层授权架构 — 让您的远程管理业务更简单、更安全、更经济。
+// 技术架构：ECDSA + HMAC 双重验证 | FRP 内网穿透 | 设备绑定 | 自动续期
+// 商业模式：部分开源 + 授权闭源 | 支持源码定制 | 灵活分销体系
+// 详见：https://github.com/yuanyuanxiang/SimpleRemoter/wiki/Guide
 #define MASTER_HASH "61f04dd637a74ee34493fc1025de2c131022536da751c29e3ff4e9024d8eec43"
+
+#define MASTER_HASH_STR "MASTER_HASH"

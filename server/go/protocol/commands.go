@@ -177,26 +177,28 @@ func (info *LoginInfo) GetReservedField(index int) string {
 
 // Validation structure for TOKEN_AUTH
 type Validation struct {
-	From     string // Start date
-	To       string // End date
-	Admin    string // Admin address
-	Port     int    // Admin port
-	Checksum string // Reserved field
+	From     string // Start date (20 bytes)
+	To       string // End date (20 bytes)
+	Admin    string // Admin address (100 bytes)
+	Port     uint16 // Admin port (2 bytes)
+	MaxDepth uint16 // Max generation depth (2 bytes), 0=cannot generate sub-master
+	Checksum string // HMAC checksum field (16 bytes)
 }
 
 // BuildValidation creates a validation response
-func BuildValidation(days float64, admin string, port int) []byte {
+func BuildValidation(days float64, admin string, port int, maxDepth uint16) []byte {
 	// This would build the validation structure
 	// For now, return a simple structure
 	data := make([]byte, 160) // Size of Validation struct
 	data[0] = TokenAuth
 
 	// Fill in fields...
-	// From: 20 bytes
-	// To: 20 bytes
-	// Admin: 100 bytes
-	// Port: 4 bytes
-	// Checksum: 16 bytes
+	// From: 20 bytes (offset 0)
+	// To: 20 bytes (offset 20)
+	// Admin: 100 bytes (offset 40)
+	// Port: 2 bytes (offset 140)
+	// MaxDepth: 2 bytes (offset 142)
+	// Checksum: 16 bytes (offset 144)
 
 	return data
 }

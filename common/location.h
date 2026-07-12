@@ -100,7 +100,9 @@ inline void splitIpPort(const std::string& input, std::string& ip, std::string& 
 class IPConverter
 {
 public:
-    std::string IPtoAddress(const std::string& ip)
+    virtual ~IPConverter() {}
+
+    virtual std::string IPtoAddress(const std::string& ip)
     {
         return "implement me";
     }
@@ -133,14 +135,68 @@ public:
         return false;
     }
 
+    /**
+     * 判断给定的 IP 地址是否是公网 IP
+     */
+    bool IsPublicIP(const std::string& ipAddress)
+    {
+        in_addr addr;
+        if (inet_pton(AF_INET, ipAddress.c_str(), &addr) != 1) return false;
+        unsigned long h = ntohl(addr.s_addr);
+        if ((h & 0xFF000000) == 0x0A000000) return false;  // 10.0.0.0/8
+        if ((h & 0xFFF00000) == 0xAC100000) return false;  // 172.16.0.0/12
+        if ((h & 0xFFFF0000) == 0xC0A80000) return false;  // 192.168.0.0/16
+        if ((h & 0xFF000000) == 0x7F000000) return false;  // 127.0.0.0/8
+        if ((h & 0xFF000000) == 0x00000000) return false;  // 0.0.0.0/8
+        if ((h & 0xFFFF0000) == 0xA9FE0000) return false;  // 169.254.0.0/16
+        if ((h & 0xFFC00000) == 0x64400000) return false;  // 100.64.0.0/10
+        if ((h & 0xF0000000) == 0xE0000000) return false;  // 224.0.0.0/4
+        if ((h & 0xF0000000) == 0xF0000000) return false;  // 240.0.0.0/4
+        return true;
+    }
+
+    /**
+     * 获取本机网卡的公网 IP 和私有 IP
+     */
+    void GetLocalIPs(std::string& publicIP, std::string& privateIP)
+    {
+        publicIP.clear();
+        privateIP.clear();
+        ULONG outBufLen = 15000;
+        IP_ADAPTER_ADDRESSES* pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+        if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &outBufLen) == ERROR_BUFFER_OVERFLOW) {
+            free(pAddresses);
+            pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+        }
+        if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &outBufLen) == NO_ERROR) {
+            for (IP_ADAPTER_ADDRESSES* pCurr = pAddresses; pCurr; pCurr = pCurr->Next) {
+                if (pCurr->OperStatus != IfOperStatusUp) continue;
+                if (pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                for (IP_ADAPTER_UNICAST_ADDRESS* pUnicast = pCurr->FirstUnicastAddress; pUnicast; pUnicast = pUnicast->Next) {
+                    if (pUnicast->Address.lpSockaddr->sa_family != AF_INET) continue;
+                    char addrBuf[INET_ADDRSTRLEN] = { 0 };
+                    sockaddr_in* sa_in = (sockaddr_in*)pUnicast->Address.lpSockaddr;
+                    inet_ntop(AF_INET, &sa_in->sin_addr, addrBuf, sizeof(addrBuf));
+                    std::string ip = addrBuf;
+                    if (ip.substr(0, 4) == "127.") continue;
+                    if (IsPublicIP(ip)) { if (publicIP.empty()) publicIP = ip; }
+                    else { if (privateIP.empty()) privateIP = ip; }
+                    if (!publicIP.empty() && !privateIP.empty()) break;
+                }
+                if (!publicIP.empty() && !privateIP.empty()) break;
+            }
+        }
+        free(pAddresses);
+    }
+
     // 获取本机地理位置
     std::string GetLocalLocation()
     {
         return GetGeoLocation(getPublicIP());
     }
 
-    // 获取 IP 地址地理位置(基于[ipinfo.io])
-    std::string GetGeoLocation(const std::string& IP)
+    // 获取 IP 地址地理位置 (多API备用)
+    virtual std::string GetGeoLocation(const std::string& IP)
     {
         if (IP.empty()) return "";
 
@@ -151,62 +207,117 @@ public:
                 return "";
         }
 
-        HINTERNET hInternet, hConnect;
-        DWORD bytesRead;
-        std::string readBuffer;
-
         // 初始化 WinINet
-        hInternet = InternetOpen("IP Geolocation", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+        HINTERNET hInternet = InternetOpen("IP Geolocation", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
         if (hInternet == NULL) {
             Mprintf("InternetOpen failed! %d\n", GetLastError());
             return "";
         }
 
-        // 创建 HTTP 请求句柄
-        std::string url = "http://ipinfo.io/" + ip + "/json";
-        hConnect = InternetOpenUrlA(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
-        if (hConnect == NULL) {
-            Mprintf("InternetOpenUrlA failed! %d\n", GetLastError());
-            InternetCloseHandle(hInternet);
-            return "";
+        // 设置超时
+        DWORD timeout = 5000;
+        InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+        // API配置: {url格式, 城市字段, 国家字段, 成功条件字段, 成功条件值, 是否HTTPS}
+        struct GeoApiConfig {
+            const char* urlFmt;      // URL格式 (%s = IP)
+            const char* cityField;   // 城市字段名
+            const char* countryField;// 国家字段名
+            const char* checkField;  // 校验字段 (空=不校验)
+            const char* checkValue;  // 校验值 (空=检查非error)
+            bool useHttps;
+        };
+
+        static const GeoApiConfig apis[] = {
+            // ip-api.com: 45次/分钟
+            {"http://ip-api.com/json/%s?fields=status,country,city", "city", "country", "status", "success", false},
+            // ipinfo.io: 1000次/月
+            {"http://ipinfo.io/%s/json", "city", "country", "", "", false},
+            // ipapi.co: 1000次/天
+            {"https://ipapi.co/%s/json/", "city", "country_name", "error", "", true},
+        };
+
+        std::string location;
+        for (const auto& api : apis) {
+            location = TryGeoApi(hInternet, ip, api.urlFmt, api.cityField, api.countryField,
+                                 api.checkField, api.checkValue, api.useHttps);
+            if (!location.empty()) break;
         }
 
-        // 读取返回的内容
+        InternetCloseHandle(hInternet);
+
+        if (location.empty() && IsPrivateIP(ip)) {
+            return "Local Area Network";
+        }
+        return location;
+    }
+
+private:
+    // 通用API查询函数
+    std::string TryGeoApi(HINTERNET hInternet, const std::string& ip,
+                          const char* urlFmt, const char* cityField, const char* countryField,
+                          const char* checkField, const char* checkValue, bool useHttps)
+    {
+        char urlBuf[256];
+        sprintf_s(urlBuf, urlFmt, ip.c_str());
+
+        DWORD flags = INTERNET_FLAG_RELOAD;
+        if (useHttps) flags |= INTERNET_FLAG_SECURE;
+
+        HINTERNET hConnect = InternetOpenUrlA(hInternet, urlBuf, NULL, 0, flags, 0);
+        if (!hConnect) return "";
+
+        // 检查HTTP状态码
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (HttpQueryInfo(hConnect, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusSize, NULL)) {
+            if (statusCode == 429 || statusCode >= 400) {
+                InternetCloseHandle(hConnect);
+                return "";  // 429或其他错误，尝试下一个API
+            }
+        }
+
+        std::string readBuffer;
         char buffer[4096];
+        DWORD bytesRead;
         while (InternetReadFile(hConnect, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
             readBuffer.append(buffer, bytesRead);
         }
+        InternetCloseHandle(hConnect);
 
-        // 解析 JSON 响应
-        Json::Value jsonData;
-        Json::Reader jsonReader;
-        std::string location;
-
-        if (jsonReader.parse(readBuffer, jsonData)) {
-            std::string country = Utf8ToAnsi(jsonData["country"].asString());
-            std::string city = Utf8ToAnsi(jsonData["city"].asString());
-            std::string loc = jsonData["loc"].asString();  // 经纬度信息
-            if (city.empty() && country.empty()) {
-            } else if (city.empty()) {
-                location = country;
-            } else if (country.empty()) {
-                location = city;
-            } else {
-                location = city + ", " + country;
-            }
-            if (location.empty() && IsPrivateIP(ip)) {
-                location = "Local Area Network";
-            }
-        } else {
-            Mprintf("Failed to parse JSON response: %s.\n", readBuffer.c_str());
+        // 备用: 检查响应体中的错误信息
+        if (readBuffer.find("Rate limit") != std::string::npos ||
+            readBuffer.find("rate limit") != std::string::npos) {
+            return "";
         }
 
-        // 关闭句柄
-        InternetCloseHandle(hConnect);
-        InternetCloseHandle(hInternet);
+        Json::Value json;
+        Json::Reader reader;
+        if (!reader.parse(readBuffer, json)) return "";
 
-        return location;
+        // 校验条件
+        if (checkField && checkField[0]) {
+            if (checkValue && checkValue[0]) {
+                // 检查字段==值
+                if (json[checkField].asString() != checkValue) return "";
+            } else {
+                // 检查字段不为true (error字段)
+                if (json[checkField].asBool()) return "";
+            }
+        }
+
+        std::string city = Utf8ToAnsi(json[cityField].asString());
+        std::string country = Utf8ToAnsi(json[countryField].asString());
+
+        if (!city.empty() && !country.empty()) return city + ", " + country;
+        if (!city.empty()) return city;
+        if (!country.empty()) return country;
+        return "";
     }
+
+public:
 
     bool isLoopbackAddress(const std::string& ip)
     {
@@ -307,3 +418,13 @@ public:
         return result;
     }
 };
+
+enum IPDatabaseType {
+    NoneDB = 0,
+    QQWry = 1,
+    Ip2Region = 2,
+};
+
+IPConverter* LoadFileQQWry(const char* datPath);
+
+IPConverter* LoadFileIp2Region(const char* xdbPath);

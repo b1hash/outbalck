@@ -5,6 +5,7 @@
 
 #pragma comment(lib,"Vfw32.lib")
 
-LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS &conn, BOOL &isAuthKernel);
+BOOL IsAuthKernel(std::string& str);
+LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS &conn, const std::string& expiredDate);
 DWORD CPUClockMHz();
 BOOL WebCamIsExist();

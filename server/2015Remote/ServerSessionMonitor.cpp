@@ -1,5 +1,6 @@
 ﻿#include "stdafx.h"
 #include "ServerSessionMonitor.h"
+#include "CrashReport.h"
 #include <stdio.h>
 #include <tlhelp32.h>
 #include <userenv.h>
@@ -22,6 +23,53 @@ static void AgentArray_Init(ServerAgentProcessArray* arr);
 static void AgentArray_Free(ServerAgentProcessArray* arr);
 static BOOL AgentArray_Add(ServerAgentProcessArray* arr, const ServerAgentProcessInfo* info);
 static void AgentArray_RemoveAt(ServerAgentProcessArray* arr, size_t index);
+
+// 崩溃保护辅助函数
+static void HandleFastCrash(ServerSessionMonitor* self, DWORD exitCode, ULONGLONG runtime);
+
+// 处理快速崩溃（用于崩溃保护，防止重启循环）
+// 注意：崩溃统计（onCrash）已在调用方处理，这里只处理崩溃窗口逻辑
+static void HandleFastCrash(ServerSessionMonitor* self, DWORD exitCode, ULONGLONG runtime)
+{
+    char buf[256];
+    ULONGLONG now = GetTickCount64();
+
+    sprintf_s(buf, sizeof(buf), "Fast crash detected: exitCode=0x%08X, runtime=%llu ms", exitCode, runtime);
+    Mprintf(buf);
+
+    // 检查是否在窗口期内
+    if (self->crashCount == 0 || (now - self->firstCrashTime) > CRASH_WINDOW_MS) {
+        // 开始新的窗口期
+        self->crashCount = 1;
+        self->firstCrashTime = now;
+        sprintf_s(buf, sizeof(buf), "Crash window started, count: %d", self->crashCount);
+        Mprintf(buf);
+    } else {
+        // 在窗口期内，增加计数
+        self->crashCount++;
+        sprintf_s(buf, sizeof(buf), "Crash count increased to: %d (threshold: %d)",
+                  self->crashCount, CRASH_THRESHOLD);
+        Mprintf(buf);
+
+        if (self->crashCount >= CRASH_THRESHOLD) {
+            // 触发崩溃保护
+            self->crashProtected = TRUE;
+            sprintf_s(buf, sizeof(buf),
+                "CRASH PROTECTION TRIGGERED: Agent crashed %d times within %d seconds.",
+                CRASH_THRESHOLD, CRASH_WINDOW_MS / 1000);
+            Mprintf(buf);
+            // 调用崩溃保护回调
+            if (self->onCrashProtection) {
+                self->onCrashProtection();
+            }
+        }
+    }
+
+    // 调用崩溃窗口状态变化回调（用于持久化）
+    if (self->onCrashWindowChange) {
+        self->onCrashWindowChange(self->crashCount, self->firstCrashTime);
+    }
+}
 
 // ============================================
 // 动态数组实现
@@ -84,8 +132,19 @@ void ServerSessionMonitor_Init(ServerSessionMonitor* self)
 {
     self->monitorThread = NULL;
     self->running = FALSE;
+    self->runAsUser = FALSE;  // 默认以SYSTEM身份运行
     InitializeCriticalSection(&self->csProcessList);
     AgentArray_Init(&self->agentProcesses);
+    // 崩溃保护初始化
+    self->crashCount = 0;
+    self->firstCrashTime = 0;
+    self->crashProtected = FALSE;
+    // 回调初始化
+    self->onAgentStart = NULL;
+    self->onAgentExit = NULL;
+    self->onCrash = NULL;
+    self->onCrashWindowChange = NULL;
+    self->onCrashProtection = NULL;
 }
 
 void ServerSessionMonitor_Cleanup(ServerSessionMonitor* self)
@@ -169,6 +228,20 @@ static void MonitorLoop(ServerSessionMonitor* self)
 
         // 清理已终止的进程
         CleanupDeadProcesses(self);
+
+        // 检查是否需要停止监控（可能在 CleanupDeadProcesses 中因 EXIT_MANUAL_STOP 设置）
+        if (!self->running) {
+            Mprintf("Monitor stop requested - exiting loop");
+            break;
+        }
+
+        // 检查是否触发了崩溃保护，如果是则退出监控循环
+        // 这会导致服务线程退出，进而停止整个服务
+        if (self->crashProtected) {
+            Mprintf("Crash protection triggered - stopping monitor loop");
+            self->running = FALSE;
+            break;
+        }
 
         // 枚举所有会话
         PWTS_SESSION_INFO pSessionInfo = NULL;
@@ -351,9 +424,34 @@ static void CleanupDeadProcesses(ServerSessionMonitor* self)
         if (GetExitCodeProcess(info->hProcess, &exitCode)) {
             if (exitCode != STILL_ACTIVE) {
                 // 进程已退出
-                sprintf_s(buf, sizeof(buf), "GUI PID=%d exited with code %d, cleaning up",
-                          (int)info->processId, (int)exitCode);
+                ULONGLONG runtime = GetTickCount64() - info->launchTime;
+                sprintf_s(buf, sizeof(buf), "GUI PID=%d exited with code %d after %llu ms, cleaning up",
+                          (int)info->processId, (int)exitCode, runtime);
                 Mprintf(buf);
+
+                // 调用退出回调（用于统计累计运行时间，每次退出都记录）
+                if (self->onAgentExit) {
+                    self->onAgentExit(exitCode, runtime);
+                }
+
+                // 检查是否是用户主动退出（通过菜单退出）
+                // 如果是，停止监控循环，不再重启代理
+                if (exitCode == EXIT_MANUAL_STOP) {
+                    Mprintf("Agent exited with EXIT_MANUAL_STOP - stopping monitor");
+                    self->running = FALSE;
+                }
+                // 统计所有崩溃（用于 MTBF 计算）
+                // exitCode != 0 且不是主动退出/重启请求，都视为崩溃
+                else if (exitCode != 0 && exitCode != EXIT_RESTART_REQUEST) {
+                    // 调用崩溃统计回调（所有崩溃都记录，用于 MTBF）
+                    if (self->onCrash) {
+                        self->onCrash(exitCode, runtime);
+                    }
+                    // 快速崩溃才触发崩溃保护（防止重启循环）
+                    if (runtime < FAST_CRASH_TIME_MS && !self->crashProtected) {
+                        HandleFastCrash(self, exitCode, runtime);
+                    }
+                }
 
                 SAFE_CLOSE_HANDLE(info->hProcess);
                 AgentArray_RemoveAt(&self->agentProcesses, i);
@@ -361,9 +459,25 @@ static void CleanupDeadProcesses(ServerSessionMonitor* self)
             }
         } else {
             // 无法获取退出代码，可能进程已不存在
-            sprintf_s(buf, sizeof(buf), "Cannot query GUI PID=%d, removing from list",
-                      (int)info->processId);
+            ULONGLONG runtime = GetTickCount64() - info->launchTime;
+            sprintf_s(buf, sizeof(buf), "Cannot query GUI PID=%d (runtime %llu ms), removing from list",
+                      (int)info->processId, runtime);
             Mprintf(buf);
+
+            // 调用退出回调（用于统计累计运行时间）
+            if (self->onAgentExit) {
+                self->onAgentExit(0xFFFFFFFF, runtime);
+            }
+
+            // 无法获取退出代码视为崩溃（保守处理）
+            // 调用崩溃统计回调（用于 MTBF）
+            if (self->onCrash) {
+                self->onCrash(0xFFFFFFFF, runtime);
+            }
+            // 快速崩溃才触发崩溃保护
+            if (runtime < FAST_CRASH_TIME_MS && !self->crashProtected) {
+                HandleFastCrash(self, 0xFFFFFFFF, runtime);
+            }
 
             SAFE_CLOSE_HANDLE(info->hProcess);
             AgentArray_RemoveAt(&self->agentProcesses, i);
@@ -380,7 +494,8 @@ static BOOL LaunchGuiInSession(ServerSessionMonitor* self, DWORD sessionId)
 {
     char buf[512];
 
-    sprintf_s(buf, sizeof(buf), "Attempting to launch GUI in session %d", (int)sessionId);
+    sprintf_s(buf, sizeof(buf), "Attempting to launch GUI in session %d (runAsUser=%d)",
+              (int)sessionId, (int)self->runAsUser);
     Mprintf(buf);
 
     STARTUPINFO si;
@@ -391,34 +506,61 @@ static BOOL LaunchGuiInSession(ServerSessionMonitor* self, DWORD sessionId)
     si.cb = sizeof(STARTUPINFO);
     si.lpDesktop = (LPSTR)"winsta0\\default";  // 关键：指定桌面
 
-    // 获取当前服务进程的 SYSTEM 令牌
     HANDLE hToken = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-        sprintf_s(buf, sizeof(buf), "OpenProcessToken failed: %d", (int)GetLastError());
-        Mprintf(buf);
-        return FALSE;
-    }
-
-    // 复制为可用于创建进程的主令牌
     HANDLE hDupToken = NULL;
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
-                          SecurityImpersonation, TokenPrimary, &hDupToken)) {
-        sprintf_s(buf, sizeof(buf), "DuplicateTokenEx failed: %d", (int)GetLastError());
-        Mprintf(buf);
-        SAFE_CLOSE_HANDLE(hToken);
-        return FALSE;
-    }
 
-    // 修改令牌的会话 ID 为目标用户会话
-    if (!SetTokenInformation(hDupToken, TokenSessionId, &sessionId, sizeof(sessionId))) {
-        sprintf_s(buf, sizeof(buf), "SetTokenInformation failed: %d", (int)GetLastError());
-        Mprintf(buf);
-        SAFE_CLOSE_HANDLE(hDupToken);
-        SAFE_CLOSE_HANDLE(hToken);
-        return FALSE;
-    }
+    if (self->runAsUser) {
+        // 模式1：以用户身份运行（解决IME、剪切板等问题）
+        Mprintf("Mode: Run as User");
 
-    Mprintf("Token duplicated");
+        // 直接获取用户令牌
+        if (!WTSQueryUserToken(sessionId, &hToken)) {
+            sprintf_s(buf, sizeof(buf), "WTSQueryUserToken failed: %d", (int)GetLastError());
+            Mprintf(buf);
+            return FALSE;
+        }
+
+        // 复制为主令牌
+        if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+                              SecurityImpersonation, TokenPrimary, &hDupToken)) {
+            sprintf_s(buf, sizeof(buf), "DuplicateTokenEx failed: %d", (int)GetLastError());
+            Mprintf(buf);
+            SAFE_CLOSE_HANDLE(hToken);
+            return FALSE;
+        }
+
+        Mprintf("User token obtained and duplicated");
+    } else {
+        // 模式2：以SYSTEM身份运行（现有逻辑）
+        Mprintf("Mode: Run as SYSTEM");
+
+        // 获取当前服务进程的 SYSTEM 令牌
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
+            sprintf_s(buf, sizeof(buf), "OpenProcessToken failed: %d", (int)GetLastError());
+            Mprintf(buf);
+            return FALSE;
+        }
+
+        // 复制为可用于创建进程的主令牌
+        if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+                              SecurityImpersonation, TokenPrimary, &hDupToken)) {
+            sprintf_s(buf, sizeof(buf), "DuplicateTokenEx failed: %d", (int)GetLastError());
+            Mprintf(buf);
+            SAFE_CLOSE_HANDLE(hToken);
+            return FALSE;
+        }
+
+        // 修改令牌的会话 ID 为目标用户会话
+        if (!SetTokenInformation(hDupToken, TokenSessionId, &sessionId, sizeof(sessionId))) {
+            sprintf_s(buf, sizeof(buf), "SetTokenInformation failed: %d", (int)GetLastError());
+            Mprintf(buf);
+            SAFE_CLOSE_HANDLE(hDupToken);
+            SAFE_CLOSE_HANDLE(hToken);
+            return FALSE;
+        }
+
+        Mprintf("SYSTEM token duplicated");
+    }
 
     // 获取当前程序路径（就是自己）
     char exePath[MAX_PATH];
@@ -442,9 +584,13 @@ static BOOL LaunchGuiInSession(ServerSessionMonitor* self, DWORD sessionId)
         return FALSE;
     }
 
-    // 构建命令行：同一个 exe， 但添加 -agent 参数
-    char cmdLine[MAX_PATH + 20];
-    sprintf_s(cmdLine, sizeof(cmdLine), "\"%s\" -agent", exePath);
+    // 构建命令行：同一个 exe， 但添加 -agent 或 -agent-asuser 参数
+    char cmdLine[MAX_PATH + 32];
+    if (self->runAsUser) {
+        sprintf_s(cmdLine, sizeof(cmdLine), "\"%s\" -agent-asuser", exePath);
+    } else {
+        sprintf_s(cmdLine, sizeof(cmdLine), "\"%s\" -agent", exePath);
+    }
 
     sprintf_s(buf, sizeof(buf), "Command line: %s", cmdLine);
     Mprintf(buf);
@@ -494,8 +640,14 @@ static BOOL LaunchGuiInSession(ServerSessionMonitor* self, DWORD sessionId)
         info.processId = pi.dwProcessId;
         info.sessionId = sessionId;
         info.hProcess = pi.hProcess;  // 不关闭句柄，留着后面终止
+        info.launchTime = GetTickCount64();  // 记录启动时间
         AgentArray_Add(&self->agentProcesses, &info);
         LeaveCriticalSection(&self->csProcessList);
+
+        // 调用启动回调（用于统计启动次数）
+        if (self->onAgentStart) {
+            self->onAgentStart(pi.dwProcessId, sessionId);
+        }
 
         SAFE_CLOSE_HANDLE(pi.hThread);  // 线程句柄可以关闭
     } else {

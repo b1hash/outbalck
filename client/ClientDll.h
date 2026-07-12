@@ -125,6 +125,9 @@ public:
         if (!Stop()) return false;
         return true;
     }
+    virtual bool IsMainInstance()override {
+        return !m_bShared;
+    }
 };
 
 ClientApp* NewClientStartArg(const char* remoteAddr, IsRunning run = IsClientAppRunning, BOOL shared=FALSE);

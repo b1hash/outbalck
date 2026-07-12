@@ -1,9 +1,116 @@
 ﻿#include "StdAfx.h"
 #include "IOCPServer.h"
 #include "2015Remote.h"
+#include "common/IPWhitelist.h"
+#include "common/IPBlacklist.h"
 
 #include <iostream>
 #include <ws2tcpip.h>
+
+// Proxy Protocol v2 签名 (12 字节)
+static const unsigned char PROXY_PROTOCOL_V2_SIGNATURE[12] = {
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
+};
+
+// 解析 Proxy Protocol v2 头，返回真实客户端 IP
+// 成功返回 true 并设置 realIP，失败返回 false
+// 如果不是 Proxy Protocol，返回 false 且不消费任何数据
+static bool ParseProxyProtocolV2(SOCKET sock, std::string& realIP)
+{
+    // 等待数据就绪（最多 200ms），解决 FRP Proxy Protocol 头延迟到达的时序问题
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    struct timeval tv = { 0, 200000 };  // 200ms
+    int ready = select((int)sock + 1, &readfds, NULL, NULL, &tv);
+    if (ready <= 0) {
+        return false;  // 超时或错误，当作普通连接
+    }
+
+    // 先 peek 前 16 字节（12 签名 + 4 头部）
+    unsigned char header[16];
+    int n = recv(sock, (char*)header, 16, MSG_PEEK);
+
+    if (n < 12) {
+        // 数据不足，检查已有数据是否匹配签名前缀
+        if (n > 0 && memcmp(header, PROXY_PROTOCOL_V2_SIGNATURE, n) != 0) {
+            return false;  // 不匹配，不是 Proxy Protocol
+        }
+        // 数据太少无法判断，当作普通连接
+        return false;
+    }
+
+    // 检查签名
+    if (memcmp(header, PROXY_PROTOCOL_V2_SIGNATURE, 12) != 0) {
+        return false;  // 签名不匹配，不是 Proxy Protocol
+    }
+
+    if (n < 16) {
+        // 有签名但头部不完整，等待更多数据（理论上不会发生）
+        return false;
+    }
+
+    // 解析版本和命令 (byte 12)
+    // 高 4 位是版本 (应该是 0x2)，低 4 位是命令 (0x0=LOCAL, 0x1=PROXY)
+    unsigned char verCmd = header[12];
+    unsigned char version = (verCmd >> 4) & 0x0F;
+    unsigned char command = verCmd & 0x0F;
+
+    if (version != 2) {
+        // 不是 v2，可能是 v1 或无效
+        return false;
+    }
+
+    // 解析地址族和协议 (byte 13)
+    // 高 4 位是地址族 (0x1=AF_INET, 0x2=AF_INET6)
+    // 低 4 位是协议 (0x1=STREAM, 0x2=DGRAM)
+    unsigned char famProto = header[13];
+    unsigned char addrFamily = (famProto >> 4) & 0x0F;
+
+    // 解析地址长度 (bytes 14-15, big-endian)
+    unsigned short addrLen = (header[14] << 8) | header[15];
+
+    // 计算完整头部长度 (IPv4: 16+12=28, IPv6: 16+36=52)
+    int totalHeaderLen = 16 + addrLen;
+    if (totalHeaderLen > 108) {  // 安全上限：16 + 最大 TLV 长度
+        return false;
+    }
+
+    // 读取完整头部（真正消费数据），使用固定数组避免动态分配
+    unsigned char fullHeader[108];
+    int received = 0;
+    while (received < totalHeaderLen) {
+        int r = recv(sock, (char*)fullHeader + received, totalHeaderLen - received, 0);
+        if (r <= 0) {
+            return false;  // 接收失败
+        }
+        received += r;
+    }
+
+    // 如果是 LOCAL 命令，使用 socket 的对端地址
+    if (command == 0x00) {
+        return false;  // 让调用者使用 getpeername
+    }
+
+    // 解析地址
+    if (addrFamily == 0x01 && addrLen >= 12) {
+        // IPv4: src_addr(4) + dst_addr(4) + src_port(2) + dst_port(2)
+        unsigned char* addr = fullHeader + 16;
+        char ipStr[INET_ADDRSTRLEN];
+        snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+        realIP = ipStr;
+        return true;
+    } else if (addrFamily == 0x02 && addrLen >= 36) {
+        // IPv6: src_addr(16) + dst_addr(16) + src_port(2) + dst_port(2)
+        unsigned char* addr = fullHeader + 16;
+        char ipStr[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, addr, ipStr, sizeof(ipStr));
+        realIP = ipStr;
+        return true;
+    }
+
+    return false;  // 未知地址族
+}
 
 // 根据 socket 获取客户端IP地址.
 std::string GetPeerName(SOCKET sock)
@@ -32,9 +139,178 @@ std::string GetRemoteIP(SOCKET sock)
     return buf;
 }
 
+// IP 连接限流配置 (缓存，避免频繁读取注册表)
+static struct {
+    int banWindow = 60;
+    int banMaxConn = 15;
+    int banDuration = 3600;
+    bool loaded = false;
+} g_BanConfig;
+
+void ReloadBanConfig() {
+    g_BanConfig.banWindow = THIS_CFG.GetInt("settings", "BanWindow", 60);
+    g_BanConfig.banMaxConn = THIS_CFG.GetInt("settings", "BanMaxConn", 15);
+    g_BanConfig.banDuration = THIS_CFG.GetInt("settings", "BanDuration", 3600);
+    g_BanConfig.loaded = true;
+}
+
+static int GetBanWindowSeconds() {
+    if (!g_BanConfig.loaded) ReloadBanConfig();
+    return g_BanConfig.banWindow;
+}
+static int GetBanMaxConnections() {
+    if (!g_BanConfig.loaded) ReloadBanConfig();
+    return g_BanConfig.banMaxConn;
+}
+static int GetBanDurationSeconds() {
+    if (!g_BanConfig.loaded) ReloadBanConfig();
+    return g_BanConfig.banDuration;
+}
+
+// 检查 IP 是否被封禁
+bool IOCPServer::IsIPBanned(const std::string& ip)
+{
+    // 检查白名单 (包含本地地址检查)
+    if (IPWhitelist::getInstance().IsWhitelisted(ip)) {
+        return false;
+    }
+
+    CLock lock(m_BanLock);
+
+    auto it = m_BannedIPs.find(ip);
+    if (it != m_BannedIPs.end()) {
+        time_t now = time(nullptr);
+        if (now < it->second) {
+            // 仍在封禁期内
+            return true;
+        }
+        // 封禁已过期，移除
+        m_BannedIPs.erase(it);
+    }
+    return false;
+}
+
+// 检查 IP 是否在黑名单中
+bool IOCPServer::IsIPBlacklisted(const std::string& ip)
+{
+    if (IPBlacklist::getInstance().IsBlacklisted(ip)) {
+        // 防刷频日志
+        if (IPBlacklist::getInstance().ShouldLog(ip)) {
+            Mprintf("Connection rejected: %s (blacklisted)\n", ip.c_str());
+            if (m_hMainWnd) {
+                char tip[256];
+                sprintf_s(tip, _TRF("IP %s 连接被拒绝 (黑名单)"), ip.c_str());
+                PostMessageA(m_hMainWnd, WM_SHOWERRORMSG,
+                    (WPARAM)new CString(tip), (LPARAM)new CString(_TR("黑名单")));
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// 记录连接并检测异常
+void IOCPServer::RecordConnection(const std::string& ip)
+{
+    // 检查白名单 (包含本地地址检查)
+    if (IPWhitelist::getInstance().IsWhitelisted(ip)) {
+        return;
+    }
+
+    bool shouldBan = false;
+    {
+        CLock lock(m_BanLock);
+
+        time_t now = time(nullptr);
+        int banWindow = GetBanWindowSeconds();
+
+        // 定期清理过期的连接计数 (每 1000 次检查一次，或条目超过 10000)
+        static int cleanupCounter = 0;
+        if (++cleanupCounter >= 1000 || m_ConnectionCount.size() > 10000) {
+            cleanupCounter = 0;
+            for (auto it = m_ConnectionCount.begin(); it != m_ConnectionCount.end(); ) {
+                if (now - it->second.windowStart >= banWindow) {
+                    it = m_ConnectionCount.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        auto it = m_ConnectionCount.find(ip);
+        if (it == m_ConnectionCount.end()) {
+            // 新 IP，开始计数
+            m_ConnectionCount[ip] = { 1, now };
+        } else {
+            // 检查是否在同一个统计窗口内
+            if (now - it->second.windowStart < banWindow) {
+                it->second.count++;
+                // 检查是否超过阈值
+                if (it->second.count > GetBanMaxConnections()) {
+                    shouldBan = true;
+                }
+            } else {
+                // 新窗口，重置计数
+                it->second.count = 1;
+                it->second.windowStart = now;
+            }
+        }
+    }
+    if (shouldBan) {
+        BanIP(ip, GetBanDurationSeconds());
+    }
+}
+
+// 封禁 IP
+void IOCPServer::BanIP(const std::string& ip, int seconds)
+{
+    {
+        CLock lock(m_BanLock);
+        time_t expiry = time(nullptr) + seconds;
+        m_BannedIPs[ip] = expiry;
+        // 清除连接计数
+        m_ConnectionCount.erase(ip);
+    }
+    Mprintf("IP banned: %s (duration: %d seconds, reason: too many connections)\n",
+            ip.c_str(), seconds);
+
+    // 发送到主窗口信息列表
+    if (m_hMainWnd) {
+        char tip[256];
+        sprintf_s(tip, _TRF("IP %s 已封禁 %d 秒 (连接过于频繁)"), ip.c_str(), seconds);
+        PostMessageA(m_hMainWnd, WM_SHOWERRORMSG, (WPARAM)new CString(tip),(LPARAM)new CString(_TR("IP 封禁")));
+    }
+}
+
+// 从配置文件加载 IP 白名单
+void IOCPServer::LoadIPWhitelist()
+{
+    // 配置格式: IPWhitelist=192.168.1.1;10.0.0.1;172.16.0.100
+    std::string whitelist = THIS_CFG.GetStr("settings", "IPWhitelist", "");
+    IPWhitelist::getInstance().Load(whitelist);
+
+    size_t count = IPWhitelist::getInstance().Count();
+    if (count > 0) {
+        Mprintf("IP whitelist loaded: %zu IPs\n", count);
+    }
+}
+
+// 从配置文件加载 IP 黑名单
+void IOCPServer::LoadIPBlacklist()
+{
+    // 配置格式: IPBlacklist=192.168.1.1;10.0.0.1
+    std::string blacklist = THIS_CFG.GetStr("settings", "IPBlacklist", "");
+    IPBlacklist::getInstance().Load(blacklist);
+
+    size_t count = IPBlacklist::getInstance().Count();
+    if (count > 0) {
+        Mprintf("IP blacklist loaded: %zu IPs\n", count);
+    }
+}
+
 IOCPServer::IOCPServer(HWND hWnd)
 {
-	m_hMainWnd = hWnd;
+    m_hMainWnd = hWnd;
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2,2), &wsaData)!=0) {
         return;
@@ -48,6 +324,9 @@ IOCPServer::IOCPServer(HWND hWnd)
     m_ulMaxConnections = 10000;
 
     InitializeCriticalSection(&m_cs);
+    InitializeCriticalSection(&m_BanLock);
+    LoadIPWhitelist();
+    LoadIPBlacklist();
 
     m_ulWorkThreadCount = 0;
 
@@ -115,6 +394,7 @@ IOCPServer::~IOCPServer(void)
     }
 
     DeleteCriticalSection(&m_cs);
+    DeleteCriticalSection(&m_BanLock);
     m_ulWorkThreadCount = 0;
 
     m_ulThreadPoolMin  = 0;
@@ -379,6 +659,18 @@ DWORD IOCPServer::WorkThreadProc(LPVOID lParam)
 //在工作线程中被调用
 BOOL IOCPServer::HandleIO(IOType PacketFlags,PCONTEXT_OBJECT ContextObject, DWORD dwTrans, ZSTD_DCtx* ctx, z_stream* z)
 {
+    // 防止竞态条件 (#215)：
+    // 必须先增加引用计数，再检查 IsRemoved。
+    // 顺序很重要！如果先检查再增加，会有 TOCTOU 竞态窗口：
+    // 在检查和增加之间，RemoveStaleContext 可能完成并重用对象。
+    ContextObject->IoRefCount.fetch_add(1);
+
+    // 检查对象是否已被标记为移除
+    if (ContextObject->IsRemoved.load()) {
+        ContextObject->IoRefCount.fetch_sub(1);
+        return FALSE;
+    }
+
     BOOL bRet = FALSE;
 
     switch (PacketFlags) {
@@ -398,7 +690,14 @@ BOOL IOCPServer::HandleIO(IOType PacketFlags,PCONTEXT_OBJECT ContextObject, DWOR
         break;
     }
 
-    return bRet;
+    // 减少引用计数 (#215)
+    // 特殊返回值 -2 表示内部函数已经减少了引用计数并调用了 RemoveStaleContext
+    // 此时对象可能已在空闲池或被重用，不能再访问
+    if (bRet != -2) {
+        ContextObject->IoRefCount.fetch_sub(1);
+    }
+
+    return bRet == -2 ? FALSE : bRet;
 }
 
 
@@ -481,15 +780,16 @@ BOOL ParseReceivedData(CONTEXT_OBJECT * ContextObject, DWORD dwTrans, pfnNotifyP
                             ret = DeCompressedBuffer[0] == TOKEN_LOGIN ? 999 : 1;
                     } else {
                         zlibFailed = true;
-                        ContextObject->CompressMethod = COMPRESS_UNKNOWN;
+                        // 注意：不设置 COMPRESS_UNKNOWN，后续包仍尝试用 ZSTD
                     }
                 } else {
                     zlibFailed = true;
                 }
                 // CompressedBuffer 和 DeCompressedBuffer 都由 CONTEXT_OBJECT 管理，不在此处释放
                 if (zlibFailed) {
-                    Mprintf("[ERROR] ZLIB uncompress failed \n");
-                    throw "Bad Buffer";
+                    Mprintf("[ERROR] uncompress failed: cmd=0x%02X, compressed=%u, original=%u\n",
+                            (unsigned char)CompressedBuffer[0], ulCompressedLength, ulOriginalLength);
+                    throw "Bad Buffer";  // 抛出异常，在 catch 中清理缓冲区
                 }
             } else {
                 break;
@@ -506,8 +806,11 @@ BOOL ParseReceivedData(CONTEXT_OBJECT * ContextObject, DWORD dwTrans, pfnNotifyP
 BOOL IOCPServer::OnClientReceiving(PCONTEXT_OBJECT  ContextObject, DWORD dwTrans, ZSTD_DCtx* ctx, z_stream* z)
 {
     if (FALSE == ParseReceivedData(ContextObject, dwTrans, m_NotifyProc, ctx, z)) {
+        // 先减少引用计数，再调用 RemoveStaleContext (#215)
+        // RemoveStaleContext 完成后对象会被移到空闲池，不能再访问
+        ContextObject->IoRefCount.fetch_sub(1);
         RemoveStaleContext(ContextObject);
-        return FALSE;
+        return -2;  // 特殊返回值：告诉 HandleIO 不要再减少引用计数
     }
 
     PostRecv(ContextObject); //投递新的接收数据的请求
@@ -609,10 +912,12 @@ BOOL IOCPServer::OnClientPostSending(CONTEXT_OBJECT* ContextObject,ULONG ulCompl
             int iOk = WSASend(ContextObject->sClientSocket, &ContextObject->wsaOutBuffer,1,
                               NULL, ulFlags,&OverlappedPlus->m_ol, NULL);
             if ( iOk == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING ) {
+                // 先减少引用计数，再调用 RemoveStaleContext (#215)
+                ContextObject->IoRefCount.fetch_sub(1);
                 if (RemoveStaleContext(ContextObject))
                     Mprintf("!!! OnClientPostSending 投递消息失败: %d\n", WSAGetLastError());
                 SAFE_DELETE(OverlappedPlus);
-                return FALSE;
+                return -2;  // 特殊返回值：告诉 HandleIO 不要再减少引用计数
             }
             return TRUE;
         }
@@ -680,6 +985,30 @@ void IOCPServer::OnAccept()
     }
 
     ContextObject->sClientSocket = sClientSocket;
+
+    // 尝试解析 Proxy Protocol v2 头，获取真实客户端 IP
+    // 如果解析成功，更新 PeerName；否则保持 getpeername 的结果
+    std::string realIP;
+    if (ParseProxyProtocolV2(sClientSocket, realIP)) {
+        ContextObject->SetPeerName (realIP);
+    }
+
+    // IP 黑名单和封禁检查
+    std::string clientIP = ContextObject->GetPeerName().empty() ?
+                           inet_ntoa(ClientAddr.sin_addr) : ContextObject->GetPeerName();
+    // 先检查黑名单
+    if (IsIPBlacklisted(clientIP)) {
+        delete ContextObject;
+        closesocket(sClientSocket);
+        return;
+    }
+    // 再检查临时封禁
+    if (IsIPBanned(clientIP)) {
+        delete ContextObject;
+        closesocket(sClientSocket);
+        return;
+    }
+    RecordConnection(clientIP);
 
     ContextObject->wsaInBuf.buf = (char*)ContextObject->szBuffer;
     ContextObject->wsaInBuf.len = sizeof(ContextObject->szBuffer);
@@ -763,17 +1092,17 @@ PCONTEXT_OBJECT IOCPServer::AllocateContext(SOCKET s)
 
     if (m_ContextConnectionList.GetCount() >= m_ulMaxConnections) {
         static uint64_t notifyTime = 0;
-		auto now = time(0);
+        auto now = time(0);
         if (now - notifyTime > 15) {
             notifyTime = now;
             Mprintf("!!! AllocateContext: 达到最大连接数 %lu，拒绝新连接\n", m_ulMaxConnections);
             if (m_hMainWnd) {
-				char tip[256];
-				sprintf_s(tip, _TRF("达到最大连接数限制: %lu, 请释放连接"), m_ulMaxConnections);
+                char tip[256];
+                sprintf_s(tip, _TRF("达到最大连接数限制: %lu, 请释放连接"), m_ulMaxConnections);
                 PostMessageA(m_hMainWnd, WM_SHOWNOTIFY, (WPARAM)new CharMsg(_TR("达到最大连接数")),
-                    (LPARAM)new CharMsg(tip));
+                             (LPARAM)new CharMsg(tip));
             }
-		}
+        }
         return NULL;
     }
 
@@ -792,14 +1121,27 @@ BOOL IOCPServer::RemoveStaleContext(CONTEXT_OBJECT* ContextObject)
     auto find = m_ContextConnectionList.Find(ContextObject);
     LeaveCriticalSection(&m_cs);
     if (find) {  //在内存中查找该用户的上下文数据结构
+        // 标记对象为已移除，防止新的 I/O 处理开始 (#215)
+        ContextObject->IsRemoved.store(true);
+
         m_OfflineProc(ContextObject);
 
         CancelIo((HANDLE)ContextObject->sClientSocket);  //取消在当前套接字的异步IO -->PostRecv
         closesocket(ContextObject->sClientSocket);      //关闭套接字
         ContextObject->sClientSocket = INVALID_SOCKET;
 
-        while (!HasOverlappedIoCompleted((LPOVERLAPPED)ContextObject)) { //判断还有没有异步IO请求在当前套接字上
-            Sleep(0);
+        // 等待所有正在处理此对象的工作线程完成 (#215)
+        // 注意：之前的 HasOverlappedIoCompleted((LPOVERLAPPED)ContextObject) 是错误的，
+        // 因为 CONTEXT_OBJECT 不是 OVERLAPPED，其第一个字段是虚函数表指针，
+        // 导致检查总是立即返回 TRUE，造成竞态条件崩溃
+        int waitCount = 0;
+        while (ContextObject->IoRefCount.load() > 0) {
+            Sleep(1);
+            if (++waitCount > 5000) {  // 5秒超时保护
+                Mprintf("!!! RemoveStaleContext: IoRefCount wait timeout (ref=%d)\n",
+                        ContextObject->IoRefCount.load());
+                break;
+            }
         }
 
         MoveContextToFreePoolList(ContextObject);  //将该内存结构回收至内存池

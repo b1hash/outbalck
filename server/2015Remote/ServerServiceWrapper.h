@@ -2,15 +2,24 @@
 #define SERVER_SERVICE_WRAPPER_H
 
 #include <windows.h>
+#include "UIBranding.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // 服务配置：服务端使用不同的服务名
-#define SERVER_SERVICE_NAME        "YamaControlService"
-#define SERVER_SERVICE_DISPLAY     "Yama Control Service"
+// Debug 版本使用不同的服务名，便于调试
+// 服务名和显示名均可通过 UIBranding.h 定制
+#ifdef _DEBUG
+#define SERVER_SERVICE_NAME        BRAND_SERVICE_NAME "_Debug"
+#define SERVER_SERVICE_DISPLAY     BRAND_SERVICE_DISPLAY " (Debug)"
 #define SERVER_SERVICE_DESC        "Provides remote desktop control server functionality."
+#else
+#define SERVER_SERVICE_NAME        BRAND_SERVICE_NAME
+#define SERVER_SERVICE_DISPLAY     BRAND_SERVICE_DISPLAY
+#define SERVER_SERVICE_DESC        "Provides remote desktop control server functionality."
+#endif
 
 /*
 # 停止服务

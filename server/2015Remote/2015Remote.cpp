@@ -15,9 +15,30 @@
 #include <io.h>
 #include <direct.h>
 #include <DbgHelp.h>
+#include <intrin.h>  // for __cpuid, __cpuidex
 #include "IOCPUDPServer.h"
 #include "ServerServiceWrapper.h"
+#include "common/SafeString.h"
+#include "CrashReport.h"
+#include "UIBranding.h"
 #pragma comment(lib, "Dbghelp.lib")
+
+// 外部声明：程序退出标志（定义在 2015RemoteDlg.cpp）
+extern std::atomic<bool> g_bAppExiting;
+
+// Check if CPU supports AVX2 instruction set
+static BOOL IsAVX2Supported()
+{
+    int cpuInfo[4] = { 0 };
+    __cpuid(cpuInfo, 0);
+    int nIds = cpuInfo[0];
+
+    if (nIds >= 7) {
+        __cpuidex(cpuInfo, 7, 0);
+        return (cpuInfo[1] & (1 << 5)) != 0;  // EBX bit 5 = AVX2
+    }
+    return FALSE;
+}
 
 BOOL ServerPair::StartServer(pfnNotifyProc NotifyProc, pfnOfflineProc OffProc, USHORT uPort)
 {
@@ -53,6 +74,11 @@ std::string GetMasterHash()
 */
 long WINAPI whenbuged(_EXCEPTION_POINTERS *excp)
 {
+    // 如果程序正在退出，静默退出，返回码 0（避免服务重启）
+    if (g_bAppExiting) {
+        ExitProcess(0);
+    }
+
     // 获取dump文件夹，若不存在，则创建之
     char dumpDir[_MAX_PATH];
     char dumpFile[_MAX_PATH + 64];
@@ -72,12 +98,13 @@ long WINAPI whenbuged(_EXCEPTION_POINTERS *excp)
         _mkdir(dumpDir);
 
     // 构建完整的dump文件路径
-    char curTime[64];
+    char curTime[64], dumpName[128];
     time_t TIME = time(0);
     struct tm localTime;
     localtime_s(&localTime, &TIME);
-    strftime(curTime, sizeof(curTime), "\\YAMA_%Y-%m-%d %H%M%S.dmp", &localTime);
-    sprintf_s(dumpFile, sizeof(dumpFile), "%s%s", dumpDir, curTime);
+    strftime(curTime, sizeof(curTime), "%Y-%m-%d %H%M%S", &localTime);
+    sprintf_s(dumpName, sizeof(dumpName), "\\" BRAND_DUMP_PREFIX "_%s.dmp", curTime);
+    sprintf_s(dumpFile, sizeof(dumpFile), "%s%s", dumpDir, dumpName);
 
     HANDLE hFile = ::CreateFileA(dumpFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                                  FILE_ATTRIBUTE_NORMAL, NULL);
@@ -245,11 +272,14 @@ static BOOL HandleServiceCommandLine()
         return TRUE;
     }
 
-    // -agent: 由服务启动的GUI代理模式
-    // 此模式下正常运行GUI，但使用不同的互斥量名称避免冲突
+    // -agent 或 -agent-asuser: 由服务启动的GUI代理模式
+    // 必须先检查更长的参数 -agent-asuser，避免被 -agent 误匹配
+    if (cmdLine.Find(_T("-agent-asuser")) != -1) {
+        Mprintf("[HandleServiceCommandLine] Run service agent as USER: '%s'\n", cmdLine.GetString());
+        return FALSE;
+    }
     if (cmdLine.Find(_T("-agent")) != -1) {
-        // 继续正常启动GUI，但标记为代理模式
-        Mprintf("[HandleServiceCommandLine] Run service agent: '%s'\n", cmdLine.GetString());
+        Mprintf("[HandleServiceCommandLine] Run service agent as SYSTEM: '%s'\n", cmdLine.GetString());
         return FALSE;
     }
 
@@ -318,6 +348,16 @@ BOOL IsRunningAsAdmin()
 
 BOOL LaunchAsAdmin(const char* szFilePath, const char* verb)
 {
+    CString cmdLine = AfxGetApp()->m_lpCmdLine, arg;
+    cmdLine.Trim(); // 去掉前后空格
+
+    if (cmdLine.CompareNoCase(_T("-agent-asuser")) == 0) {
+		arg = "-agent-asuser";
+    }
+    else if (cmdLine.CompareNoCase(_T("-agent")) == 0) {
+		arg = "-agent";
+    }
+
     SHELLEXECUTEINFOA shExecInfo;
     ZeroMemory(&shExecInfo, sizeof(SHELLEXECUTEINFOA));
     shExecInfo.cbSize = sizeof(SHELLEXECUTEINFOA);
@@ -326,6 +366,7 @@ BOOL LaunchAsAdmin(const char* szFilePath, const char* verb)
     shExecInfo.lpVerb = verb;
     shExecInfo.lpFile = szFilePath;
     shExecInfo.nShow = SW_NORMAL;
+	shExecInfo.lpParameters = arg.IsEmpty() ? NULL : (LPCSTR)arg;
 
     return ShellExecuteExA(&shExecInfo);
 }
@@ -384,62 +425,107 @@ BOOL CMy2015RemoteApp::ProcessZstaCmd()
 
 BOOL CMy2015RemoteApp::InitInstance()
 {
+	CString cmdLine = ::GetCommandLine();
+    Mprintf("启动运行: %s\n", cmdLine);
+
+    // 防止用户频繁点击导致多实例启动冲突
+    // 服务进程、安装/卸载命令不需要互斥量检查（由 SCM 管理）
+    // 代理模式和普通模式使用相同互斥量（TCP 监听，只能运行一个）
+#ifndef _DEBUG
+    {
+        CString cmdLineLower = cmdLine;
+        cmdLineLower.MakeLower();
+
+        // 以下命令跳过互斥量检查：
+        // - 服务进程和安装/卸载命令（由 SCM 管理）
+        // - 压缩/解压命令（独立功能，不启动主程序）
+        BOOL skipMutex = (cmdLineLower.Find(_T("-service")) != -1) ||
+                         (cmdLineLower.Find(_T("-install")) != -1) ||
+                         (cmdLineLower.Find(_T("-uninstall")) != -1) ||
+                         (cmdLineLower.Find(_T("-zsta")) != -1);
+
+        if (!skipMutex) {
+            std::string masterHash(GetMasterHash());
+            std::string mu = GetPwdHash()==masterHash ? "MASTER.EXE" : "YAMA.EXE";
+            m_Mutex = CreateMutex(NULL, FALSE, mu.c_str());
+            if (ERROR_ALREADY_EXISTS == GetLastError()) {
+                SAFE_CLOSE_HANDLE(m_Mutex);
+                m_Mutex = NULL;
+                // 不弹框，静默退出，避免用户频繁点击时弹出多个对话框
+                Mprintf("[InitInstance] 一个主控程序已经在运行，静默退出。\n");
+                return FALSE;
+            }
+        }
+    }
+#endif
+
+    // 安装安全字符串 handler，避免 _s 函数参数无效时崩溃且无 dump
+    InstallSafeStringHandler();
+
+    // Check if CPU supports AVX2 instruction set
+    if (!IsAVX2Supported()) {
+        ::MessageBoxA(NULL,
+            "此程序需要支持 AVX2 指令集的 CPU（2013年后的处理器）。您的 CPU 不支持 AVX2，程序无法运行。",
+            "CPU 不兼容", MB_ICONERROR);
+        return FALSE;
+    }
+
     if (!ProcessZstaCmd()) {
         Mprintf("[InitInstance] 处理自定义压缩/解压命令后退出。\n");
         return FALSE;
     }
 
-#if _DEBUG
-    BOOL runNormal = TRUE;
-#else
     BOOL runNormal = THIS_CFG.GetInt("settings", "RunNormal", 0);
-#endif
+
+    // 检查代理崩溃保护标志
+    // 如果服务检测到代理连续崩溃，会设置此标志并停止服务
+    // 用户下次启动时（普通模式或代理模式）都会看到提示
+    if (THIS_CFG.GetInt(CFG_CRASH_SECTION, CFG_CRASH_PROTECTED, 0) == 1) {
+        // 清除崩溃保护标志
+        THIS_CFG.SetInt(CFG_CRASH_SECTION, CFG_CRASH_PROTECTED, 0);
+        // 确保是正常模式（服务端已设置，这里再次确保）
+        THIS_CFG.SetInt("settings", "RunNormal", 1);
+        runNormal = 1;
+        Mprintf("[InitInstance] 检测到代理崩溃保护标志，切换到正常运行模式。\n");
+        MessageBoxL("检测到代理程序连续崩溃，已自动切换到正常运行模式。\n\n"
+                    "如需重新启用服务模式，请在设置中手动切换。",
+                    "崩溃保护", MB_ICONWARNING);
+    }
+
     char curFile[MAX_PATH] = { 0 };
     GetModuleFileNameA(NULL, curFile, MAX_PATH);
-    if (!runNormal && !IsRunningAsAdmin() && LaunchAsAdmin(curFile, "runas")) {
+    // 代理模式由服务管理，不应再次请求管理员权限提升
+    // 否则会导致：1) 原进程正常退出(exitCode=0)不被视为崩溃 2) 被提升的进程脱离服务监控
+    BOOL isAgentMode = IsAgentMode();
+    if (runNormal != 1 && !isAgentMode && !IsRunningAsAdmin() && LaunchAsAdmin(curFile, "runas")) {
         Mprintf("[InitInstance] 程序没有管理员权限，用户选择以管理员身份重新运行。\n");
         return FALSE;
     }
 
     // 首先处理服务命令行参数
-    if (!runNormal && HandleServiceCommandLine()) {
+    if (runNormal != 1 && HandleServiceCommandLine()) {
         Mprintf("[InitInstance] 服务命令已处理，退出。\n");
         return FALSE;  // 服务命令已处理，退出
     }
 
-    std::string masterHash(GetMasterHash());
-    std::string mu = GetPwdHash()==masterHash ? "MASTER.EXE" : "YAMA.EXE";
-#ifndef _DEBUG
-    {
-        m_Mutex = CreateMutex(NULL, FALSE, mu.c_str());
-        if (ERROR_ALREADY_EXISTS == GetLastError()) {
-            SAFE_CLOSE_HANDLE(m_Mutex);
-            m_Mutex = NULL;
-            MessageBoxL("一个主控程序已经在运行，请检查任务管理器。",
-                       "提示", MB_ICONINFORMATION);
-            Mprintf("[InitInstance] 一个主控程序已经在运行，退出。");
-            return FALSE;
-        }
-    }
-#endif
-
     Mprintf("[InitInstance] 主控程序启动运行。\n");
     SetUnhandledExceptionFilter(&whenbuged);
 
-    // 创建并显示启动画面
-    CSplashDlg* pSplash = new CSplashDlg();
-    pSplash->Create(NULL);
-    pSplash->UpdateProgressDirect(5, _T("正在初始化系统图标..."));
+    // 设置 AppUserModelID，避免 Windows 10/11 通知不能显示标题
+    // 动态加载以兼容 XP/Vista
+    typedef HRESULT(WINAPI* PFN_SetAppUserModelID)(PCWSTR);
+    HMODULE hShell32 = GetModuleHandleA("shell32.dll");
+    if (hShell32) {
+        PFN_SetAppUserModelID pfn = (PFN_SetAppUserModelID)GetProcAddress(hShell32, 
+            "SetCurrentProcessExplicitAppUserModelID");
+        if (pfn) pfn(L"YAMA");
+    }
 
-    SHFILEINFO	sfi = {};
-    HIMAGELIST hImageList = (HIMAGELIST)SHGetFileInfo((LPCTSTR)_T(""), 0, &sfi, sizeof(SHFILEINFO), SHGFI_LARGEICON | SHGFI_SYSICONINDEX);
-    m_pImageList_Large.Attach(hImageList);
-    hImageList = (HIMAGELIST)SHGetFileInfo((LPCTSTR)_T(""), 0, &sfi, sizeof(SHFILEINFO), SHGFI_SMALLICON | SHGFI_SYSICONINDEX);
-    m_pImageList_Small.Attach(hImageList);
+    // 设置线程区域为中文，确保 MBCS 程序在非中文系统上也能正确显示对话框中的中文
+    // 必须在创建任何对话框之前调用
+    SetChineseThreadLocale();
 
-    pSplash->UpdateProgressDirect(10, _T("正在初始化公共控件..."));
-
-    pSplash->UpdateProgressDirect(12, "正在加载语言包...");
+    // 加载语言包（必须在显示任何文本之前）
     auto lang = THIS_CFG.GetStr("settings", "Language", "en_US");
     auto langDir = THIS_CFG.GetStr("settings", "LangDir", "./lang");
     langDir = langDir.empty() ? "./lang" : langDir;
@@ -448,6 +534,20 @@ BOOL CMy2015RemoteApp::InitInstance()
         g_Lang.Load(lang.c_str());
         Mprintf("语言包目录已经指定[%s], 语言数量: %d\n", langDir.c_str(), g_Lang.GetLanguageCount());
     }
+
+    // 创建并显示启动画面
+    CSplashDlg* pSplash = new CSplashDlg();
+    pSplash->Create(NULL);
+    pSplash->UpdateProgressDirect(5, _TR("正在初始化系统图标..."));
+
+    SHFILEINFO	sfi = {};
+    HIMAGELIST hImageList = (HIMAGELIST)SHGetFileInfo((LPCTSTR)_T(""), 0, &sfi, sizeof(SHFILEINFO), SHGFI_LARGEICON | SHGFI_SYSICONINDEX);
+    m_pImageList_Large.Attach(hImageList);
+    hImageList = (HIMAGELIST)SHGetFileInfo((LPCTSTR)_T(""), 0, &sfi, sizeof(SHFILEINFO), SHGFI_SMALLICON | SHGFI_SYSICONINDEX);
+    m_pImageList_Small.Attach(hImageList);
+
+    pSplash->UpdateProgressDirect(10, _TR("正在初始化公共控件..."));
+
 
     // 如果一个运行在 Windows XP 上的应用程序清单指定要
     // 使用 ComCtl32.dll 版本 6 或更高版本来启用可视化方式，
@@ -470,16 +570,14 @@ BOOL CMy2015RemoteApp::InitInstance()
     // 标准初始化
     // 如果未使用这些功能并希望减小
     // 最终可执行文件的大小，则应移除下列
-    // 不需要的特定初始化例程
     // 更改用于存储设置的注册表项
-    // TODO: 应适当修改该字符串，
-    // 例如修改为公司或组织名
-    SetRegistryKey(_T("YAMA"));
+    // 可在 UIBranding.h 中修改 BRAND_REGISTRY_KEY
+    SetRegistryKey(_T(BRAND_REGISTRY_KEY));
 
     // 注册一个事件，用于进程间通信
-    // 请勿修改此事件名称，否则可能导致无法启动程序、鉴权失败等问题
+    // 警告：BRAND_EVENT_PREFIX 为系统保留，请勿修改！
     char eventName[64] = { 0 };
-    sprintf(eventName, "YAMA_%d", GetCurrentProcessId());
+    sprintf(eventName, BRAND_EVENT_PREFIX "_%d", GetCurrentProcessId());
     HANDLE hEvent = CreateEventA(NULL, TRUE, FALSE, eventName);
     if (hEvent == NULL) {
         Mprintf("[InitInstance] 创建事件失败，错误码: %d\n", GetLastError());
@@ -527,14 +625,23 @@ int CMy2015RemoteApp::ExitInstance()
 
     SAFE_DELETE(m_iniFile);
 
-    Mprintf("[InitInstance] 主控程序退出运行。\n");
-    Sleep(500);
+    Mprintf("[ExitInstance] 主控程序退出运行。\n");
 
-    // 只有在代理模式退出时才停止服务
+    // 代理模式正常退出时，需要通知服务停止监控
     if (IsAgentMode()) {
-        Mprintf("[InitInstance] 主控程序为代理模式，停止服务。\n");
-        ServerService_Stop();
+        // 先尝试通过 SCM API 停止服务（需要管理员权限）
+        int ret = ServerService_Stop();
+        if (ret == 0) {
+            Mprintf("[ExitInstance] 代理模式，已通过 SCM 停止服务。\n");
+        } else {
+            // SCM 方式失败（可能是用户权限不足），使用 ExitProcess 确保退出代码正确
+            // 注意：不用 return，因为 MFC 对话框模式下返回值可能被忽略
+            Mprintf("[ExitInstance] 代理模式，SCM 失败(%d)，使用 ExitProcess(%d)。\n", ret, EXIT_MANUAL_STOP);
+            Sleep(500);
+            ExitProcess(EXIT_MANUAL_STOP);
+        }
     }
 
+    Sleep(500);
     return CWinApp::ExitInstance();
 }

@@ -78,7 +78,7 @@ LPBYTE CSystemManager::GetProcessList()
 
             //打开进程并返回句柄
             hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                FALSE, pe32.th32ProcessID);   //打开目标进程
+                                   FALSE, pe32.th32ProcessID);   //打开目标进程
 
             if (hProcess != NULL) {
                 // 优先使用 QueryFullProcessImageName（不受32/64位限制）
@@ -87,15 +87,14 @@ LPBYTE CSystemManager::GetProcessList()
                     // 回退到原来的方法
                     EnumProcessModules(hProcess, &hModules, sizeof(hModules), &cbNeeded);
                     DWORD dwReturn = GetModuleFileNameExA(hProcess, hModules,
-                        szProcessFullPath,
-                        sizeof(szProcessFullPath));
+                                                          szProcessFullPath,
+                                                          sizeof(szProcessFullPath));
                     if (dwReturn == 0) {
                         strcpy(szProcessFullPath, pe32.szExeFile);  // 最后用进程名
                     }
                 }
                 CloseHandle(hProcess);  // 关闭进程句柄，防止泄漏
-            }
-            else {
+            } else {
                 // OpenProcess 失败，使用快照中的进程名
                 strcpy(szProcessFullPath, pe32.szExeFile);
             }
@@ -115,11 +114,19 @@ LPBYTE CSystemManager::GetProcessList()
             //开始计算占用的缓冲区， 我们关心他的发送的数据结构
             // 此进程占用数据大小
             dwLength = sizeof(DWORD) +
-                lstrlen(exeFile) + lstrlen(szProcessFullPath) + 2;
+                       lstrlen(exeFile) + lstrlen(szProcessFullPath) + 2;
             // 缓冲区太小，再重新分配下
-            if (LocalSize(szBuffer) < (dwOffset + dwLength))
-                szBuffer = (LPBYTE)LocalReAlloc(szBuffer, (dwOffset + dwLength),
-                    LMEM_ZEROINIT | LMEM_MOVEABLE);
+            if (LocalSize(szBuffer) < (dwOffset + dwLength)) {
+                LPBYTE newBuffer = (LPBYTE)LocalReAlloc(szBuffer, (dwOffset + dwLength),
+                                                LMEM_ZEROINIT | LMEM_MOVEABLE);
+                if (newBuffer == NULL) {
+                    // 内存分配失败，返回已有数据
+                    SAFE_CLOSE_HANDLE(hSnapshot);
+                    DebugPrivilege(SE_DEBUG_NAME, FALSE);
+                    return szBuffer;
+                }
+                szBuffer = newBuffer;
+            }
             //接下来三个memcpy就是向缓冲区里存放数据 数据结构是
             //进程ID+进程名+0+进程完整名+0  进程
             //因为字符数据是以0 结尾的
@@ -238,6 +245,13 @@ LPBYTE CSystemManager::GetWindowsList()
     EnumWindows((WNDENUMPROC)EnumWindowsProc, (LPARAM)&szBuffer);  //注册函数
     //如果API函数参数当中有函数指针存在
     //就是向系统注册一个 回调函数
+
+    // 检查是否有窗口被枚举到，避免空指针访问
+    if (szBuffer == NULL) {
+        szBuffer = (LPBYTE)LocalAlloc(LPTR, 1);
+        if (szBuffer == NULL)
+            return NULL;
+    }
     szBuffer[0] = TOKEN_WSLIST;
     return szBuffer;
 }
@@ -265,11 +279,9 @@ BOOL CALLBACK CSystemManager::EnumWindowsProc(HWND hWnd, LPARAM lParam)  //要�
     const char* szStatus = "normal";
     if (IsIconic(hWnd)) {
         szStatus = "minimized";
-    }
-    else if (IsZoomed(hWnd)) {
+    } else if (IsZoomed(hWnd)) {
         szStatus = "maximized";
-    }
-    else if (!IsWindowVisible(hWnd)) {
+    } else if (!IsWindowVisible(hWnd)) {
         szStatus = "hidden";
     }
 
@@ -293,12 +305,15 @@ BOOL CALLBACK CSystemManager::EnumWindowsProc(HWND hWnd, LPARAM lParam)  //要�
     dwLength = sizeof(DWORD) + lstrlen(szTitleWithAttrs) + 1;  // 使用新标题
     dwOffset = LocalSize(szBuffer);  //1
     //重新计算缓冲区大小
-    szBuffer = (LPBYTE)LocalReAlloc(szBuffer, dwOffset + dwLength, LMEM_ZEROINIT | LMEM_MOVEABLE);
-    if (szBuffer == NULL)
-        return FALSE;
+    LPBYTE newBuffer = (LPBYTE)LocalReAlloc(szBuffer, dwOffset + dwLength, LMEM_ZEROINIT | LMEM_MOVEABLE);
+    if (newBuffer == NULL) {
+        // 内存分配失败，保留已有数据，跳过此窗口继续枚举
+        return TRUE;
+    }
+    szBuffer = newBuffer;
     //下面两个memcpy就能看到数据结构为 hwnd+窗口标题+0
     memcpy((szBuffer + dwOffset), &hWnd, sizeof(DWORD));
     memcpy(szBuffer + dwOffset + sizeof(DWORD), szTitleWithAttrs, lstrlen(szTitleWithAttrs) + 1);  // 使用新标题
     *(LPBYTE*)lParam = szBuffer;
-    return true;
+    return TRUE;
 }

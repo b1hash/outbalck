@@ -47,8 +47,15 @@ BOOL CChat::OnInitDialog()
     __super::OnInitDialog();
 
     CString str;
-    str.FormatL(_T("远程交谈 - %s"), m_ContextObject->PeerName.c_str()),
-               SetWindowText(str);
+    str.FormatL(_T("远程交谈 - %s"), m_ContextObject->GetPeerName().c_str()),
+                SetWindowText(str);
+
+    // 设置控件文本（解决英语系统乱码问题）
+    SetDlgItemText(IDC_BUTTON_SEND, _TR("发送消息"));
+    SetDlgItemText(IDC_BUTTON_END, _TR("结束交谈"));
+    SetDlgItemText(IDC_LOCK, _TR("锁定屏幕\n屏蔽功能键"));
+    SetDlgItemText(IDC_UNLOCK, _TR("解除锁定"));
+
     m_editTip.SetWindowTextL("提示: 对方聊天对话框在发送消息后才会弹出");
     m_editNewMsg.SetLimitText(4079);
     // TODO: Add extra initialization here
@@ -72,7 +79,7 @@ void CChat::OnReceiveComplete()
     SYSTEMTIME st;
     GetLocalTime(&st);
     char Text[5120] = { 0 };
-    sprintf_s(Text, _T("%s %d/%d/%d %d:%02d:%02d\r\n  %s\r\n\r\n"), _T("对方:"),
+    sprintf_s(Text, _T("%s %d/%d/%d %d:%02d:%02d\r\n  %s\r\n\r\n"), _TRF("对方:"),
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, strResult);
     if (m_editChatLog.GetWindowTextLength() >= 20000)
         m_editChatLog.SetWindowText(_T(""));
@@ -93,7 +100,7 @@ void CChat::OnButtonSend()
     SYSTEMTIME st;
     GetLocalTime(&st);
     char Text[5120] = { 0 };
-    sprintf_s(Text, _T("%s %d/%d/%d %d:%02d:%02d\r\n  %s\r\n\r\n"), _T("自己:"),
+    sprintf_s(Text, _T("%s %d/%d/%d %d:%02d:%02d\r\n  %s\r\n\r\n"), _TRF("自己:"),
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, str);
     if (m_editChatLog.GetWindowTextLength() >= 20000)
         m_editChatLog.SetWindowText(_T(""));

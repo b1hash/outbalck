@@ -3,8 +3,23 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <locale.h>
 #include <afxwin.h>
 #include "common/IniParser.h"
+
+// 设置线程区域为简体中文
+// 这样 MBCS 程序在非中文系统上创建对话框时，也能正确解码 RC 资源中的 GBK 中文
+// 必须在任何对话框创建之前调用！
+inline void SetChineseThreadLocale()
+{
+    // 设置线程区域为简体中文 (LCID = 2052 = 0x0804)
+    // LANG_CHINESE (0x04) + SUBLANG_CHINESE_SIMPLIFIED (0x02) = 0x0804
+    LCID lcidChinese = MAKELCID(MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED), SORT_DEFAULT);
+    SetThreadLocale(lcidChinese);
+
+    // 同时设置 C 运行时库的区域（用于 mbstowcs 等函数）
+    setlocale(LC_ALL, ".936");  // GBK 代码页
+}
 
 // 语言管理类 - 支持多语言切换
 class CLangManager
@@ -249,8 +264,14 @@ public:
 
 // 翻译函数 - 用于 CString 变量或 LPCTSTR
 // 用法: _L(strVar) 或 _L(_T("中文"))
-inline CString _L(const CString& str) { return g_Lang.Get(str); }
-inline CString _L(LPCTSTR str) { return g_Lang.Get(CString(str)); }
+inline CString _L(const CString& str)
+{
+    return g_Lang.Get(str);
+}
+inline CString _L(LPCTSTR str)
+{
+    return g_Lang.Get(CString(str));
+}
 
 // 翻译宏 - 用于格式化函数中的变量 (返回 LPCTSTR)
 // 用法: _stprintf_s(buf, _LF(strVar), arg);
@@ -373,6 +394,30 @@ inline void TranslateDialog(CWnd* pWnd)
     }
 }
 
+// 使用 Unicode API 获取菜单字符串，然后转换为 GBK 用于翻译查找
+inline CString GetMenuStringAsGBK(HMENU hMenu, UINT uIDItem, UINT flags)
+{
+    // 获取菜单字符串长度
+    int len = ::GetMenuStringW(hMenu, uIDItem, NULL, 0, flags);
+    if (len <= 0) return CString();
+
+    CStringW wstr;
+    ::GetMenuStringW(hMenu, uIDItem, wstr.GetBufferSetLength(len + 1), len + 1, flags);
+    wstr.ReleaseBuffer();
+
+    if (wstr.IsEmpty()) return CString();
+
+    // 将 Unicode 转换为 GBK (代码页 936)
+    int mbLen = WideCharToMultiByte(936, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (mbLen <= 0) return CString();
+
+    CString result;
+    WideCharToMultiByte(936, 0, wstr, -1, result.GetBufferSetLength(mbLen), mbLen, NULL, NULL);
+    result.ReleaseBuffer();
+
+    return result;
+}
+
 // 翻译菜单
 inline void TranslateMenu(CMenu* pMenu)
 {
@@ -382,8 +427,8 @@ inline void TranslateMenu(CMenu* pMenu)
 
     UINT count = pMenu->GetMenuItemCount();
     for (UINT i = 0; i < count; i++) {
-        CString text;
-        pMenu->GetMenuString(i, text, MF_BYPOSITION);
+        // 使用 Unicode API 获取菜单文本，转换为 GBK 用于查找
+        CString text = GetMenuStringAsGBK(pMenu->GetSafeHmenu(), i, MF_BYPOSITION);
         if (!text.IsEmpty()) {
             CString newText = g_Lang.Get(text);
             if (newText != text) {
@@ -402,11 +447,11 @@ inline void TranslateMenu(CMenu* pMenu)
                 if (pSubMenu) {
                     // 弹出菜单使用 MF_POPUP
                     pMenu->ModifyMenu(i, MF_BYPOSITION | MF_POPUP | MF_STRING,
-                        (UINT_PTR)pSubMenu->GetSafeHmenu(), newText);
+                                      (UINT_PTR)pSubMenu->GetSafeHmenu(), newText);
                 } else {
                     // 普通菜单项
                     pMenu->ModifyMenu(i, MF_BYPOSITION | MF_STRING,
-                        pMenu->GetMenuItemID(i), newText);
+                                      pMenu->GetMenuItemID(i), newText);
                 }
             }
         }
@@ -448,17 +493,31 @@ inline void TranslateListHeader(CListCtrl* pList)
 
     int count = pHeader->GetItemCount();
     for (int i = 0; i < count; i++) {
-        HDITEM hdi;
-        TCHAR text[256] = { 0 };
-        hdi.mask = HDI_TEXT;
-        hdi.pszText = text;
-        hdi.cchTextMax = 256;
+        // 使用 Unicode API 获取表头文本
+        HDITEMW hdiW;
+        WCHAR wtext[256] = { 0 };
+        hdiW.mask = HDI_TEXT;
+        hdiW.pszText = wtext;
+        hdiW.cchTextMax = 256;
 
-        if (pHeader->GetItem(i, &hdi)) {
-            CString newText = g_Lang.Get(CString(text));
-            if (newText != text) {
-                hdi.pszText = (LPTSTR)(LPCTSTR)newText;
-                pHeader->SetItem(i, &hdi);
+        if (::SendMessageW(pHeader->GetSafeHwnd(), HDM_GETITEMW, i, (LPARAM)&hdiW)) {
+            // 将 Unicode 转换为 GBK 用于翻译查找
+            CString text;
+            int mbLen = WideCharToMultiByte(936, 0, wtext, -1, NULL, 0, NULL, NULL);
+            if (mbLen > 0) {
+                WideCharToMultiByte(936, 0, wtext, -1, text.GetBufferSetLength(mbLen), mbLen, NULL, NULL);
+                text.ReleaseBuffer();
+            }
+
+            if (!text.IsEmpty()) {
+                CString newText = g_Lang.Get(text);
+                if (newText != text) {
+                    // 设置翻译后的文本
+                    HDITEM hdi;
+                    hdi.mask = HDI_TEXT;
+                    hdi.pszText = (LPTSTR)(LPCTSTR)newText;
+                    pHeader->SetItem(i, &hdi);
+                }
             }
         }
     }
@@ -469,7 +528,7 @@ inline void TranslateListHeader(CListCtrl* pList)
 class CDialogLang : public CDialog
 {
 public:
-    CDialogLang(){}
+    CDialogLang() {}
 
     CDialogLang(UINT nIDTemplate, CWnd* pParent = NULL)
         : CDialog(nIDTemplate, pParent) {}
@@ -544,8 +603,8 @@ protected:
     // 语言代码到显示名称的映射
     static CString GetLanguageDisplayName(const CString& langCode)
     {
-        if (langCode == _T("zh_CN")) return _T("简体中文");
-        if (langCode == _T("zh_TW")) return _T("繁體中文");
+        if (langCode == _T("zh_CN")) return _T("Simplified Chinese");
+        if (langCode == _T("zh_TW")) return _T("Traditional Chinese");
         if (langCode == _T("en_US")) return _T("English");
         return langCode;
     }
@@ -571,19 +630,19 @@ protected:
 
         // 静态文本
         AddControl(0x0082, 15, 15, 40, 12, (WORD)-1,
-            SS_LEFT | WS_CHILD | WS_VISIBLE, _T("语言:"));
+                   SS_LEFT | WS_CHILD | WS_VISIBLE, _T("语言:"));
 
         // ComboBox
         AddControl(0x0085, 55, 13, 130, 150, 1001,
-            CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL, _T(""));
+                   CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL, _T(""));
 
         // 确定按钮
         AddControl(0x0080, 45, 50, 50, 14, IDOK,
-            BS_DEFPUSHBUTTON | WS_CHILD | WS_VISIBLE | WS_TABSTOP, _T("确定"));
+                   BS_DEFPUSHBUTTON | WS_CHILD | WS_VISIBLE | WS_TABSTOP, _T("确定"));
 
         // 取消按钮
         AddControl(0x0080, 105, 50, 50, 14, IDCANCEL,
-            BS_PUSHBUTTON | WS_CHILD | WS_VISIBLE | WS_TABSTOP, _T("取消"));
+                   BS_PUSHBUTTON | WS_CHILD | WS_VISIBLE | WS_TABSTOP, _T("取消"));
 
         return (LPCDLGTEMPLATE)m_templateBuffer.data();
     }
@@ -594,7 +653,10 @@ protected:
         m_templateBuffer.insert(m_templateBuffer.end(), p, p + size);
     }
 
-    void AppendWord(WORD w) { AppendData(&w, sizeof(WORD)); }
+    void AppendWord(WORD w)
+    {
+        AppendData(&w, sizeof(WORD));
+    }
 
     void AppendString(LPCTSTR str)
     {
@@ -615,12 +677,15 @@ protected:
     }
 
     void AddControl(WORD classAtom, short x, short y, short cx, short cy,
-        WORD id, DWORD style, LPCTSTR text)
+                    WORD id, DWORD style, LPCTSTR text)
     {
         AlignToDword();
         DLGITEMTEMPLATE item = { 0 };
         item.style = style;
-        item.x = x; item.y = y; item.cx = cx; item.cy = cy;
+        item.x = x;
+        item.y = y;
+        item.cx = cx;
+        item.cy = cy;
         item.id = id;
         AppendData(&item, sizeof(DLGITEMTEMPLATE));
         AppendWord(0xFFFF);

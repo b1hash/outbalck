@@ -11,6 +11,7 @@
     <ClCompile Include="BuildDlg.cpp" />
     <ClCompile Include="Chat.cpp" />
     <ClCompile Include="CPasswordDlg.cpp" />
+    <ClCompile Include="LicenseFile.cpp" />
     <ClCompile Include="CTextDlg.cpp" />
     <ClCompile Include="DecryptDlg.cpp" />
     <ClCompile Include="EditDialog.cpp" />
@@ -29,6 +30,7 @@
     <ClCompile Include="ServicesDlg.cpp" />
     <ClCompile Include="SettingDlg.cpp" />
     <ClCompile Include="ShellDlg.cpp" />
+    <ClCompile Include="TerminalDlg.cpp" />
     <ClCompile Include="SortListCtrl.cpp" />
     <ClCompile Include="stdafx.cpp" />
     <ClCompile Include="SystemDlg.cpp" />
@@ -61,12 +63,22 @@
     <ClCompile Include="ServerSessionMonitor.cpp" />
     <ClCompile Include="SplashDlg.cpp" />
     <ClCompile Include="ToolbarDlg.cpp" />
+    <ClCompile Include="SearchBarDlg.cpp" />
     <ClCompile Include="CDlgFileSend.cpp" />
     <ClCompile Include="..\..\common\file_upload.cpp" />
     <ClCompile Include="..\..\client\reg_startup.c" />
     <ClCompile Include="CClientListDlg.cpp" />
     <ClCompile Include="CUpdateDlg.cpp" />
     <ClCompile Include="CListCtrlEx.cpp" />
+    <ClCompile Include="CIconButton.cpp" />
+    <ClCompile Include="CLicenseDlg.cpp" />
+    <ClCompile Include="NotifyManager.cpp" />
+    <ClCompile Include="NotifySettingsDlg.cpp" />
+    <ClCompile Include="FrpsForSubDlg.cpp" />
+    <ClCompile Include="NetworkDlg.cpp" />
+    <ClCompile Include="IPHistoryDlg.cpp" />
+    <ClCompile Include="FeatureLimitsDlg.cpp" />
+    <ClCompile Include="WebService.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\client\Audio.h" />
@@ -82,6 +94,7 @@
     <ClInclude Include="BuildDlg.h" />
     <ClInclude Include="Chat.h" />
     <ClInclude Include="CPasswordDlg.h" />
+    <ClInclude Include="LicenseFile.h" />
     <ClInclude Include="CTextDlg.h" />
     <ClInclude Include="DateVerify.h" />
     <ClInclude Include="DecryptDlg.h" />
@@ -104,6 +117,7 @@
     <ClInclude Include="ServicesDlg.h" />
     <ClInclude Include="SettingDlg.h" />
     <ClInclude Include="ShellDlg.h" />
+    <ClInclude Include="TerminalDlg.h" />
     <ClInclude Include="SortListCtrl.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="SystemDlg.h" />
@@ -141,6 +155,7 @@
     <ClInclude Include="ServerSessionMonitor.h" />
     <ClInclude Include="SplashDlg.h" />
     <ClInclude Include="ToolbarDlg.h" />
+    <ClInclude Include="SearchBarDlg.h" />
     <ClInclude Include="CDlgFileSend.h" />
     <ClInclude Include="..\..\client\reg_startup.h" />
     <ClInclude Include="HostInfo.h" />
@@ -149,6 +164,23 @@
     <ClInclude Include="CUpdateDlg.h" />
     <ClInclude Include="CListCtrlEx.h" />
     <ClInclude Include="LangManager.h" />
+    <ClInclude Include="CIconButton.h" />
+    <ClInclude Include="CLicenseDlg.h" />
+    <ClInclude Include="NotifyConfig.h" />
+    <ClInclude Include="NotifyManager.h" />
+    <ClInclude Include="NotifySettingsDlg.h" />
+    <ClInclude Include="FrpsForSubDlg.h" />
+    <ClInclude Include="TerminalModuleLoader.h" />
+    <ClInclude Include="..\..\common\SafeString.h" />
+    <ClInclude Include="NetworkDlg.h" />
+    <ClInclude Include="IPHistoryDlg.h" />
+    <ClInclude Include="FeatureLimitsDlg.h" />
+    <ClInclude Include="FeatureFlags.h" />
+    <ClInclude Include="UIBranding.h" />
+    <ClInclude Include="WebService.h" />
+    <ClInclude Include="WebServiceAuth.h" />
+    <ClInclude Include="WebPage.h" />
+    <ClInclude Include="SimpleWebSocket.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="2015Remote.rc" />
@@ -194,6 +226,43 @@
     <Image Include="res\Bitmap\EditGroup.bmp" />
     <Image Include="res\Bitmap\Inject.bmp" />
     <Image Include="res\Bitmap\HostProxy.bmp" />
+    <Image Include="res\Bitmap\LoginNotify.bmp" />
+    <Image Include="res\ToolBar_Main_Res.bmp" />
+    <Image Include="res\ToolBar_Main.bmp" />
+    <Image Include="res\ToolBar_Enable.bmp" />
+    <Image Include="res\ToolBar_Disable.bmp" />
+    <Image Include="res\Bitmap\delete.bmp" />
+    <Image Include="res\Bitmap\update.bmp" />
+    <Image Include="res\Bitmap\Shutdown.bmp" />
+    <Image Include="res\Bitmap\Reboot.bmp" />
+    <Image Include="res\Bitmap\Logout.bmp" />
+    <Image Include="res\Bitmap\PortProxyStd.bmp" />
+    <Image Include="res\Bitmap\Show.bmp" />
+    <Image Include="res\Bitmap\Exit.bmp" />
+    <Image Include="res\Bitmap\Settings.bmp" />
+    <Image Include="res\Bitmap\Wallet.bmp" />
+    <Image Include="res\Bitmap\Network.bmp" />
+    <Image Include="res\Bitmap\InputPassword.bmp" />
+    <Image Include="res\Bitmap\ImportLicense.bmp" />
+    <Image Include="res\Bitmap\PEEdit.bmp" />
+    <Image Include="res\Bitmap\AuthGen.bmp" />
+    <Image Include="res\Bitmap\GenMaster.bmp" />
+    <Image Include="res\Bitmap\LicenseMgr.bmp" />
+    <Image Include="res\Bitmap\Keyboard.bmp" />
+    <Image Include="res\Bitmap\Notify.bmp" />
+    <Image Include="res\Bitmap\Log.bmp" />
+    <Image Include="res\Bitmap\History.bmp" />
+    <Image Include="res\Bitmap\Backup.bmp" />
+    <Image Include="res\Bitmap\Import.bmp" />
+    <Image Include="res\Bitmap\Language.bmp" />
+    <Image Include="res\Bitmap\Refresh.bmp" />
+    <Image Include="res\Bitmap\Plugin.bmp" />
+    <Image Include="res\Bitmap\FRP.bmp" />
+    <Image Include="res\Bitmap\Help.bmp" />
+    <Image Include="res\Bitmap\Feedback.bmp" />
+    <Image Include="res\Bitmap\Trial.bmp" />
+    <Image Include="res\Bitmap\RequestAuth.bmp" />
+    <Image Include="res\Bitmap\CancelShare.bmp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\Release\ghost.exe" />
@@ -234,6 +303,18 @@
     <None Include="stub2\stub64.bin" />
     <None Include="res\SCLoader_32.exe" />
     <None Include="res\SCLoader_64.exe" />
+    <None Include="..\..\linux\ghost" />
+    <None Include="res\Cur\4.cur" />
+    <None Include="res\Cur\2.cur" />
+    <None Include="res\Cur\3.cur" />
+    <None Include="res\Cur\1.cur" />
+    <None Include="res\Cur\arrow.cur" />
+    <None Include="res\3rd\upx.exe" />
+    <None Include="res\3rd\frpc.dll" />
+    <None Include="res\3rd\frps.dll" />
+    <None Include="res\3rd\rcedit.exe" />
+    <None Include="res\3rd\SCLoader_32.exe" />
+    <None Include="res\3rd\SCLoader_64.exe" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="..\..\ReadMe.md" />

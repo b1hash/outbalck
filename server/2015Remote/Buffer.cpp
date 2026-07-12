@@ -38,13 +38,12 @@ ULONG CBuffer::RemoveCompletedBuffer(ULONG ulLength)
 {
     EnterCriticalSection(&m_cs);
 
-    ULONG dataLen = m_Ptr - m_Base;
-    if (ulLength > m_ulMaxLength) { //请求长度比内存总长度还大
-        LeaveCriticalSection(&m_cs);
-        return 0;
-    }
-    if (ulLength > dataLen) { //请求长度比有效数据长度还大
-        ulLength = dataLen;
+    // 有效数据长度（考虑已读取偏移）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
+
+    if (ulLength > effectiveDataLen) { // 请求长度比有效数据长度还大
+        ulLength = effectiveDataLen;
     }
 
     if (ulLength) {
@@ -67,7 +66,9 @@ VOID CBuffer::CompactBuffer()
 {
     // 此函数应在持有锁的情况下调用
     if (m_ulReadOffset > 0 && m_Base) {
-        ULONG remainingData = (m_Ptr - m_Base) - m_ulReadOffset;
+        ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+        // 防止下溢：确保 remainingData 不为负
+        ULONG remainingData = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
         if (remainingData > 0) {
             MoveMemory(m_Base, m_Base + m_ulReadOffset, remainingData);
         }
@@ -83,8 +84,9 @@ ULONG CBuffer::ReadBuffer(PBYTE Buffer, ULONG ulLength)
 {
     EnterCriticalSection(&m_cs);
 
-    // 计算有效数据长度（考虑读取偏移）
-    ULONG effectiveDataLen = (m_Ptr - m_Base) - m_ulReadOffset;
+    // 计算有效数据长度（考虑读取偏移，防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
 
     if (ulLength > effectiveDataLen) {
         ulLength = effectiveDataLen;
@@ -196,8 +198,9 @@ ULONG CBuffer::GetBufferLength() // 返回有效数据长度
         LeaveCriticalSection(&m_cs);
         return 0;
     }
-    // 有效数据长度需要减去已读取的偏移量
-    ULONG len = (m_Ptr - m_Base) - m_ulReadOffset;
+    // 有效数据长度需要减去已读取的偏移量（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG len = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
     LeaveCriticalSection(&m_cs);
 
     return len;
@@ -209,6 +212,16 @@ std::string CBuffer::Skip(ULONG ulPos)
         return "";
 
     EnterCriticalSection(&m_cs);
+
+    // 计算有效数据长度（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
+
+    // 边界检查：确保不会越界读取
+    if (ulPos > effectiveDataLen) {
+        ulPos = effectiveDataLen;
+    }
+
     // 从当前读取位置开始跳过
     std::string ret((char*)(m_Base + m_ulReadOffset), (char*)(m_Base + m_ulReadOffset + ulPos));
 
@@ -228,8 +241,9 @@ std::string CBuffer::Skip(ULONG ulPos)
 LPBYTE CBuffer::GetBuffer(ULONG ulPos)
 {
     EnterCriticalSection(&m_cs);
-    // 计算有效数据长度
-    ULONG effectiveDataLen = (m_Ptr - m_Base) - m_ulReadOffset;
+    // 计算有效数据长度（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
     if (m_Base == NULL || ulPos >= effectiveDataLen) {
         LeaveCriticalSection(&m_cs);
         return NULL;
@@ -245,7 +259,9 @@ LPBYTE CBuffer::GetBuffer(ULONG ulPos)
 Buffer CBuffer::GetMyBuffer(ULONG ulPos)
 {
     EnterCriticalSection(&m_cs);
-    ULONG effectiveDataLen = (m_Ptr - m_Base) - m_ulReadOffset;
+    // 计算有效数据长度（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
     if (m_Base == NULL || ulPos >= effectiveDataLen) {
         LeaveCriticalSection(&m_cs);
         return Buffer();
@@ -260,7 +276,9 @@ Buffer CBuffer::GetMyBuffer(ULONG ulPos)
 BYTE CBuffer::GetBYTE(ULONG ulPos)
 {
     EnterCriticalSection(&m_cs);
-    ULONG effectiveDataLen = (m_Ptr - m_Base) - m_ulReadOffset;
+    // 计算有效数据长度（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
     if (m_Base == NULL || ulPos >= effectiveDataLen) {
         LeaveCriticalSection(&m_cs);
         return 0;
@@ -275,8 +293,10 @@ BYTE CBuffer::GetBYTE(ULONG ulPos)
 BOOL CBuffer::CopyBuffer(PVOID pDst, ULONG nLen, ULONG ulPos)
 {
     EnterCriticalSection(&m_cs);
-    ULONG effectiveDataLen = (m_Ptr - m_Base) - m_ulReadOffset;
-    if (m_Base == NULL || effectiveDataLen - ulPos < nLen) {
+    // 计算有效数据长度（防止下溢）
+    ULONG totalDataLen = (ULONG)(m_Ptr - m_Base);
+    ULONG effectiveDataLen = (totalDataLen > m_ulReadOffset) ? (totalDataLen - m_ulReadOffset) : 0;
+    if (m_Base == NULL || pDst == NULL || ulPos >= effectiveDataLen || (effectiveDataLen - ulPos) < nLen) {
         LeaveCriticalSection(&m_cs);
         return FALSE;
     }

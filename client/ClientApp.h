@@ -10,4 +10,5 @@ public:
     virtual bool Initialize() = 0;
     virtual bool Start() = 0;
     virtual bool Stop() = 0;
+    virtual bool IsMainInstance() = 0;
 };

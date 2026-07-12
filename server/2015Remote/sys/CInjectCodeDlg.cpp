@@ -41,6 +41,15 @@ END_MESSAGE_MAP()
 BOOL CInjectCodeDlg::OnInitDialog()
 {
     __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_INJECTINFO_PATH, _TR("文件路径: "));
+    SetDlgItemText(IDC_STATIC_INJECTINFO_METHOD, _TR("注入方式："));
+    SetDlgItemText(IDC_STATIC_INJECTINFO_DIR, _TR("落地目录："));
+
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("注入设置"));
+    SetDlgItemText(IDC_BUTTON_INJECT, _TR("注入"));
+
     int i = 0;
     m_combo_main.InsertStringL(i++, _T("CreateRemoteThread(落地反射注入)"));
     m_combo_main.InsertStringL(i++, _T("QueueUserAPC(落地反射注入)"));

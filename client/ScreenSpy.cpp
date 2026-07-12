@@ -20,19 +20,36 @@ CScreenSpy::CScreenSpy(ULONG ulbiBitCount, BYTE algo, BOOL vDesk, int gop, BOOL 
     m_BitmapInfor_Full = ConstructBitmapInfo(ulbiBitCount, m_ulFullWidth, m_ulFullHeight);
 
     iniFile cfg(CLIENT_PATH);
-    int strategy = HasSSE2() ? cfg.GetInt("settings", "ScreenStrategy", 0) : 1;
+    int strategy = cfg.GetInt("settings", "ScreenStrategy", 0);
+    int maxWidth = cfg.GetInt("settings", "ScreenWidth", 0);
     m_BitmapInfor_Send = new BITMAPINFO(*m_BitmapInfor_Full);
-    switch (strategy) {
-    case 1: // 1 - Original size
-        break;
-    default: // 0 - 1080p
-        if (m_bAlgorithm != ALGORITHM_H264) {
-            m_BitmapInfor_Send->bmiHeader.biWidth = min(1920, m_BitmapInfor_Send->bmiHeader.biWidth);
-            m_BitmapInfor_Send->bmiHeader.biHeight = min(1080, m_BitmapInfor_Send->bmiHeader.biHeight);
-            m_BitmapInfor_Send->bmiHeader.biSizeImage =
-                ((m_BitmapInfor_Send->bmiHeader.biWidth * m_BitmapInfor_Send->bmiHeader.biBitCount + 31) / 32) *
-                4 * m_BitmapInfor_Send->bmiHeader.biHeight;
-        }
+    m_nInstructionSet = cfg.GetInt("settings", "CpuSpeedup", 0);
+
+    Mprintf("CScreenSpy: strategy=%d, maxWidth=%d, fullWidth=%d, algo=%d\n",
+            strategy, maxWidth, m_BitmapInfor_Send->bmiHeader.biWidth, m_bAlgorithm);
+
+    if (strategy == 1) {
+        // strategy=1: 用户明确选择原始分辨率
+        Mprintf("CScreenSpy: 使用原始分辨率\n");
+    } else if (maxWidth > 0 && maxWidth < m_BitmapInfor_Send->bmiHeader.biWidth) {
+        // maxWidth>0: 自定义 maxWidth，等比缩放（自适应质量使用）
+        float ratio = (float)maxWidth / m_BitmapInfor_Send->bmiHeader.biWidth;
+        m_BitmapInfor_Send->bmiHeader.biWidth = maxWidth;
+        m_BitmapInfor_Send->bmiHeader.biHeight = (LONG)(m_BitmapInfor_Send->bmiHeader.biHeight * ratio);
+        m_BitmapInfor_Send->bmiHeader.biSizeImage =
+            ((m_BitmapInfor_Send->bmiHeader.biWidth * m_BitmapInfor_Send->bmiHeader.biBitCount + 31) / 32) *
+            4 * m_BitmapInfor_Send->bmiHeader.biHeight;
+        Mprintf("CScreenSpy: 自定义分辨率 %dx%d\n",
+                m_BitmapInfor_Send->bmiHeader.biWidth, m_BitmapInfor_Send->bmiHeader.biHeight);
+    } else {
+        // strategy=0 或 maxWidth=0: 默认 1080p 限制
+        m_BitmapInfor_Send->bmiHeader.biWidth = min(1920, m_BitmapInfor_Send->bmiHeader.biWidth);
+        m_BitmapInfor_Send->bmiHeader.biHeight = min(1080, m_BitmapInfor_Send->bmiHeader.biHeight);
+        m_BitmapInfor_Send->bmiHeader.biSizeImage =
+            ((m_BitmapInfor_Send->bmiHeader.biWidth * m_BitmapInfor_Send->bmiHeader.biBitCount + 31) / 32) *
+            4 * m_BitmapInfor_Send->bmiHeader.biHeight;
+        Mprintf("CScreenSpy: 1080p 限制 %dx%d\n",
+                m_BitmapInfor_Send->bmiHeader.biWidth, m_BitmapInfor_Send->bmiHeader.biHeight);
     }
 
     m_hDeskTopDC = GetDC(NULL);
@@ -111,6 +128,12 @@ LPBYTE CScreenSpy::GetFirstScreenData(ULONG* ulFirstScreenLength)
 VOID CScreenSpy::ScanScreen(HDC hdcDest, HDC hdcSour, ULONG ulWidth, ULONG ulHeight)
 {
     if (m_bVirtualPaint) {
+        // 先用深色填充背景，避免窗口移动时留下残影
+        RECT rcFill = { 0, 0, (LONG)ulWidth, (LONG)ulHeight };
+        HBRUSH hBrush = CreateSolidBrush(RGB(30, 30, 30));  // 深灰色背景
+        FillRect(hdcDest, &rcFill, hBrush);
+        DeleteObject(hBrush);
+
         int n = 0;
         if (n = EnumWindowsTopToDown(NULL, EnumHwndsPrint, (LPARAM)&m_data.SetScreenDC(hdcDest))) {
             Mprintf("EnumWindowsTopToDown failed: %d!!! GetLastError: %d\n", n, GetLastError());

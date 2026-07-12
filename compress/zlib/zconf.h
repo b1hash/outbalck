@@ -1,5 +1,5 @@
 /* zconf.h -- configuration of the zlib compression library
- * Copyright (C) 1995-2025 Jean-loup Gailly, Mark Adler
+ * Copyright (C) 1995-2026 Jean-loup Gailly, Mark Adler
  * For conditions of distribution and use, see copyright notice in zlib.h
  */
 
@@ -7,11 +7,6 @@
 
 #ifndef ZCONF_H
 #define ZCONF_H
-
-/* #undef Z_PREFIX */
-#define HAVE_STDARG_H 1
-/* #undef HAVE_UNISTD_H */
-ZCONF_H
 
 /*
  * If you *really* need a unique prefix for all types and library functions,
@@ -38,7 +33,10 @@ ZCONF_H
 #  ifndef Z_SOLO
 #    define compress              z_compress
 #    define compress2             z_compress2
+#    define compress_z            z_compress_z
+#    define compress2_z           z_compress2_z
 #    define compressBound         z_compressBound
+#    define compressBound_z       z_compressBound_z
 #  endif
 #  define crc32                 z_crc32
 #  define crc32_combine         z_crc32_combine
@@ -49,6 +47,7 @@ ZCONF_H
 #  define crc32_z               z_crc32_z
 #  define deflate               z_deflate
 #  define deflateBound          z_deflateBound
+#  define deflateBound_z        z_deflateBound_z
 #  define deflateCopy           z_deflateCopy
 #  define deflateEnd            z_deflateEnd
 #  define deflateGetDictionary  z_deflateGetDictionary
@@ -134,9 +133,12 @@ ZCONF_H
 #  define inflate_copyright     z_inflate_copyright
 #  define inflate_fast          z_inflate_fast
 #  define inflate_table         z_inflate_table
+#  define inflate_fixed         z_inflate_fixed
 #  ifndef Z_SOLO
 #    define uncompress            z_uncompress
 #    define uncompress2           z_uncompress2
+#    define uncompress_z          z_uncompress_z
+#    define uncompress2_z         z_uncompress2_z
 #  endif
 #  define zError                z_zError
 #  ifndef Z_SOLO

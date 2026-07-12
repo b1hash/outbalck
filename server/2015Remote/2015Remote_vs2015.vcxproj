@@ -113,6 +113,7 @@
       <OutputFile>$(SolutionDir)Bin\$(TargetName)_x86d$(TargetExt)</OutputFile>
       <ImageHasSafeExceptionHandlers>true</ImageHasSafeExceptionHandlers>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -145,6 +146,7 @@
       <IgnoreSpecificDefaultLibraries>LIBCMT.lib;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
       <OutputFile>$(SolutionDir)Bin\$(TargetName)_x64d$(TargetExt)</OutputFile>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -179,6 +181,7 @@
       <AdditionalDependencies>zlib\zlib.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions> /SAFESEH:NO /ignore:4099 %(AdditionalOptions)</AdditionalOptions>
       <OutputFile>$(SolutionDir)Bin\$(TargetName)_x86$(TargetExt)</OutputFile>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -211,9 +214,10 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>zlib\zlib_x64.lib</AdditionalDependencies>
+      <AdditionalDependencies>zlib\zlib_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions> /SAFESEH:NO /ignore:4099 %(AdditionalOptions)</AdditionalOptions>
       <OutputFile>$(SolutionDir)Bin\$(TargetName)_x64$(TargetExt)</OutputFile>
+      <AdditionalLibraryDirectories>$(SolutionDir)..\SimplePlugins\bin</AdditionalLibraryDirectories>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -226,6 +230,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <None Include="..\..\linux\ghost" />
     <None Include="..\..\Release\ghost.exe" />
     <None Include="..\..\Release\SCLoader.exe" />
     <None Include="..\..\Release\ServerDll.dll" />
@@ -240,6 +245,12 @@
     <None Include="res\2.cur" />
     <None Include="res\2015Remote.ico" />
     <None Include="res\3.cur" />
+    <None Include="res\3rd\frpc.dll" />
+    <None Include="res\3rd\frps.dll" />
+    <None Include="res\3rd\rcedit.exe" />
+    <None Include="res\3rd\SCLoader_32.exe" />
+    <None Include="res\3rd\SCLoader_64.exe" />
+    <None Include="res\3rd\upx.exe" />
     <None Include="res\4.cur" />
     <None Include="res\arrow.cur" />
     <None Include="res\audio.ico" />
@@ -250,6 +261,11 @@
     <None Include="res\Bitmap\ToolBar_Main.bmp" />
     <None Include="res\cmdshell.ico" />
     <None Include="res\cursor5.cur" />
+    <None Include="res\Cur\1.cur" />
+    <None Include="res\Cur\2.cur" />
+    <None Include="res\Cur\3.cur" />
+    <None Include="res\Cur\4.cur" />
+    <None Include="res\Cur\arrow.cur" />
     <None Include="res\Cur\Drag.cur" />
     <None Include="res\Cur\MutiDrag.cur" />
     <None Include="res\dword.ico" />
@@ -275,6 +291,7 @@
     <ClInclude Include="..\..\common\ikcp.h" />
     <ClInclude Include="..\..\common\iniFile.h" />
     <ClInclude Include="..\..\common\obfs.h" />
+    <ClInclude Include="..\..\common\SafeString.h" />
     <ClInclude Include="2015Remote.h" />
     <ClInclude Include="2015RemoteDlg.h" />
     <ClInclude Include="adapter.h" />
@@ -287,9 +304,12 @@
     <ClInclude Include="CDrawingBoard.h" />
     <ClInclude Include="CGridDialog.h" />
     <ClInclude Include="Chat.h" />
+    <ClInclude Include="CLicenseDlg.h" />
     <ClInclude Include="CListCtrlEx.h" />
     <ClInclude Include="context.h" />
     <ClInclude Include="CPasswordDlg.h" />
+    <ClInclude Include="FeatureFlags.h" />
+    <ClInclude Include="LicenseFile.h" />
     <ClInclude Include="CRcEditDlg.h" />
     <ClInclude Include="CTextDlg.h" />
     <ClInclude Include="CUpdateDlg.h" />
@@ -308,8 +328,15 @@
     <ClInclude Include="IOCPKCPServer.h" />
     <ClInclude Include="IOCPServer.h" />
     <ClInclude Include="IOCPUDPServer.h" />
+    <ClInclude Include="IPHistoryDlg.h" />
     <ClInclude Include="KeyBoardDlg.h" />
     <ClInclude Include="LangManager.h" />
+    <ClInclude Include="NetworkDlg.h" />
+    <ClInclude Include="NotifyConfig.h" />
+    <ClInclude Include="NotifyManager.h" />
+    <ClInclude Include="NotifySettingsDlg.h" />
+    <ClInclude Include="FeatureLimitsDlg.h" />
+    <ClInclude Include="FrpsForSubDlg.h" />
     <ClInclude Include="proxy\HPSocket.h" />
     <ClInclude Include="proxy\HPTypeDef.h" />
     <ClInclude Include="proxy\ProxyConnectServer.h" />
@@ -319,10 +346,12 @@
     <ClInclude Include="RegisterDlg.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="ScreenSpyDlg.h" />
+    <ClInclude Include="SearchBarDlg.h" />
     <ClInclude Include="Server.h" />
     <ClInclude Include="ServicesDlg.h" />
     <ClInclude Include="SettingDlg.h" />
     <ClInclude Include="ShellDlg.h" />
+    <ClInclude Include="TerminalDlg.h" />
     <ClInclude Include="SortListCtrl.h" />
     <ClInclude Include="SplashDlg.h" />
     <ClInclude Include="stdafx.h" />
@@ -335,14 +364,22 @@
     <ClInclude Include="targetver.h" />
     <ClInclude Include="ToolbarDlg.h" />
     <ClInclude Include="TrueColorToolBar.h" />
+    <ClInclude Include="UIBranding.h" />
     <ClInclude Include="VideoDlg.h" />
     <ClInclude Include="zconf.h" />
     <ClInclude Include="zlib.h" />
     <ClInclude Include="ServerServiceWrapper.h" />
     <ClInclude Include="ServerSessionMonitor.h" />
+    <ClInclude Include="CIconButton.h" />
+    <ClInclude Include="TerminalModuleLoader.h" />
+    <ClInclude Include="WebService.h" />
+    <ClInclude Include="WebServiceAuth.h" />
+    <ClInclude Include="WebPage.h" />
+    <ClInclude Include="SimpleWebSocket.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\client\Audio.cpp" />
+    <ClCompile Include="WebService.cpp" />
     <ClCompile Include="..\..\client\MemoryModule.c">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
@@ -384,8 +421,10 @@
     <ClCompile Include="CDrawingBoard.cpp" />
     <ClCompile Include="CGridDialog.cpp" />
     <ClCompile Include="Chat.cpp" />
+    <ClCompile Include="CLicenseDlg.cpp" />
     <ClCompile Include="CListCtrlEx.cpp" />
     <ClCompile Include="CPasswordDlg.cpp" />
+    <ClCompile Include="LicenseFile.cpp" />
     <ClCompile Include="CRcEditDlg.cpp" />
     <ClCompile Include="CTextDlg.cpp" />
     <ClCompile Include="CUpdateDlg.cpp" />
@@ -402,7 +441,13 @@
     <ClCompile Include="IOCPKCPServer.cpp" />
     <ClCompile Include="IOCPServer.cpp" />
     <ClCompile Include="IOCPUDPServer.cpp" />
+    <ClCompile Include="IPHistoryDlg.cpp" />
     <ClCompile Include="KeyBoardDlg.cpp" />
+    <ClCompile Include="NetworkDlg.cpp" />
+    <ClCompile Include="NotifyManager.cpp" />
+    <ClCompile Include="NotifySettingsDlg.cpp" />
+    <ClCompile Include="FeatureLimitsDlg.cpp" />
+    <ClCompile Include="FrpsForSubDlg.cpp" />
     <ClCompile Include="Loader.c">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
@@ -420,9 +465,11 @@
     </ClCompile>
     <ClCompile Include="RegisterDlg.cpp" />
     <ClCompile Include="ScreenSpyDlg.cpp" />
+    <ClCompile Include="SearchBarDlg.cpp" />
     <ClCompile Include="ServicesDlg.cpp" />
     <ClCompile Include="SettingDlg.cpp" />
     <ClCompile Include="ShellDlg.cpp" />
+    <ClCompile Include="TerminalDlg.cpp" />
     <ClCompile Include="SortListCtrl.cpp" />
     <ClCompile Include="SplashDlg.cpp" />
     <ClCompile Include="stdafx.cpp">
@@ -442,6 +489,7 @@
     <ClCompile Include="VideoDlg.cpp" />
     <ClCompile Include="ServerServiceWrapper.cpp" />
     <ClCompile Include="ServerSessionMonitor.cpp" />
+    <ClCompile Include="CIconButton.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="2015Remote.rc" />
@@ -453,20 +501,53 @@
     <Image Include="res\Bitmap\AddWatch.bmp" />
     <Image Include="res\Bitmap\AdminRun.bmp" />
     <Image Include="res\Bitmap\AssignTo.bmp" />
+    <Image Include="res\Bitmap\AuthGen.bmp" />
     <Image Include="res\Bitmap\authorize.bmp" />
+    <Image Include="res\Bitmap\Backup.bmp" />
+    <Image Include="res\Bitmap\CancelShare.bmp" />
+    <Image Include="res\Bitmap\delete.bmp" />
     <Image Include="res\Bitmap\DxgiDesktop.bmp" />
     <Image Include="res\Bitmap\EditGroup.bmp" />
+    <Image Include="res\Bitmap\Exit.bmp" />
+    <Image Include="res\Bitmap\Feedback.bmp" />
+    <Image Include="res\Bitmap\FRP.bmp" />
+    <Image Include="res\Bitmap\GenMaster.bmp" />
     <Image Include="res\Bitmap\GrayDesktop.bmp" />
+    <Image Include="res\Bitmap\Help.bmp" />
+    <Image Include="res\Bitmap\History.bmp" />
     <Image Include="res\Bitmap\HostProxy.bmp" />
+    <Image Include="res\Bitmap\Import.bmp" />
+    <Image Include="res\Bitmap\ImportLicense.bmp" />
     <Image Include="res\Bitmap\Inject.bmp" />
+    <Image Include="res\Bitmap\InputPassword.bmp" />
+    <Image Include="res\Bitmap\Keyboard.bmp" />
+    <Image Include="res\Bitmap\Language.bmp" />
+    <Image Include="res\Bitmap\LicenseMgr.bmp" />
+    <Image Include="res\Bitmap\Log.bmp" />
+    <Image Include="res\Bitmap\LoginNotify.bmp" />
+    <Image Include="res\Bitmap\Logout.bmp" />
+    <Image Include="res\Bitmap\Network.bmp" />
     <Image Include="res\Bitmap\note.bmp" />
+    <Image Include="res\Bitmap\Notify.bmp" />
+    <Image Include="res\Bitmap\PEEdit.bmp" />
+    <Image Include="res\Bitmap\Plugin.bmp" />
+    <Image Include="res\Bitmap\PortProxyStd.bmp" />
     <Image Include="res\Bitmap\PrivateScreen.bmp" />
     <Image Include="res\Bitmap\proxy.bmp" />
+    <Image Include="res\Bitmap\Reboot.bmp" />
+    <Image Include="res\Bitmap\Refresh.bmp" />
     <Image Include="res\Bitmap\remove.bmp" />
+    <Image Include="res\Bitmap\RequestAuth.bmp" />
+    <Image Include="res\Bitmap\Settings.bmp" />
     <Image Include="res\Bitmap\Share.bmp" />
+    <Image Include="res\Bitmap\Show.bmp" />
+    <Image Include="res\Bitmap\Shutdown.bmp" />
     <Image Include="res\Bitmap\SpeedDesktop.bmp" />
+    <Image Include="res\Bitmap\Trial.bmp" />
     <Image Include="res\Bitmap\unauthorize.bmp" />
+    <Image Include="res\Bitmap\update.bmp" />
     <Image Include="res\Bitmap\VirtualDesktop.bmp" />
+    <Image Include="res\Bitmap\Wallet.bmp" />
     <Image Include="res\Bitmap_4.bmp" />
     <Image Include="res\Bitmap_5.bmp" />
     <Image Include="res\chat.ico" />
@@ -488,6 +569,10 @@
     <Image Include="res\system.ico" />
     <Image Include="res\toolbar1.bmp" />
     <Image Include="res\toolbar2.bmp" />
+    <Image Include="res\ToolBar_Disable.bmp" />
+    <Image Include="res\ToolBar_Enable.bmp" />
+    <Image Include="res\ToolBar_Main.bmp" />
+    <Image Include="res\ToolBar_Main_Res.bmp" />
     <Image Include="res\update.bmp" />
     <Image Include="res\webcam.ico" />
   </ItemGroup>

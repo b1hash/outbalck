@@ -2,6 +2,8 @@
 #include "SplashDlg.h"
 #include "resource.h"
 #include "2015Remote.h"
+#include "LangManager.h"
+#include "UIBranding.h"
 
 BEGIN_MESSAGE_MAP(CSplashDlg, CWnd)
     ON_WM_PAINT()
@@ -12,7 +14,7 @@ END_MESSAGE_MAP()
 
 CSplashDlg::CSplashDlg()
     : m_nProgress(0)
-    , m_strStatus(_T("正在初始化..."))
+    , m_strStatus(_TR("正在初始化..."))
     , m_hIcon(NULL)
 {
 }
@@ -198,7 +200,7 @@ void CSplashDlg::OnPaint()
     memDC.SetBkMode(TRANSPARENT);
     memDC.SetTextColor(RGB(255, 255, 255));
     CFont* pOldFont = memDC.SelectObject(&m_fontTitle);
-    memDC.TextOut(95, 35, _T("YAMA"));
+    memDC.TextOut(95, 35, BRAND_SPLASH_NAME_W);
     memDC.SelectObject(pOldFont);
 
     // 绘制副标题

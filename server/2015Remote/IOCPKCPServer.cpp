@@ -215,20 +215,27 @@ void IOCPKCPServer::Disconnect(CONTEXT_OBJECT* ctx)
 {
     if (!ctx) return;
 
-    std::string key = ctx->PeerName;
+    std::string key = ctx->GetPeerName();
+    bool found = false;
+
+    // Step 1: Remove from m_clients while holding lock
     {
         std::lock_guard<std::mutex> lock(m_contextsMutex);
         auto it = m_clients.find(key);
-        if (it != m_clients.end()) {
-            if (it->second == ctx) {
-                if (m_offline) m_offline(ctx);
-                if (ctx->kcp) {
-                    ikcp_release(ctx->kcp);
-                    ctx->kcp = nullptr;
-                }
-                delete ctx;
-                m_clients.erase(it);
-            }
+        if (it != m_clients.end() && it->second == ctx) {
+            m_clients.erase(it);
+            found = true;
         }
+    }
+
+    // Step 2: Call offline callback WITHOUT holding m_contextsMutex
+    // This prevents deadlock with UI thread holding m_cs and calling Send2Client
+    if (found) {
+        if (m_offline) m_offline(ctx);
+        if (ctx->kcp) {
+            ikcp_release(ctx->kcp);
+            ctx->kcp = nullptr;
+        }
+        delete ctx;
     }
 }

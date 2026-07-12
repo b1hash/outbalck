@@ -15,6 +15,7 @@ CRcEditDlg::CRcEditDlg(CWnd* pParent /*=nullptr*/)
     : CDialogLangEx(IDD_DIALOG_RCEDIT, pParent)
     , m_sExePath(_T(""))
     , m_sIcoPath(_T(""))
+    , m_sProcessDesc(_T(""))
 {
 
 }
@@ -32,6 +33,9 @@ void CRcEditDlg::DoDataExchange(CDataExchange* pDX)
     DDV_MaxChars(pDX, m_sExePath, 256);
     DDX_Text(pDX, IDC_EDIT_ICO_FILE, m_sIcoPath);
     DDV_MaxChars(pDX, m_sIcoPath, 256);
+    DDX_Control(pDX, IDC_EDIT_PROCESS_DESC, m_EditProcessDesc);
+    DDX_Text(pDX, IDC_EDIT_PROCESS_DESC, m_sProcessDesc);
+    DDV_MaxChars(pDX, m_sProcessDesc, 135);
 }
 
 
@@ -47,8 +51,16 @@ END_MESSAGE_MAP()
 BOOL CRcEditDlg::OnInitDialog()
 {
     __super::OnInitDialog();
+    // 多语言翻译 - Static控件
+    SetDlgItemText(IDC_STATIC_RCEDIT_TIP, _TR("提示: 替换完成后，请刷新程序进行查看；如若未成功，请更换图标重试。"));
+    SetDlgItemText(IDC_STATIC_RCEDIT_DESC, _TR("进程描述:"));
 
-    // TODO:  在此添加额外的初始化
+    // 设置对话框标题和控件文本（解决英语系统乱码问题）
+    SetWindowText(_TR("PE 编辑"));
+    SetDlgItemText(IDC_BTN_SELECT_EXE, _TR("目标程序"));
+    SetDlgItemText(IDC_BTN_SELECT_ICO, _TR("图标文件"));
+    SetDlgItemText(IDOK, _TR("确定"));
+    SetDlgItemText(IDCANCEL, _TR("取消"));
 
     return TRUE;  // return TRUE unless you set the focus to a control
     // 异常: OCX 属性页应返回 FALSE
@@ -61,8 +73,9 @@ void CRcEditDlg::OnOK()
         MessageBoxL("请选择目标应用程序!", "提示", MB_ICONINFORMATION);
         return;
     }
-    if (m_sIcoPath.IsEmpty()) {
-        MessageBoxL("请选择[*.ico]图标文件!", "提示", MB_ICONINFORMATION);
+    m_EditProcessDesc.GetWindowTextA(m_sProcessDesc);
+    if (m_sIcoPath.IsEmpty() && m_sProcessDesc.IsEmpty()) {
+        MessageBoxL("请选择[*.ico]图标文件或输入进程描述!", "提示", MB_ICONINFORMATION);
         return;
     }
     std::string ReleaseEXE(int resID, const char* name);
@@ -70,16 +83,21 @@ void CRcEditDlg::OnOK()
 
     std::string rcedit = ReleaseEXE(IDR_BIN_RCEDIT, "rcedit.exe");
     if (rcedit.empty()) {
-        MessageBoxL("解压程序失败，无法替换图标!", "提示", MB_ICONINFORMATION);
+        MessageBoxL("解压程序失败，无法操作PE!", "提示", MB_ICONINFORMATION);
         return;
     }
     std::string exe = m_sExePath.GetString();
     std::string icon = m_sIcoPath.GetString();
-    std::string cmdLine = "\"" + rcedit + "\" " + "\"" + exe + "\" --set-icon \"" + icon + "\"";
+    std::string desc = m_sProcessDesc.GetString();
+    std::string cmdLine = "\"" + rcedit + "\" \"" + exe + "\"";
+    if (!icon.empty())
+        cmdLine += " --set-icon \"" + icon + "\"";
+    if (!desc.empty())
+        cmdLine += " --set-version-string \"FileDescription\" \"" + desc + "\"";
     int result = run_cmd(cmdLine);
     if (result) {
-        MessageBoxL(CString("替换图标失败，错误代码: ") + std::to_string(result).c_str(),
-                   "提示", MB_ICONINFORMATION);
+        MessageBoxL(_TR("PE 操作失败，错误代码: ") + std::to_string(result).c_str(),
+                    "提示", MB_ICONINFORMATION);
         return;
     }
 

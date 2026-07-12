@@ -6,44 +6,78 @@
 #include "ScreenSpyDlg.h"
 #include "afxdialogex.h"
 #include <imm.h>
+#pragma comment(lib, "imm32.lib")
 #include <WinUser.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 #include "CGridDialog.h"
 #include "2015RemoteDlg.h"
+#include "CPasswordDlg.h"
+#include "CDlgFileSend.h"
 #include <file_upload.h>
 #include <md5.h>
+#include <cstdint>  // for uint16_t
+#include <vector>
+#include "WebService.h"
 
+// 文件接收消息数据结构
+struct FileV2MsgData {
+    std::vector<BYTE> data;  // 原始数据
+    uint64_t transferID;
+    FileV2MsgData(const BYTE* buf, size_t len, uint64_t tid)
+        : data(buf, buf + len), transferID(tid) {}
+};
 
 // CScreenSpyDlg 对话框
 
-enum {
-    IDM_CONTROL = 0x1010,
-    IDM_FULLSCREEN,
-    IDM_SEND_CTRL_ALT_DEL,
-    IDM_TRACE_CURSOR,	// 跟踪显示远程鼠标
-    IDM_BLOCK_INPUT,	// 锁定远程计算机输入
-    IDM_SAVEDIB,		// 保存图片
-    IDM_GET_CLIPBOARD,	// 获取剪贴板
-    IDM_SET_CLIPBOARD,	// 设置剪贴板
-    IDM_ADAPTIVE_SIZE,
-    IDM_SAVEAVI,
-    IDM_SAVEAVI_H264,
-    IDM_SWITCHSCREEN,
-    IDM_MULTITHREAD_COMPRESS,
-    IDM_FPS_10,
-    IDM_FPS_15,
-    IDM_FPS_20,
-    IDM_FPS_25,
-    IDM_FPS_30,
-    IDM_FPS_UNLIMITED,
-    IDM_ORIGINAL_SIZE,
-    IDM_SCREEN_1080P,
-    IDM_REMOTE_CURSOR,
-};
+// IDM_* enum 已移至 ScreenSpyDlg.h
 
 IMPLEMENT_DYNAMIC(CScreenSpyDlg, CDialog)
 
+// 算法标识 (与客户端 CursorInfo.h 保持一致)
+#define ALGORITHM_GRAY 0
 #define ALGORITHM_DIFF 1
+#define ALGORITHM_H264 2
+#define ALGORITHM_HOME 3
+#define ALGORITHM_RGB565 3
+
 #define TIMER_ID 132
+
+// 静态成员变量定义
+int CScreenSpyDlg::s_nFastStretch = -1;  // -1 表示未初始化
+
+bool CScreenSpyDlg::GetFastStretchMode()
+{
+    if (s_nFastStretch < 0) {
+        s_nFastStretch = THIS_CFG.GetInt("settings", "FastStretch", 0);
+    }
+    return s_nFastStretch != 0;
+}
+
+void CScreenSpyDlg::SetFastStretchMode(bool bFast)
+{
+    s_nFastStretch = bFast ? 1 : 0;
+    THIS_CFG.SetInt("settings", "FastStretch", s_nFastStretch);
+}
+
+// RGB565 → BGRA32 转换函数
+// 输入: RGB565 像素数据 (每像素 2 字节)
+// 输出: BGRA 像素数据 (每像素 4 字节)
+// RGB565 格式: RRRRRGGG GGGBBBBB (R:5位, G:6位, B:5位)
+inline void ConvertRGB565ToBGRA(const uint16_t* src, BYTE* dst, ULONG pixelCount)
+{
+    for (ULONG i = 0; i < pixelCount; i++, src++, dst += 4) {
+        uint16_t c = *src;
+        // 位复制填充低位，还原更精确
+        BYTE r5 = (c >> 11) & 0x1F;
+        BYTE g6 = (c >> 5) & 0x3F;
+        BYTE b5 = c & 0x1F;
+        dst[2] = (r5 << 3) | (r5 >> 2);  // R: 5→8位
+        dst[1] = (g6 << 2) | (g6 >> 4);  // G: 6→8位
+        dst[0] = (b5 << 3) | (b5 >> 2);  // B: 5→8位
+        dst[3] = 0xFF;                    // A: 不透明
+    }
+}
 
 #ifdef _WIN64
 #ifdef _DEBUG
@@ -76,6 +110,9 @@ extern "C" char* __imp_strtok(char* str, const char* delim)
 CScreenSpyDlg::CScreenSpyDlg(CMy2015RemoteDlg* Parent, Server* IOCPServer, CONTEXT_OBJECT* ContextObject)
     : DialogBase(CScreenSpyDlg::IDD, Parent, IOCPServer, ContextObject, 0)
 {
+    m_bUsingFRP = THIS_CFG.GetInt("frp", "UseFrp", 0);
+    if (m_bUsingFRP != 0 && m_bUsingFRP != 1)
+        m_bUsingFRP = 1;
     m_pParent = Parent;
     m_hFullDC = NULL;
     m_hFullMemDC = NULL;
@@ -98,7 +135,7 @@ CScreenSpyDlg::CScreenSpyDlg(CMy2015RemoteDlg* Parent, Server* IOCPServer, CONTE
         }
     }
     m_FrameID = 0;
-    ImmDisableIME(0);// 禁用输入法
+    // 不在构造函数中禁用 IME，改为在 OnInitDialog 中仅禁用此窗口的 IME
 
     CHAR szFullPath[MAX_PATH];
     GetSystemDirectory(szFullPath, MAX_PATH);
@@ -114,6 +151,33 @@ CScreenSpyDlg::CScreenSpyDlg(CMy2015RemoteDlg* Parent, Server* IOCPServer, CONTE
     m_ContextObject->InDeCompressedBuffer.CopyBuffer(m_BitmapInfor_Full, ulBitmapInforLength, 1);
     m_ContextObject->InDeCompressedBuffer.CopyBuffer(&m_Settings, sizeof(ScreenSettings), 57);
 
+    // 解析 clientID (在 BITMAPINFOHEADER 之后，偏移 41)
+    // 格式: [TOKEN_BITMAPINFO:1][BITMAPINFOHEADER:40][clientID:8][dlgID:8][ScreenSettings:...]
+    LPBYTE pClientID = m_ContextObject->InDeCompressedBuffer.GetBuffer(41);
+    if (pClientID) {
+        m_ClientID = *((uint64_t*)pClientID);
+        Mprintf("[ScreenSpyDlg] Parsed clientID in constructor: %llu\n", m_ClientID);
+    }
+
+    // 从客户端配置初始化自适应质量状态 (QualityLevel: -2=关闭, -1=自适应, 0-5=具体等级)
+    m_AdaptiveQuality.startTime = GetTickCount64();  // 记录启动时间
+    if (m_Settings.QualityLevel == QUALITY_DISABLED) {
+        m_AdaptiveQuality.enabled = false;
+        m_AdaptiveQuality.currentLevel = QUALITY_GOOD;  // 关闭模式时不使用等级
+    } else if (m_Settings.QualityLevel == QUALITY_ADAPTIVE) {
+        m_AdaptiveQuality.enabled = true;
+        m_AdaptiveQuality.currentLevel = QUALITY_GOOD;  // 自适应默认从 Good 开始
+    } else if (m_Settings.QualityLevel >= 0 && m_Settings.QualityLevel < QUALITY_COUNT) {
+        m_AdaptiveQuality.enabled = false;
+        m_AdaptiveQuality.currentLevel = m_Settings.QualityLevel;
+    }
+    // 初始化当前分辨率限制（关闭模式时为0，不限制）
+    if (m_Settings.QualityLevel != QUALITY_DISABLED) {
+        m_AdaptiveQuality.currentMaxWidth = GetQualityProfile(m_AdaptiveQuality.currentLevel).maxWidth;
+    } else {
+        m_AdaptiveQuality.currentMaxWidth = 0;
+    }
+
     m_bIsCtrl = FALSE;
     m_bIsTraceCursor = FALSE;
 }
@@ -124,6 +188,12 @@ VOID CScreenSpyDlg::SendNext(void)
     BYTE	bToken[32] = { COMMAND_NEXT };
     uint64_t dlg = (uint64_t)this;
     memcpy(bToken+1, &dlg, sizeof(uint64_t));
+    // 附加服务端能力标志
+    uint32_t capabilities = CAP_SCROLL_DETECT;  // 支持滚动检测优化
+    memcpy(bToken + 9, &capabilities, sizeof(uint32_t));
+    // 附加滚动检测间隔（0=禁用, 2=每2帧, ...）
+    int scrollInterval = m_Settings.ScrollDetectInterval;
+    memcpy(bToken + 9 + sizeof(uint32_t), &scrollInterval, sizeof(int));
     m_ContextObject->Send2Client(bToken, sizeof(bToken));
 }
 
@@ -151,7 +221,26 @@ CScreenSpyDlg::~CScreenSpyDlg()
     // AVFrame需要清除
     av_frame_unref(&m_AVFrame);
 
+    // 清理自定义光标
+    if (m_hCustomCursor) {
+        DestroyCursor(m_hCustomCursor);
+        m_hCustomCursor = NULL;
+    }
+
+    // 清理音频播放
+    StopAudioPlayback();
+
+    // 清理所有文件接收对话框
+    for (auto& pair : m_FileRecvDlgs) {
+        if (pair.second) {
+            pair.second->DestroyWindow();
+            delete pair.second;
+        }
+    }
+    m_FileRecvDlgs.clear();
+
     SAFE_DELETE(m_pToolbar);
+    SAFE_DELETE(m_pStatusInfoWnd);
 }
 
 void CScreenSpyDlg::DoDataExchange(CDataExchange* pDX)
@@ -159,6 +248,226 @@ void CScreenSpyDlg::DoDataExchange(CDataExchange* pDX)
     __super::DoDataExchange(pDX);
 }
 
+// ========== CStatusInfoWnd 实现 ==========
+
+BEGIN_MESSAGE_MAP(CStatusInfoWnd, CWnd)
+    ON_WM_PAINT()
+    ON_WM_ERASEBKGND()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_LBUTTONUP()
+    ON_WM_MOUSEMOVE()
+END_MESSAGE_MAP()
+
+BOOL CStatusInfoWnd::Create(CWnd* pParent)
+{
+    DWORD dwStyle = WS_POPUP;
+    DWORD dwExStyle = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+
+    // 注册窗口类
+    static LPCTSTR szClassName = _T("StatusInfoWnd");
+    static bool bRegistered = false;
+    if (!bRegistered) {
+        WNDCLASS wc = { 0 };
+        wc.lpfnWndProc = ::DefWindowProc;
+        wc.hInstance = AfxGetInstanceHandle();
+        wc.lpszClassName = szClassName;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        AfxRegisterClass(&wc);
+        bRegistered = true;
+    }
+
+    if (!CreateEx(dwExStyle, szClassName, _T(""), dwStyle,
+        CRect(0, 0, 170, 24), pParent, 0))
+        return FALSE;
+
+    SetLayeredWindowAttributes(0, 220, LWA_ALPHA);
+    LoadSettings();
+    return TRUE;
+}
+
+void CStatusInfoWnd::UpdateInfo(double fps, double kbps, const CString& quality)
+{
+    if (kbps >= 1024)
+        m_strInfo.Format(_T("%.0f FPS | %.1f MB/s | %s"), fps, kbps / 1024, quality.GetString());
+    else
+        m_strInfo.Format(_T("%.0f FPS | %.0f KB/s | %s"), fps, kbps, quality.GetString());
+
+    if (m_bVisible)
+        Invalidate(FALSE);
+}
+
+void CStatusInfoWnd::Show()
+{
+    m_bVisible = true;
+    ShowWindow(SW_SHOWNOACTIVATE);
+}
+
+void CStatusInfoWnd::Hide()
+{
+    m_bVisible = false;
+    ShowWindow(SW_HIDE);
+}
+
+void CStatusInfoWnd::SetOpacityLevel(int level)
+{
+    m_nOpacityLevel = level;
+    BYTE opacity;
+    switch (level) {
+    case 1: opacity = 191; break;  // 75%
+    case 2: opacity = 128; break;  // 50%
+    default: opacity = 220; break; // 默认略透明
+    }
+    SetLayeredWindowAttributes(0, opacity, LWA_ALPHA);
+}
+
+void CStatusInfoWnd::UpdatePosition(const RECT& rcMonitor)
+{
+    int width = 170, height = 24;
+    int monWidth = rcMonitor.right - rcMonitor.left;
+
+    int x, y;
+    if (m_bHasCustomPosition) {
+        x = rcMonitor.left + (int)(monWidth * m_dOffsetXRatio) - width / 2;
+        y = rcMonitor.top + m_nOffsetY;
+        x = max((int)rcMonitor.left, min(x, (int)rcMonitor.right - width));
+        y = max((int)rcMonitor.top, min(y, (int)rcMonitor.bottom - height));
+    } else {
+        x = rcMonitor.left + (monWidth - width) / 2;
+        y = rcMonitor.top + 50;
+    }
+    SetWindowPos(&wndTopMost, x, y, width, height, SWP_NOACTIVATE);
+}
+
+void CStatusInfoWnd::LoadSettings()
+{
+    m_bHasCustomPosition = THIS_CFG.GetInt("statusinfo", "HasCustomPos", 0) != 0;
+    if (m_bHasCustomPosition) {
+        m_dOffsetXRatio = THIS_CFG.GetDouble("statusinfo", "OffsetXRatio", 0.5);
+        m_nOffsetY = THIS_CFG.GetInt("statusinfo", "OffsetY", 50);
+    }
+}
+
+void CStatusInfoWnd::SaveSettings()
+{
+    THIS_CFG.SetInt("statusinfo", "HasCustomPos", m_bHasCustomPosition ? 1 : 0);
+    THIS_CFG.SetDouble("statusinfo", "OffsetXRatio", m_dOffsetXRatio);
+    THIS_CFG.SetInt("statusinfo", "OffsetY", m_nOffsetY);
+}
+
+// 检查父窗口是否处于控制模式
+bool CStatusInfoWnd::IsParentInControlMode()
+{
+    CScreenSpyDlg* pParent = (CScreenSpyDlg*)GetParent();
+    return pParent && pParent->m_bIsCtrl;
+}
+
+void CStatusInfoWnd::OnLButtonDown(UINT nFlags, CPoint point)
+{
+    // 控制模式下不处理拖拽，让消息传递到父窗口
+    if (IsParentInControlMode()) {
+        // 转换为屏幕坐标后发送给父窗口
+        CPoint ptScreen = point;
+        ClientToScreen(&ptScreen);
+        CWnd* pParent = GetParent();
+        if (pParent) {
+            pParent->ScreenToClient(&ptScreen);
+            pParent->PostMessage(WM_LBUTTONDOWN, nFlags, MAKELPARAM(ptScreen.x, ptScreen.y));
+        }
+        return;
+    }
+
+    m_bDragging = true;
+    m_ptDragStart = point;
+    SetCapture();
+}
+
+void CStatusInfoWnd::OnLButtonUp(UINT nFlags, CPoint point)
+{
+    if (IsParentInControlMode()) {
+        CPoint ptScreen = point;
+        ClientToScreen(&ptScreen);
+        CWnd* pParent = GetParent();
+        if (pParent) {
+            pParent->ScreenToClient(&ptScreen);
+            pParent->PostMessage(WM_LBUTTONUP, nFlags, MAKELPARAM(ptScreen.x, ptScreen.y));
+        }
+        return;
+    }
+
+    if (m_bDragging) {
+        m_bDragging = false;
+        ReleaseCapture();
+
+        CWnd* pParent = GetParent();
+        if (pParent) {
+            HMONITOR hMon = MonitorFromWindow(pParent->GetSafeHwnd(), MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = { sizeof(mi) };
+            if (GetMonitorInfo(hMon, &mi)) {
+                CRect rcWnd;
+                GetWindowRect(&rcWnd);
+
+                int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+                int wndCenterX = rcWnd.left + rcWnd.Width() / 2;
+
+                m_dOffsetXRatio = (double)(wndCenterX - mi.rcMonitor.left) / monWidth;
+                m_nOffsetY = rcWnd.top - mi.rcMonitor.top;
+                m_bHasCustomPosition = true;
+                SaveSettings();
+            }
+        }
+    }
+}
+
+void CStatusInfoWnd::OnMouseMove(UINT nFlags, CPoint point)
+{
+    if (IsParentInControlMode()) {
+        CPoint ptScreen = point;
+        ClientToScreen(&ptScreen);
+        CWnd* pParent = GetParent();
+        if (pParent) {
+            pParent->ScreenToClient(&ptScreen);
+            pParent->PostMessage(WM_MOUSEMOVE, nFlags, MAKELPARAM(ptScreen.x, ptScreen.y));
+        }
+        return;
+    }
+
+    if (m_bDragging) {
+        CRect rcWnd;
+        GetWindowRect(&rcWnd);
+
+        int dx = point.x - m_ptDragStart.x;
+        int dy = point.y - m_ptDragStart.y;
+
+        SetWindowPos(&wndTopMost, rcWnd.left + dx, rcWnd.top + dy,
+            0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void CStatusInfoWnd::OnPaint()
+{
+    CPaintDC dc(this);
+    CRect rc;
+    GetClientRect(&rc);
+
+    // 背景
+    dc.FillSolidRect(rc, RGB(40, 40, 40));
+
+    // 文字
+    dc.SetBkMode(TRANSPARENT);
+    dc.SetTextColor(RGB(220, 220, 220));
+    CFont font;
+    font.CreatePointFont(90, _T("Segoe UI"));
+    CFont* pOldFont = dc.SelectObject(&font);
+    dc.DrawText(m_strInfo, rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    dc.SelectObject(pOldFont);
+}
+
+BOOL CStatusInfoWnd::OnEraseBkgnd(CDC* pDC)
+{
+    return TRUE;
+}
+
+// ========== CScreenSpyDlg 实现 ==========
 
 BEGIN_MESSAGE_MAP(CScreenSpyDlg, CDialog)
     ON_WM_CLOSE()
@@ -178,7 +487,12 @@ BEGIN_MESSAGE_MAP(CScreenSpyDlg, CDialog)
     ON_WM_ACTIVATE()
     ON_WM_TIMER()
     ON_COMMAND(ID_EXIT_FULLSCREEN, &CScreenSpyDlg::OnExitFullscreen)
+    ON_COMMAND(ID_SHOW_STATUS_INFO, &CScreenSpyDlg::OnShowStatusInfo)
+    ON_COMMAND(ID_HIDE_STATUS_INFO, &CScreenSpyDlg::OnHideStatusInfo)
     ON_MESSAGE(WM_DISCONNECT, &CScreenSpyDlg::OnDisconnect)
+    ON_MESSAGE(MM_WOM_DONE, &CScreenSpyDlg::OnWaveOutDone)
+    ON_MESSAGE(WM_RECVFILEV2_CHUNK, &CScreenSpyDlg::OnRecvFileV2Chunk)
+    ON_MESSAGE(WM_RECVFILEV2_COMPLETE, &CScreenSpyDlg::OnRecvFileV2Complete)
     ON_WM_DROPFILES()
 END_MESSAGE_MAP()
 
@@ -214,15 +528,19 @@ void CScreenSpyDlg::PrepareDrawing(const LPBITMAPINFO bmp)
     Mprintf("%s [对话框ID: %llu]\n", strString.GetString(), dlg);
 
     m_hFullDC = ::GetDC(m_hWnd);
-    SetStretchBltMode(m_hFullDC, HALFTONE);
-    SetBrushOrgEx(m_hFullDC, 0, 0, NULL);
+    SetStretchBltMode(m_hFullDC, GetFastStretchMode() ? COLORONCOLOR : HALFTONE);
+    if (!GetFastStretchMode()) SetBrushOrgEx(m_hFullDC, 0, 0, NULL);
     m_hFullMemDC = CreateCompatibleDC(m_hFullDC);
     m_BitmapHandle = CreateDIBSection(m_hFullDC, bmp, DIB_RGB_COLORS, &m_BitmapData_Full, NULL, NULL);
 
     SelectObject(m_hFullMemDC, m_BitmapHandle);
 
-    SetScrollRange(SB_HORZ, 0, bmp->bmiHeader.biWidth);
-    SetScrollRange(SB_VERT, 0, bmp->bmiHeader.biHeight);
+    // 仅在滚动条已可见时更新范围（不会闪现，只是刷新范围值）
+    // 全屏或自适应模式下不调用，避免隐式添加 WS_HSCROLL/WS_VSCROLL 导致闪现
+    if (!m_Settings.FullScreen && !m_bAdaptiveSize) {
+        SetScrollRange(SB_HORZ, 0, bmp->bmiHeader.biWidth);
+        SetScrollRange(SB_VERT, 0, bmp->bmiHeader.biHeight);
+    }
 
     GetClientRect(&m_CRect);
     m_wZoom = ((double)bmp->bmiHeader.biWidth) / ((double)(m_CRect.Width()));
@@ -233,6 +551,14 @@ BOOL CScreenSpyDlg::OnInitDialog()
 {
     __super::OnInitDialog();
     SetIcon(m_hIcon,FALSE);
+
+    // 获取默认 IME 上下文（ImmAssociateContext 返回之前关联的上下文）
+    // 先禁用再恢复，以获取原始上下文句柄
+    m_hOldIMC = ImmAssociateContext(m_hWnd, NULL);
+    if (m_hOldIMC) {
+        ImmAssociateContext(m_hWnd, m_hOldIMC);  // 立即恢复
+    }
+
     DragAcceptFiles(TRUE);
     ChangeWindowMessageFilter(WM_DROPFILES, MSGFLT_ADD);
     ChangeWindowMessageFilter(0x0049, MSGFLT_ADD);
@@ -248,6 +574,11 @@ BOOL CScreenSpyDlg::OnInitDialog()
         SysMenu->AppendMenuL(MF_STRING, IDM_ADAPTIVE_SIZE, "自适应窗口大小(&A)");
         SysMenu->AppendMenuL(MF_STRING, IDM_TRACE_CURSOR, "跟踪被控端鼠标(&T)");
         SysMenu->AppendMenuL(MF_STRING, IDM_BLOCK_INPUT, "锁定被控端鼠标和键盘(&L)");
+        SysMenu->AppendMenuL(MF_STRING, IDM_RESTORE_CONSOLE, "RDP会话归位(&R)");
+        // 只在虚拟桌面模式下显示重置选项
+        if (m_Settings.ScreenType == USING_VIRTUAL) {
+            SysMenu->AppendMenuL(MF_STRING, IDM_RESET_VIRTUAL_DESKTOP, "重置虚拟桌面(&V)");
+        }
         SysMenu->AppendMenuSeparator(MF_SEPARATOR);
         SysMenu->AppendMenuL(MF_STRING, IDM_SAVEDIB, "保存快照(&S)");
         SysMenu->AppendMenuL(MF_STRING, IDM_SAVEAVI, _T("录像(MJPEG)"));
@@ -259,10 +590,16 @@ BOOL CScreenSpyDlg::OnInitDialog()
         SysMenu->AppendMenuL(MF_STRING, IDM_MULTITHREAD_COMPRESS, "多线程压缩(&2)");
         SysMenu->AppendMenuL(MF_STRING, IDM_ORIGINAL_SIZE, "原始分辨率(&3)");
         SysMenu->AppendMenuL(MF_STRING, IDM_SCREEN_1080P, "限制为1080P(&4)");
+        SysMenu->AppendMenuL(MF_STRING, IDM_ENABLE_SSE2, "启用SSE2指令集(&5)");
+        SysMenu->AppendMenuL(MF_STRING, IDM_FAST_STRETCH, "服务端快速缩放(降低CPU)(&6)");
+        SysMenu->AppendMenuL(MF_STRING, IDM_CUSTOM_CURSOR, "使用自定义光标(&7)");
         SysMenu->AppendMenuSeparator(MF_SEPARATOR);
 
         SysMenu->CheckMenuItem(IDM_FULLSCREEN, m_Settings.FullScreen ? MF_CHECKED : MF_UNCHECKED);
         SysMenu->CheckMenuItem(IDM_REMOTE_CURSOR, m_Settings.RemoteCursor ? MF_CHECKED : MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_ENABLE_SSE2, m_Settings.CpuSpeedup == 1 ? MF_CHECKED : MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_FAST_STRETCH, GetFastStretchMode() ? MF_CHECKED : MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_CUSTOM_CURSOR, m_bUseCustomCursor ? MF_CHECKED : MF_UNCHECKED);
 
         CMenu fpsMenu;
         if (fpsMenu.CreatePopupMenu()) {
@@ -275,25 +612,71 @@ BOOL CScreenSpyDlg::OnInitDialog()
             SysMenu->AppendMenuL(MF_STRING | MF_POPUP, (UINT_PTR)fpsMenu.Detach(), _T("帧率设置"));
         }
 
-        BOOL all = THIS_CFG.GetInt("settings", "MultiScreen");
+        // 滚动检测间隔菜单
+        // 滚动检测菜单（用户友好描述）
+        CMenu scrollMenu;
+        if (scrollMenu.CreatePopupMenu()) {
+            scrollMenu.AppendMenuL(MF_STRING, IDM_SCROLL_DETECT_OFF, "关闭(局域网)");
+            scrollMenu.AppendMenuL(MF_STRING, IDM_SCROLL_DETECT_2, "跨网推荐(最省流量)");
+            scrollMenu.AppendMenuL(MF_STRING, IDM_SCROLL_DETECT_4, "标准模式");
+            scrollMenu.AppendMenuL(MF_STRING, IDM_SCROLL_DETECT_8, "低频模式(省CPU)");
+            SysMenu->AppendMenuL(MF_STRING | MF_POPUP, (UINT_PTR)scrollMenu.Detach(), _T("滚动优化"));
+        }
+
+        // 屏幕质量子菜单
+        CMenu qualityMenu;
+        if (qualityMenu.CreatePopupMenu()) {
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_OFF, "关闭(&O)");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_ADAPTIVE_QUALITY, "自适应(&A)");
+            qualityMenu.AppendMenuSeparator(MF_SEPARATOR);
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_ULTRA, "Ultra (25FPS, DIFF - 企业级/高速局域网)");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_HIGH, "High (20FPS, RGB565 - 家庭级/标准局域网)");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_GOOD, "Good (20FPS, H264) - 跨网/默认办公标配");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_MEDIUM, "Medium (15FPS, H264) - 跨国/跨境远控");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_LOW, "Low (12FPS, H264) - 洲际/弱网远控");
+            qualityMenu.AppendMenuL(MF_STRING, IDM_QUALITY_MINIMAL, "Minimal (8FPS, H264) - 极差/极低带宽");
+            SysMenu->AppendMenuL(MF_STRING | MF_POPUP, (UINT_PTR)qualityMenu.Detach(), _T("屏幕质量(&Q)"));
+        }
+        // 音频菜单项
+        SysMenu->AppendMenuL(MF_STRING, IDM_AUDIO_TOGGLE, "系统音频(&U)");
+        SysMenu->CheckMenuItem(IDM_AUDIO_TOGGLE, m_Settings.AudioEnabled ? MF_CHECKED : MF_UNCHECKED);
+
+        // 初始化勾选状态
+        UpdateQualityMenuCheck(SysMenu);
+
+        BOOL all = THIS_CFG.GetInt("settings", "MultiScreen", TRUE);
         SysMenu->EnableMenuItem(IDM_SWITCHSCREEN, all ? MF_ENABLED : MF_GRAYED);
         SysMenu->CheckMenuItem(IDM_MULTITHREAD_COMPRESS, m_Settings.CompressThread ? MF_CHECKED : MF_UNCHECKED);
         if (m_Settings.ScreenStrategy == 0) {
             SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_CHECKED);
             SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_UNCHECKED);
-        }
-        else if (m_Settings.ScreenStrategy == 1) {
+        } else if (m_Settings.ScreenStrategy == 1) {
             SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_UNCHECKED);
             SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_CHECKED);
         }
-		int fpsIndex = IDM_FPS_10 + (m_Settings.MaxFPS - 10)/5;
+        int fpsIndex = IDM_FPS_10 + (m_Settings.MaxFPS - 10)/5;
         for (int i = IDM_FPS_10; i <= IDM_FPS_UNLIMITED; i++) {
             SysMenu->CheckMenuItem(i, MF_UNCHECKED);
-		}
-		SysMenu->CheckMenuItem(fpsIndex, MF_CHECKED);
+        }
+        SysMenu->CheckMenuItem(fpsIndex, MF_CHECKED);
+
+        // 设置滚动检测间隔选中状态
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_OFF, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_2, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_4, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_8, MF_UNCHECKED);
+        int scrollInterval = m_Settings.ScrollDetectInterval;
+        int scrollMenuID = scrollInterval <= 0 ? IDM_SCROLL_DETECT_OFF :
+                           scrollInterval <= 2 ? IDM_SCROLL_DETECT_2 :
+                           scrollInterval <= 4 ? IDM_SCROLL_DETECT_4 : IDM_SCROLL_DETECT_8;
+        SysMenu->CheckMenuItem(scrollMenuID, MF_CHECKED);
     }
 
-    m_bIsCtrl = THIS_CFG.GetInt("settings", "DXGI") == USING_VIRTUAL;
+    m_bIsCtrl = m_Settings.ScreenType == USING_VIRTUAL;
+    // 根据初始控制状态设置 IME
+    if (m_bIsCtrl) {
+        ImmAssociateContext(m_hWnd, NULL);  // 控制模式：禁用 IME
+    }
     m_bIsTraceCursor = FALSE;  //不是跟踪
     m_ClientCursorPos.x = 0;
     m_ClientCursorPos.y = 0;
@@ -307,13 +690,21 @@ BOOL CScreenSpyDlg::OnInitDialog()
     SetClassLongPtr(m_hWnd, GCLP_HCURSOR, m_bIsCtrl ? (LONG_PTR)m_hRemoteCursor : (LONG_PTR)LoadCursor(NULL, IDC_NO));
     ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);
 
-    // 设置合理的"正常"窗口大小（屏幕的 80%），否则还原时窗口极小
-    int cxScreen = GetSystemMetrics(SM_CXSCREEN);
-    int cyScreen = GetSystemMetrics(SM_CYSCREEN);
-    int normalWidth = cxScreen * 0.382;
-    int normalHeight = cyScreen * 0.382;
-    int normalX = (cxScreen - normalWidth) / 2;
-    int normalY = (cyScreen - normalHeight) / 2;
+    // 设置合理的"正常"窗口大小，显示在主程序所在的显示器上
+    RECT rcMon = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    CWnd* pMain = AfxGetMainWnd();
+    if (pMain) {
+        HMONITOR hMon = MonitorFromWindow(pMain->GetSafeHwnd(), MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfo(hMon, &mi))
+            rcMon = mi.rcWork;
+    }
+    int monW = rcMon.right - rcMon.left;
+    int monH = rcMon.bottom - rcMon.top;
+    int normalWidth = (int)(monW * 0.382);
+    int normalHeight = (int)(monH * 0.382);
+    int normalX = rcMon.left + (monW - normalWidth) / 2;
+    int normalY = rcMon.top + (monH - normalHeight) / 2;
 
     // 使用 WINDOWPLACEMENT 确保 rcNormalPosition 被正确设置
     WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
@@ -328,7 +719,44 @@ BOOL CScreenSpyDlg::OnInitDialog()
     // 同时初始化 m_struOldWndpl，供全屏退出时使用
     m_struOldWndpl = wp;
     m_Settings.FullScreen ? EnterFullScreen() : LeaveFullScreen();
+
+    // 启动传输速率更新定时器 (1秒)
+    SetTimer(4, 1000, NULL);
+
+    // 下发质量配置表（让客户端可以持久化保存）
+    {
+        BYTE profileCmd[1 + sizeof(QualityProfile) * QUALITY_COUNT];
+        profileCmd[0] = CMD_QUALITY_PROFILES;
+        for (int i = 0; i < QUALITY_COUNT; i++) {
+            memcpy(profileCmd + 1 + i * sizeof(QualityProfile),
+                   &GetQualityProfile(i), sizeof(QualityProfile));
+        }
+        m_ContextObject->Send2Client(profileCmd, sizeof(profileCmd));
+    }
+
+    // 发送初始质量配置给客户端
+    if (m_Settings.QualityLevel == QUALITY_DISABLED) {
+        // 关闭模式：不发送任何质量命令，保持客户端原有设置
+    } else {
+        // 自适应或固定等级模式：发送质量等级和分辨率
+        BYTE cmd[4] = { CMD_QUALITY_LEVEL, (BYTE)m_AdaptiveQuality.currentLevel, 0 };
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
+
+        // 始终发送 CMD_SCREEN_SIZE，让客户端同步分辨率策略
+        // maxWidth=0 表示使用默认分辨率（1080p 限制）
+        BYTE sizeCmd[16] = { CMD_SCREEN_SIZE, 2 };  // strategy=2 表示自适应质量
+        memcpy(sizeCmd + 2, &m_AdaptiveQuality.currentMaxWidth, sizeof(int));
+        m_ContextObject->Send2Client(sizeCmd, 10);
+    }
+
     SendNext();
+
+    // 通知主窗口：设置为活动的远程桌面会话（用于 Ctrl+V 文件接收）
+    if (pMain)
+        ::PostMessage(pMain->GetSafeHwnd(), WM_SESSION_ACTIVATED, (WPARAM)this, 0);
+
+    // 注册屏幕上下文到 WebService（用于 Web 端鼠标/键盘控制）
+    WebService().RegisterScreenContext(m_ClientID, m_ContextObject);
 
     return TRUE;
 }
@@ -336,16 +764,25 @@ BOOL CScreenSpyDlg::OnInitDialog()
 
 VOID CScreenSpyDlg::OnClose()
 {
-	KillTimer(1);
-	KillTimer(2);
+    // 注销屏幕上下文（Web 端控制）
+    WebService().UnregisterScreenContext(m_ClientID);
+
+    m_bIsClosed = true;
+    m_bIsCtrl = FALSE;
+    CWnd* pMain = AfxGetMainWnd();
+    if (pMain)
+        ::PostMessage(pMain->GetSafeHwnd(), WM_SESSION_ACTIVATED, (WPARAM)nullptr, 0);
+    KillTimer(1);
+    KillTimer(2);
     KillTimer(3);
+    KillTimer(4);
     if (!m_aviFile.IsEmpty()) {
         KillTimer(TIMER_ID);
         m_aviFile = "";
         m_aviStream.Close();
     }
-    if (ShouldReconnect() && SayByeBye()) Sleep(500);
-    CancelIO();
+    bool needCancel = (ShouldReconnect() && SayByeBye());
+
     // 恢复鼠标状态
     SetClassLongPtr(m_hWnd, GCLP_HCURSOR, (LONG_PTR)LoadCursor(NULL, IDC_ARROW));
     // 通知父窗口
@@ -360,21 +797,92 @@ VOID CScreenSpyDlg::OnClose()
     if (IsProcessing()) {
         m_bHide = true;
         ShowWindow(SW_HIDE);
+        if (needCancel) { BeginWaitCursor(); Sleep(500); CancelIO(); EndWaitCursor(); }
         return;
     }
 
+    if (needCancel) { BeginWaitCursor(); Sleep(500); CancelIO(); EndWaitCursor(); }
     DialogBase::OnClose();
 }
 
 afx_msg LRESULT CScreenSpyDlg::OnDisconnect(WPARAM wParam, LPARAM lParam)
 {
     m_bConnected = FALSE;
-	m_nDisconnectTime = GetTickCount64();
-	// Close the dialog if reconnect not succeed in 15 seconds
+    m_nDisconnectTime = GetTickCount64();
+    // Close the dialog if reconnect not succeed in 15 seconds
     SetTimer(2, 15000, NULL);
     SetTimer(3, 3000, NULL);
     PostMessage(WM_PAINT);
     return S_OK;
+}
+
+// 处理文件块接收（主线程）
+LRESULT CScreenSpyDlg::OnRecvFileV2Chunk(WPARAM wParam, LPARAM lParam)
+{
+    FileV2MsgData* msgData = (FileV2MsgData*)wParam;
+    if (!msgData) return 0;
+
+    BYTE* szBuffer = msgData->data.data();
+    size_t len = msgData->data.size();
+    FileChunkPacketV2* pkt = (FileChunkPacketV2*)szBuffer;
+    uint64_t transferID = msgData->transferID;
+
+    // 创建或获取进度对话框（按 transferID 管理）
+    CDlgFileSend*& dlg = m_FileRecvDlgs[transferID];
+    if (dlg == nullptr) {
+        dlg = new CDlgFileSend(m_pParent, m_ContextObject->GetServer(), m_ContextObject, FALSE);
+        dlg->Create(IDD_DIALOG_FILESEND, GetDesktopWindow());
+        dlg->SetWindowTextA(_TR("接收文件"));
+        dlg->ShowWindow(SW_SHOW);
+        dlg->m_bKeepConnection = TRUE;  // 不断开连接
+    }
+
+    // 接收文件
+    std::string hash = GetPwdHash(), hmac = GetHMAC(100);
+    int n = RecvFileChunkV2((char*)szBuffer, len, nullptr, nullptr, hash, hmac, 0);
+    if (n) {
+        Mprintf("[ScreenSpy] RecvFileChunkV2 failed: %d\n", n);
+    }
+
+    // 更新进度
+    BYTE* name = szBuffer + sizeof(FileChunkPacketV2);
+    dlg->UpdateProgress(CString((char*)name, (int)pkt->nameLength), FileProgressInfo(pkt));
+
+    // 最后一个文件的最后一个包
+    if (pkt->fileIndex + 1 == pkt->totalFiles &&
+        pkt->offset + pkt->dataLength >= pkt->fileSize) {
+        // 等待 COMMAND_FILE_COMPLETE_V2 来最终确认
+        // dlg->FinishFileSend(TRUE);
+        // m_FileRecvDlgs.erase(transferID);
+    }
+
+    delete msgData;
+    return 0;
+}
+
+// 处理文件完成校验（主线程）
+LRESULT CScreenSpyDlg::OnRecvFileV2Complete(WPARAM wParam, LPARAM lParam)
+{
+    FileV2MsgData* msgData = (FileV2MsgData*)wParam;
+    if (!msgData) return 0;
+
+    BYTE* szBuffer = msgData->data.data();
+    size_t len = msgData->data.size();
+    uint64_t transferID = msgData->transferID;
+
+    // 本地校验
+    bool verifyOk = HandleFileCompleteV2((const char*)szBuffer, len, 0);
+    Mprintf("[ScreenSpy] 文件校验%s\n", verifyOk ? "通过" : "失败");
+
+    // 关闭进度对话框
+    auto it = m_FileRecvDlgs.find(transferID);
+    if (it != m_FileRecvDlgs.end()) {
+        it->second->FinishFileSend(verifyOk);
+        m_FileRecvDlgs.erase(it);
+    }
+
+    delete msgData;
+    return 0;
 }
 
 VOID CScreenSpyDlg::OnReceiveComplete()
@@ -384,6 +892,7 @@ VOID CScreenSpyDlg::OnReceiveComplete()
     auto cmd = m_ContextObject->InDeCompressedBuffer.GetBYTE(0);
     LPBYTE szBuffer = m_ContextObject->InDeCompressedBuffer.GetBuffer();
     unsigned len = m_ContextObject->InDeCompressedBuffer.GetBufferLen();
+    m_ulBytesThisSecond += len;  // 累计传输字节
     switch(cmd) {
     case COMMAND_GET_FOLDER: {
         std::string folder;
@@ -404,16 +913,26 @@ VOID CScreenSpyDlg::OnReceiveComplete()
     }
     case TOKEN_FIRSTSCREEN: {
         DrawFirstScreen();
+        m_ulFramesThisSecond++;
         break;
     }
     case TOKEN_NEXTSCREEN: {
         DrawNextScreenDiff(false);
+        m_ulFramesThisSecond++;
         break;
     }
     case TOKEN_KEYFRAME: {
         if (!m_bIsFirst) {
             DrawNextScreenDiff(true);
         }
+        m_ulFramesThisSecond++;
+        break;
+    }
+    case TOKEN_SCROLL_FRAME: {
+        if (!m_bIsFirst) {
+            DrawScrollFrame();
+        }
+        m_ulFramesThisSecond++;
         break;
     }
     case TOKEN_CLIPBOARD_TEXT: {
@@ -427,7 +946,258 @@ VOID CScreenSpyDlg::OnReceiveComplete()
         const ULONG	ulBitmapInforLength = sizeof(BITMAPINFOHEADER);
         m_BitmapInfor_Full = (BITMAPINFO*) new BYTE[ulBitmapInforLength];
         m_ContextObject->InDeCompressedBuffer.CopyBuffer(m_BitmapInfor_Full, ulBitmapInforLength, 1);
+        if (len >= 1 + sizeof(BITMAPINFOHEADER) + sizeof(uint64_t)) {
+            m_ClientID = *((uint64_t*)(m_ContextObject->InDeCompressedBuffer.GetBuffer(1 + sizeof(BITMAPINFOHEADER))));
+        }
         PrepareDrawing(m_BitmapInfor_Full);
+        // 分辨率切换完成，允许解码
+        m_bResolutionChanging = false;
+        // Notify web clients of resolution change
+        if (WebService().IsRunning()) {
+            int width = m_BitmapInfor_Full->bmiHeader.biWidth;
+            int height = abs(m_BitmapInfor_Full->bmiHeader.biHeight);
+            WebService().NotifyResolutionChange(m_ClientID, width, height);
+
+            // Hide window if this session was triggered by web client (and hiding is enabled)
+            if (WebService().IsWebTriggered(m_ClientID) && WebService().GetHideWebSessions()) {
+                m_bHide = true;
+                ShowWindow(SW_HIDE);
+                Mprintf("[ScreenSpyDlg] Web-triggered session, hiding window for device %llu\n", m_ClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_FILE_QUERY_RESUME: {
+        // V2 续传查询 - 根据 dstClientID 决定路由
+        FileQueryResumeV2* query = (FileQueryResumeV2*)szBuffer;
+
+        if (query->dstClientID == 0) {
+            // 目标是主控端 - 本地处理
+            auto response = HandleResumeQuery((const char*)szBuffer, len);
+            if (!response.empty()) {
+                m_ContextObject->Send2Client((LPBYTE)response.data(), (int)response.size());
+                Mprintf("[ScreenSpy] 已响应续传查询: %zu 字节\n", response.size());
+            }
+        } else {
+            // C2C - 转发到目标客户端的主连接
+            context* dstCtx = m_pParent->FindHost(query->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+                Mprintf("[ScreenSpy] 转发续传查询: -> %llu\n", query->dstClientID);
+            } else {
+                Mprintf("[ScreenSpy] 续传查询目标不在线: %llu\n", query->dstClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_C2C_TEXT: {
+        // C2C 文本剪贴板: [cmd:1][dstClientID:8][textLen:4][text:N]
+        if (len < 13) break;
+        uint64_t dstClientID;
+        uint32_t textLen;
+        memcpy(&dstClientID, szBuffer + 1, 8);
+        memcpy(&textLen, szBuffer + 9, 4);
+
+        Mprintf("[ScreenSpy] C2C 文本转发: -> %llu (%u 字节)\n", dstClientID, textLen);
+
+        // 转发到目标客户端的主连接
+        context* dstCtx = m_pParent->FindHost(dstClientID);
+        if (dstCtx) {
+            dstCtx->Send2Client(szBuffer, len);
+        } else {
+            Mprintf("[ScreenSpy] 文本目标不在线: %llu\n", dstClientID);
+        }
+        break;
+    }
+    case COMMAND_SEND_FILE_V2: {
+        // V2 文件传输
+        if (len < sizeof(FileChunkPacketV2)) break;
+        FileChunkPacketV2* pkt = (FileChunkPacketV2*)szBuffer;
+
+        if (pkt->dstClientID == 0) {
+            // 目标是服务端：本地接收
+            // 使用 PostMessage 将数据转发到主线程处理，避免在工作线程中操作 UI
+            FileV2MsgData* msgData = new FileV2MsgData(szBuffer, len, pkt->transferID);
+            PostMessage(WM_RECVFILEV2_CHUNK, (WPARAM)msgData, 0);
+        } else {
+            // C2C：转发到目标客户端
+            context* dstCtx = m_pParent->FindHost(pkt->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+            } else {
+                Mprintf("[ScreenSpy] C2C 目标不在线: %llu\n", pkt->dstClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_FILE_COMPLETE_V2: {
+        // V2 文件完成校验
+        if (len < sizeof(FileCompletePacketV2)) break;
+        FileCompletePacketV2* pkt = (FileCompletePacketV2*)szBuffer;
+
+        if (pkt->dstClientID == 0) {
+            // 目标是服务端：使用 PostMessage 转发到主线程处理
+            FileV2MsgData* msgData = new FileV2MsgData(szBuffer, len, pkt->transferID);
+            PostMessage(WM_RECVFILEV2_COMPLETE, (WPARAM)msgData, 0);
+        } else {
+            // C2C：转发到目标客户端
+            context* dstCtx = m_pParent->FindHost(pkt->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+                Mprintf("[ScreenSpy] 转发校验包: -> %llu, transferID=%llu\n",
+                    pkt->dstClientID, pkt->transferID);
+            } else {
+                Mprintf("[ScreenSpy] 校验包目标不在线: %llu\n", pkt->dstClientID);
+            }
+        }
+        break;
+    }
+    case COMMAND_FILE_RESUME: {
+        // V2 断点续传控制 - 转发
+        // 注意：有两种格式的包共用此命令:
+        // - FileResumePacketV2 (49 bytes): 单文件续传请求/响应
+        // - FileResumeResponseV2 (23 bytes): 批量续传查询响应
+        // 需要根据包大小区分
+
+        if (len >= sizeof(FileResumePacketV2)) {
+            // 大包: FileResumePacketV2
+            FileResumePacketV2* pkt = (FileResumePacketV2*)szBuffer;
+            context* dstCtx = m_pParent->FindHost(pkt->dstClientID);
+            if (dstCtx) {
+                dstCtx->Send2Client(szBuffer, len);
+                Mprintf("[ScreenSpy] 转发续传包: -> %llu, transferID=%llu\n",
+                    pkt->dstClientID, pkt->transferID);
+            }
+        } else if (len >= sizeof(FileResumeResponseV2)) {
+            // 小包: FileResumeResponseV2 (批量响应)
+            // 注意：响应要发回给 srcClientID（原始发送方）
+            FileResumeResponseV2* resp = (FileResumeResponseV2*)szBuffer;
+            context* srcCtx = m_pParent->FindHost(resp->srcClientID);
+            if (srcCtx) {
+                srcCtx->Send2Client(szBuffer, len);
+                Mprintf("[ScreenSpy] 转发续传响应: -> srcClient=%llu, %u 个文件\n",
+                    resp->srcClientID, resp->fileCount);
+            } else {
+                Mprintf("[ScreenSpy] 续传响应目标不在线: %llu\n", resp->srcClientID);
+            }
+        }
+        break;
+    }
+    case CMD_CURSOR_IMAGE: {
+        // 自定义光标图像: [cmd:1][hash:4][hotX:2][hotY:2][w:1][h:1][BGRA:w*h*4]
+        if (len < 11) break;
+        DWORD hash = *(DWORD*)(szBuffer + 1);
+        if (hash == m_dwCustomCursorHash && m_hCustomCursor) break;  // 相同光标且已创建，忽略
+
+        WORD hotX = *(WORD*)(szBuffer + 5);
+        WORD hotY = *(WORD*)(szBuffer + 7);
+        BYTE width = szBuffer[9];
+        BYTE height = szBuffer[10];
+
+        // 检查尺寸有效性
+        if (width == 0 || height == 0 || width > 64 || height > 64) break;
+
+        LPBYTE bgraData = szBuffer + 11;
+        DWORD dataSize = width * height * 4;
+
+        if (len < 11 + dataSize) break;  // 数据不完整
+
+        // 创建位图
+        HDC hScreenDC = ::GetDC(NULL);
+        if (!hScreenDC) break;
+
+        HDC hMemDC = ::CreateCompatibleDC(hScreenDC);
+        if (!hMemDC) {
+            ::ReleaseDC(NULL, hScreenDC);
+            break;
+        }
+
+        BITMAPINFO bmi = { 0 };
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height;  // 负数表示从上到下
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        void* pColorBits = NULL;
+        HBITMAP hColorBmp = CreateDIBSection(hScreenDC, &bmi, DIB_RGB_COLORS, &pColorBits, NULL, 0);
+        if (!hColorBmp || !pColorBits) {
+            ::DeleteDC(hMemDC);
+            ::ReleaseDC(NULL, hScreenDC);
+            break;
+        }
+        memcpy(pColorBits, bgraData, dataSize);
+
+        // 创建掩码位图（1bpp，行宽度 WORD 对齐）
+        int maskStride = ((width + 15) / 16) * 2;  // 每行字节数，16位对齐
+        int maskSize = maskStride * height;
+        BYTE* maskBits = new BYTE[maskSize];
+        memset(maskBits, 0, maskSize);
+
+        // 根据 Alpha 通道生成掩码（内存操作，比 SetPixel 快 100 倍）
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                BYTE alpha = bgraData[(y * width + x) * 4 + 3];
+                if (alpha < 128) {
+                    // 透明像素：掩码位=1
+                    maskBits[y * maskStride + x / 8] |= (0x80 >> (x % 8));
+                }
+            }
+        }
+
+        HBITMAP hMaskBmp = ::CreateBitmap(width, height, 1, 1, maskBits);
+        delete[] maskBits;
+
+        if (!hMaskBmp) {
+            ::DeleteObject(hColorBmp);
+            ::DeleteDC(hMemDC);
+            ::ReleaseDC(NULL, hScreenDC);
+            break;
+        }
+
+        // 创建光标
+        ICONINFO iconInfo = { 0 };
+        iconInfo.fIcon = FALSE;
+        iconInfo.xHotspot = hotX;
+        iconInfo.yHotspot = hotY;
+        iconInfo.hbmMask = hMaskBmp;
+        iconInfo.hbmColor = hColorBmp;
+
+        HCURSOR hNewCursor = CreateIconIndirect(&iconInfo);
+
+        // 清理位图（CreateIconIndirect 会复制）
+        ::DeleteObject(hColorBmp);
+        ::DeleteObject(hMaskBmp);
+        ::DeleteDC(hMemDC);
+        ::ReleaseDC(NULL, hScreenDC);
+
+        // 只有成功创建才更新
+        if (hNewCursor) {
+            if (m_hCustomCursor) {
+                DestroyCursor(m_hCustomCursor);
+            }
+            m_hCustomCursor = hNewCursor;
+            m_dwCustomCursorHash = hash;
+
+            // 如果当前正在使用自定义光标，立即更新显示
+            if (m_bCursorIndex == 254 && m_bIsCtrl && m_bUseCustomCursor) {
+                if (m_Settings.RemoteCursor) {
+                    // RemoteCursor 模式：触发重绘以显示新光标
+                    Invalidate(FALSE);
+                } else {
+                    // 窗口类光标模式：更新窗口类光标（避免引用已销毁的光标）
+                    SetClassLongPtr(m_hWnd, GCLP_HCURSOR, (LONG_PTR)m_hCustomCursor);
+                }
+            }
+        }
+        break;
+    }
+    case TOKEN_SCREEN_AUDIO: {
+        // 音频数据: [token:1][hasFormat:1][AudioFormat?][data...]
+        if (len > 2) {
+            OnAudioData(szBuffer + 1, len - 1);
+        }
         break;
     }
     default: {
@@ -439,6 +1209,7 @@ VOID CScreenSpyDlg::OnReceiveComplete()
 VOID CScreenSpyDlg::DrawFirstScreen(void)
 {
     m_bIsFirst = FALSE;
+    m_bQualitySwitch = false;
 
     //得到被控端发来的数据 ，将他拷贝到HBITMAP的缓冲区中，这样一个图像就出现了
 
@@ -484,7 +1255,15 @@ VOID CScreenSpyDlg::DrawNextScreenDiff(bool keyFrame)
     if (bOldCursorIndex != m_bCursorIndex) {
         bChange = TRUE;
         if (m_bIsCtrl && !m_bIsTraceCursor) {//替换指定窗口所属类的WNDCLASSEX结构
-            HCURSOR cursor = m_CursorInfo.getCursorHandle(m_bCursorIndex == (BYTE)-1 ? 1 : m_bCursorIndex);
+            HCURSOR cursor;
+            if (m_bCursorIndex == 254) {  // -2: 使用自定义光标
+                cursor = (m_bUseCustomCursor && m_hCustomCursor) ? m_hCustomCursor : LoadCursor(NULL, IDC_ARROW);
+            } else if (m_bCursorIndex == 255) {  // -1: 不支持，回退到箭头
+                cursor = LoadCursor(NULL, IDC_ARROW);
+            } else {
+                cursor = m_CursorInfo.getCursorHandle(m_bCursorIndex);
+                if (!cursor) cursor = LoadCursor(NULL, IDC_ARROW);
+            }
 #ifdef _WIN64
             SetClassLongPtrA(m_hWnd, GCLP_HCURSOR, (ULONG_PTR)cursor);
 #else
@@ -506,6 +1285,13 @@ VOID CScreenSpyDlg::DrawNextScreenDiff(bool keyFrame)
         case ALGORITHM_GRAY: {
             if (m_BitmapInfor_Full->bmiHeader.biSizeImage == NextScreenLength)
                 memcpy(dst, p, m_BitmapInfor_Full->bmiHeader.biSizeImage);
+            break;
+        }
+        case ALGORITHM_RGB565: {
+            // RGB565 关键帧：将 RGB565 整帧还原为 BGRA
+            ULONG pixelCount = m_BitmapInfor_Full->bmiHeader.biSizeImage / 4;
+            if (pixelCount * 2 == NextScreenLength)
+                ConvertRGB565ToBGRA((const uint16_t*)p, dst, pixelCount);
             break;
         }
         case ALGORITHM_H264: {
@@ -536,9 +1322,59 @@ VOID CScreenSpyDlg::DrawNextScreenDiff(bool keyFrame)
             }
             break;
         }
+        case ALGORITHM_RGB565: {
+            // RGB565 差分帧：解码每个差异块
+            for (LPBYTE end = p + NextScreenLength; p < end; ) {
+                ULONG pos = *(LPDWORD)p;                    // BGRA 字节偏移
+                ULONG pixelCount = *(LPDWORD)(p + sizeof(ULONG));  // 像素数量
+                p += 2 * sizeof(ULONG);
+
+                // RGB565 → BGRA 还原到目标位置
+                ConvertRGB565ToBGRA((const uint16_t*)p, dst + pos, pixelCount);
+                p += pixelCount * 2;  // RGB565 每像素 2 字节
+            }
+            break;
+        }
         case ALGORITHM_H264: {
-            if (Decode((LPBYTE)NextScreenData, NextScreenLength)) {
-                bChange = TRUE;
+            // Only decode locally if dialog is visible (skip when hidden for web-only viewing)
+            if (!m_bHide) {
+                if (Decode((LPBYTE)NextScreenData, NextScreenLength)) {
+                    bChange = TRUE;
+                }
+            }
+            // Broadcast H264 frame to web clients
+            // Format: [DeviceID:4][FrameType:1][DataLen:4][H264Data:N]
+            if (NextScreenLength > 0 && WebService().IsRunning()) {
+                // Detect H264 keyframe by checking NAL unit type
+                // NAL type 5 = IDR slice (keyframe), NAL type 7 = SPS, NAL type 8 = PPS
+                bool isKeyFrame = false;
+                LPBYTE h264Data = (LPBYTE)NextScreenData;
+                for (ULONG i = 0; i + 4 < NextScreenLength; i++) {
+                    // Look for start code: 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
+                    if ((h264Data[i] == 0 && h264Data[i+1] == 0 && h264Data[i+2] == 0 && h264Data[i+3] == 1) ||
+                        (h264Data[i] == 0 && h264Data[i+1] == 0 && h264Data[i+2] == 1)) {
+                        int nalOffset = (h264Data[i+2] == 1) ? i + 3 : i + 4;
+                        if (nalOffset < (int)NextScreenLength) {
+                            int nalType = h264Data[nalOffset] & 0x1F;
+                            if (nalType == 5 || nalType == 7 || nalType == 8) {
+                                isKeyFrame = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                std::vector<uint8_t> packet(4 + 1 + 4 + NextScreenLength);
+                uint32_t deviceIdLow = (uint32_t)(m_ClientID & 0xFFFFFFFF);
+                uint8_t frameType = isKeyFrame ? 1 : 0;
+                uint32_t dataLen = (uint32_t)NextScreenLength;
+
+                memcpy(packet.data(), &deviceIdLow, 4);
+                packet[4] = frameType;
+                memcpy(packet.data() + 5, &dataLen, 4);
+                memcpy(packet.data() + 9, NextScreenData, NextScreenLength);
+
+                WebService().BroadcastH264Frame(m_ClientID, packet.data(), packet.size());
             }
             break;
         }
@@ -559,8 +1395,115 @@ VOID CScreenSpyDlg::DrawNextScreenDiff(bool keyFrame)
 }
 
 
+VOID CScreenSpyDlg::DrawScrollFrame()
+{
+    // 滚动帧消息格式:
+    // 字节 0:        TOKEN_SCROLL_FRAME (99)
+    // 字节 1:        算法类型
+    // 字节 2-5:      光标 X
+    // 字节 6-9:      光标 Y
+    // 字节 10:       光标类型
+    // 字节 11:       滚动方向 (0=上, 1=下)
+    // 字节 12-15:    滚动距离 (像素)
+    // 字节 16-19:    边缘数据偏移 (字节)
+    // 字节 20-23:    边缘数据长度 (像素数)
+    // 字节 24+:      边缘像素数据
+
+    BOOL bChange = FALSE;
+    ULONG ulHeadLength = 1 + 1 + sizeof(POINT) + sizeof(BYTE);  // 11 字节
+
+    LPVOID FirstScreenData = m_BitmapData_Full;
+    if (FirstScreenData == NULL) return;
+
+    // 读取光标位置
+    POINT OldClientCursorPos;
+    memcpy(&OldClientCursorPos, &m_ClientCursorPos, sizeof(POINT));
+    memcpy(&m_ClientCursorPos, m_ContextObject->InDeCompressedBuffer.GetBuffer(2), sizeof(POINT));
+
+    if (memcmp(&OldClientCursorPos, &m_ClientCursorPos, sizeof(POINT)) != 0) {
+        bChange = TRUE;
+    }
+
+    // 读取光标类型
+    BYTE bOldCursorIndex = m_bCursorIndex;
+    m_bCursorIndex = m_ContextObject->InDeCompressedBuffer.GetBuffer(2 + sizeof(POINT))[0];
+    if (bOldCursorIndex != m_bCursorIndex) {
+        bChange = TRUE;
+    }
+
+    // 读取滚动参数
+    LPBYTE buffer = m_ContextObject->InDeCompressedBuffer.GetBuffer(ulHeadLength);
+    BYTE direction = buffer[0];
+    int scrollAmount = *(int*)(buffer + 1);
+    int edgeOffset = *(int*)(buffer + 5);
+    int edgePixelCount = *(int*)(buffer + 9);
+    LPBYTE edgeData = buffer + 13;
+
+    BYTE algorithm = m_ContextObject->InDeCompressedBuffer.GetBYTE(1);
+    LPBYTE dst = (LPBYTE)FirstScreenData;
+
+    // 1. 滚动现有位图缓冲区
+    // BMP is bottom-up: row 0 = screen bottom, row height-1 = screen top
+    int stride = m_BitmapInfor_Full->bmiHeader.biWidth * 4;
+    int height = m_BitmapInfor_Full->bmiHeader.biHeight;
+    int copyHeight = height - scrollAmount;
+
+    if (direction == SCROLL_DIR_UP) {
+        // 向上滚动：屏幕内容向下移，BMP 中高地址移到低地址
+        // 新内容填充到 BMP 高地址（屏幕顶部）
+        memmove(dst, dst + scrollAmount * stride, copyHeight * stride);
+    } else {
+        // 向下滚动：屏幕内容向上移，BMP 中低地址移到高地址
+        // 新内容填充到 BMP 低地址（屏幕底部）
+        memmove(dst + scrollAmount * stride, dst, copyHeight * stride);
+    }
+
+    // 2. 复制边缘数据
+    LPBYTE edgeDst = dst + edgeOffset;
+    switch (algorithm) {
+    case ALGORITHM_RGB565:
+        ConvertRGB565ToBGRA((const uint16_t*)edgeData, edgeDst, edgePixelCount);
+        break;
+    case ALGORITHM_GRAY:
+        for (int i = 0; i < edgePixelCount; ++i, edgeDst += 4) {
+            memset(edgeDst, edgeData[i], 3);
+            edgeDst[3] = 0xFF;
+        }
+        break;
+    case ALGORITHM_DIFF:
+    default:
+        memcpy(edgeDst, edgeData, edgePixelCount * 4);
+        break;
+    }
+
+    bChange = TRUE;
+    m_FrameID++;
+
+    if (bChange && !m_bHide) {
+        PostMessage(WM_PAINT);
+    }
+}
+
 bool CScreenSpyDlg::Decode(LPBYTE Buffer, int size)
 {
+    // 分辨率切换中，跳过解码避免访问无效缓冲区
+    // 但加入超时保护：5秒内客户端未响应则恢复（防止卡死）
+    if (m_bResolutionChanging) {
+        if (GetTickCount64() - m_AdaptiveQuality.lastResChangeTime > 5000) {
+            m_bResolutionChanging = false;  // 超时恢复
+            // 刷新解码器状态，丢弃之前的参考帧，等待下一个 I 帧
+            if (m_pCodecContext) {
+                avcodec_flush_buffers(m_pCodecContext);
+            }
+            Mprintf("分辨率切换超时，刷新解码器并恢复\n");
+        } else {
+            return false;
+        }
+    }
+    if (!m_BitmapData_Full || !m_BitmapInfor_Full) {
+        return false;
+    }
+
     // 解码数据.
     av_init_packet(&m_AVPacket);
 
@@ -602,99 +1545,171 @@ bool CScreenSpyDlg::Decode(LPBYTE Buffer, int size)
 
 void CScreenSpyDlg::OnPaint()
 {
-	if (m_bIsClosed) return;
+    if (m_bIsClosed) return;
     CPaintDC dc(this); // device context for painting
 
     if (m_bIsFirst) {
-        DrawTipString("请等待......");
+        if (!m_bQualitySwitch)
+            DrawTipString(_TR("请等待......"));
         return;
     }
 
-    m_bAdaptiveSize ?
-    StretchBlt(m_hFullDC, 0, 0, m_CRect.Width(), m_CRect.Height(), m_hFullMemDC, 0, 0, m_BitmapInfor_Full->bmiHeader.biWidth, m_BitmapInfor_Full->bmiHeader.biHeight, SRCCOPY) :
-    BitBlt(m_hFullDC, 0, 0, m_BitmapInfor_Full->bmiHeader.biWidth, m_BitmapInfor_Full->bmiHeader.biHeight, m_hFullMemDC, m_ulHScrollPos, m_ulVScrollPos, SRCCOPY);
+    int srcW = m_BitmapInfor_Full->bmiHeader.biWidth;
+    int srcH = m_BitmapInfor_Full->bmiHeader.biHeight;
+    if (m_bAdaptiveSize) {
+        int dstW = m_CRect.Width();
+        int dstH = m_CRect.Height();
+        // 尺寸相同时用 BitBlt（更快），否则用 StretchBlt
+        if (srcW == dstW && srcH == dstH) {
+            BitBlt(m_hFullDC, 0, 0, srcW, srcH, m_hFullMemDC, 0, 0, SRCCOPY);
+        } else {
+            StretchBlt(m_hFullDC, 0, 0, dstW, dstH, m_hFullMemDC, 0, 0, srcW, srcH, SRCCOPY);
+        }
+    } else {
+        BitBlt(m_hFullDC, 0, 0, srcW, srcH, m_hFullMemDC, m_ulHScrollPos, m_ulVScrollPos, SRCCOPY);
+    }
 
     if ((m_bIsCtrl && m_Settings.RemoteCursor) || m_bIsTraceCursor) {
-		CPoint ptLocal;
-		GetCursorPos(&ptLocal);
-		ScreenToClient(&ptLocal);
+        CPoint ptLocal;
+        GetCursorPos(&ptLocal);
+        ScreenToClient(&ptLocal);
 
-		CRect rcToolbar(0, 0, 0, 0);
-		if (m_pToolbar) m_pToolbar->GetWindowRect(&rcToolbar), ScreenToClient(&rcToolbar);
-		// 只有当本地鼠标不在工具栏区域时，才绘制远程位图光标
+        CRect rcToolbar(0, 0, 0, 0);
+        if (m_pToolbar) m_pToolbar->GetWindowRect(&rcToolbar), ScreenToClient(&rcToolbar);
+        // 只有当本地鼠标不在工具栏区域时，才绘制远程位图光标
         if (!rcToolbar.PtInRect(ptLocal)) {
 
             // 1. 计算缩放位置
             int drawX = m_bAdaptiveSize ? (int)(m_ClientCursorPos.x / m_wZoom) : (m_ClientCursorPos.x - m_ulHScrollPos);
             int drawY = m_bAdaptiveSize ? (int)(m_ClientCursorPos.y / m_hZoom) : (m_ClientCursorPos.y - m_ulVScrollPos);
 
-            // 2. 强制绘制
+            // 2. 获取光标句柄（支持自定义光标）
+            HCURSOR hCursor;
+            if (m_bCursorIndex == 254) {  // -2: 使用自定义光标
+                hCursor = (m_bUseCustomCursor && m_hCustomCursor) ? m_hCustomCursor : LoadCursor(NULL, IDC_ARROW);
+            } else if (m_bCursorIndex == 255) {  // -1: 不支持，回退到箭头
+                hCursor = LoadCursor(NULL, IDC_ARROW);
+            } else {
+                hCursor = m_CursorInfo.getCursorHandle(m_bCursorIndex);
+                if (!hCursor) hCursor = LoadCursor(NULL, IDC_ARROW);
+            }
+
+            // 3. 强制绘制
             DrawIconEx(
                 m_hFullDC,
                 drawX,
                 drawY,
-                m_CursorInfo.getCursorHandle(m_bCursorIndex == (BYTE)-1 ? 1 : m_bCursorIndex),
+                hCursor,
                 0, 0, 0, NULL, DI_NORMAL | DI_COMPAT
             );
         }
     }
     if (!m_bConnected && GetTickCount64() - m_nDisconnectTime>2000) {
-        DrawTipString("正在重连......", 2);
-	}
+        DrawTipString(_TR("正在重连......"), 2);
+    }
+    // 截图保存提示 (显示3秒，断线重连时不显示避免重叠)
+    if (m_bConnected && !m_strSaveNotice.empty() && GetTickCount64() - m_nSaveNoticeTime < 3000) {
+        RECT rcClient;
+        GetClientRect(&rcClient);
+        int cw = rcClient.right - rcClient.left;
+        int ch = rcClient.bottom - rcClient.top;
+
+        CString tipText;
+        tipText.FormatL("已保存: %s", m_strSaveNotice.c_str());
+
+        // 计算文字尺寸
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT hOldFont = (HFONT)SelectObject(m_hFullDC, hFont);
+        SIZE textSize;
+        GetTextExtentPoint32(m_hFullDC, tipText, tipText.GetLength(), &textSize);
+
+        int padding = 10;
+        int bannerW = textSize.cx + padding * 2;
+        int bannerH = textSize.cy + padding * 2;
+        int bannerX = (cw - bannerW) / 2;
+        int bannerY = ch - bannerH - 40;
+
+        // 半透明黑色背景
+        HDC hMemDC = CreateCompatibleDC(m_hFullDC);
+        HBITMAP hBmp = CreateCompatibleBitmap(m_hFullDC, bannerW, bannerH);
+        HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
+        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+        RECT rcBanner = { 0, 0, bannerW, bannerH };
+        FillRect(hMemDC, &rcBanner, hBrush);
+        DeleteObject(hBrush);
+
+        BLENDFUNCTION blend = { 0 };
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = 180;
+        AlphaBlend(m_hFullDC, bannerX, bannerY, bannerW, bannerH,
+                   hMemDC, 0, 0, bannerW, bannerH, blend);
+
+        SelectObject(hMemDC, hOldBmp);
+        DeleteObject(hBmp);
+        DeleteDC(hMemDC);
+
+        // 绘制白色文字
+        int oldBkMode = SetBkMode(m_hFullDC, TRANSPARENT);
+        COLORREF oldTextClr = SetTextColor(m_hFullDC, RGB(255, 255, 255));
+        RECT rcText = { bannerX + padding, bannerY + padding,
+                        bannerX + bannerW - padding, bannerY + bannerH - padding };
+        DrawText(m_hFullDC, tipText, -1, &rcText, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        SetBkMode(m_hFullDC, oldBkMode);
+        SetTextColor(m_hFullDC, oldTextClr);
+        SelectObject(m_hFullDC, hOldFont);
+    } else if (!m_strSaveNotice.empty()) {
+        m_strSaveNotice.clear();
+    }
 }
 
 BOOL CScreenSpyDlg::OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message)
 {
-	if ((m_bIsCtrl && m_Settings.RemoteCursor) && nHitTest == HTCLIENT)
-	{
-		::SetCursor(NULL); // 只要在客户区，始终隐藏系统光标
-		return TRUE;       // 告诉 Windows 我们处理过了
-	}
-	return __super::OnSetCursor(pWnd, nHitTest, message);
+    if ((m_bIsCtrl && m_Settings.RemoteCursor) && nHitTest == HTCLIENT) {
+        ::SetCursor(NULL); // 只要在客户区，始终隐藏系统光标
+        return TRUE;       // 告诉 Windows 我们处理过了
+    }
+    return __super::OnSetCursor(pWnd, nHitTest, message);
 }
 
 VOID CScreenSpyDlg::DrawTipString(CString strString, int fillMode)
 {
-	// fillMode: 0=不填充, 1=全黑, 2=半透明
-	RECT Rect;
-	GetClientRect(&Rect);
-	int width = Rect.right - Rect.left;
-	int height = Rect.bottom - Rect.top;
+    // fillMode: 0=不填充, 1=全黑, 2=半透明
+    RECT Rect;
+    GetClientRect(&Rect);
+    int width = Rect.right - Rect.left;
+    int height = Rect.bottom - Rect.top;
 
-	if (fillMode == 1)
-	{
-		// 原来的全黑效果
-		COLORREF BackgroundColor = RGB(0x00, 0x00, 0x00);
-		SetBkColor(m_hFullDC, BackgroundColor);
-		ExtTextOut(m_hFullDC, 0, 0, ETO_OPAQUE, &Rect, NULL, 0, NULL);
-	}
-	else if (fillMode == 2)
-	{
-		// 半透明效果
-		HDC hMemDC = CreateCompatibleDC(m_hFullDC);
-		HBITMAP hBitmap = CreateCompatibleBitmap(m_hFullDC, width, height);
-		HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
+    if (fillMode == 1) {
+        // 原来的全黑效果
+        COLORREF BackgroundColor = RGB(0x00, 0x00, 0x00);
+        SetBkColor(m_hFullDC, BackgroundColor);
+        ExtTextOut(m_hFullDC, 0, 0, ETO_OPAQUE, &Rect, NULL, 0, NULL);
+    } else if (fillMode == 2) {
+        // 半透明效果
+        HDC hMemDC = CreateCompatibleDC(m_hFullDC);
+        HBITMAP hBitmap = CreateCompatibleBitmap(m_hFullDC, width, height);
+        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hMemDC, hBitmap);
 
-		HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
-		FillRect(hMemDC, &Rect, hBrush);
-		DeleteObject(hBrush);
+        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(hMemDC, &Rect, hBrush);
+        DeleteObject(hBrush);
 
-		BLENDFUNCTION blend = { 0 };
-		blend.BlendOp = AC_SRC_OVER;
-		blend.SourceConstantAlpha = 150;
-		blend.AlphaFormat = 0;
+        BLENDFUNCTION blend = { 0 };
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = 150;
+        blend.AlphaFormat = 0;
 
-		AlphaBlend(m_hFullDC, 0, 0, width, height,
-			hMemDC, 0, 0, width, height, blend);
+        AlphaBlend(m_hFullDC, 0, 0, width, height,
+                   hMemDC, 0, 0, width, height, blend);
 
-		SelectObject(hMemDC, hOldBitmap);
-		DeleteObject(hBitmap);
-		DeleteDC(hMemDC);
-	}
+        SelectObject(hMemDC, hOldBitmap);
+        DeleteObject(hBitmap);
+        DeleteDC(hMemDC);
+    }
 
-	SetBkMode(m_hFullDC, TRANSPARENT);
-	SetTextColor(m_hFullDC, RGB(0xff, 0x00, 0x00));
-	DrawText(m_hFullDC, strString, -1, &Rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SetBkMode(m_hFullDC, TRANSPARENT);
+    SetTextColor(m_hFullDC, RGB(0xff, 0x00, 0x00));
+    DrawText(m_hFullDC, strString, -1, &Rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 }
 
 bool DirectoryExists(const char* path)
@@ -738,20 +1753,22 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         m_bIsCtrl = !m_bIsCtrl;
         SysMenu->CheckMenuItem(IDM_CONTROL, m_bIsCtrl ? MF_CHECKED : MF_UNCHECKED);
         SetClassLongPtr(m_hWnd, GCLP_HCURSOR, m_bIsCtrl ? (LONG_PTR)m_hRemoteCursor : (LONG_PTR)LoadCursor(NULL, IDC_NO));
+        // 控制模式：禁用本地 IME；查看模式：启用本地 IME
+        ImmAssociateContext(m_hWnd, m_bIsCtrl ? NULL : m_hOldIMC);
         break;
     }
     case IDM_FULLSCREEN: { // 全屏
         EnterFullScreen();
         SysMenu->CheckMenuItem(IDM_FULLSCREEN, MF_CHECKED); //菜单样式
-		BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = TRUE };
-		m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = TRUE };
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
         break;
     }
     case IDM_REMOTE_CURSOR: {
-		BYTE cmd[4] = { CMD_REMOTE_CURSOR, m_Settings.RemoteCursor = !m_Settings.RemoteCursor };
+        BYTE cmd[4] = { CMD_REMOTE_CURSOR, m_Settings.RemoteCursor = !m_Settings.RemoteCursor };
         SysMenu->CheckMenuItem(IDM_REMOTE_CURSOR, m_Settings.RemoteCursor ? MF_CHECKED : MF_UNCHECKED);
-		m_ContextObject->Send2Client(cmd, sizeof(cmd));
-		break;
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        break;
     }
     case IDM_SAVEDIB: {  // 快照保存
         SaveSnapshot();
@@ -773,8 +1790,8 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         FCCHandler handler = nID == IDM_SAVEAVI ? ENCODER_MJPEG : ENCODER_H264;
         int code;
         if (code = m_aviStream.Open(m_aviFile, m_BitmapInfor_Full, rate, handler)) {
-            MessageBoxL(CString("Create Video(*.avi) Failed:\n") + m_aviFile + "\r\n错误代码: " +
-                       CBmpToAvi::GetErrMsg(code).c_str(), "提示", MB_ICONINFORMATION);
+            MessageBoxL(CString("Create Video(*.avi) Failed:\n") + m_aviFile + "\r\n" + _TR("错误代码: ") +
+                        CBmpToAvi::GetErrMsg(code).c_str(), "提示", MB_ICONINFORMATION);
             m_aviFile = _T("");
         } else {
             ::SetTimer(m_hWnd, TIMER_ID, duration, NULL);
@@ -796,7 +1813,7 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         BYTE	bToken[2] = { CMD_MULTITHREAD_COMPRESS, (BYTE)threadNum };
         m_ContextObject->Send2Client(bToken, sizeof(bToken));
         SysMenu->CheckMenuItem(nID, threadNum ? MF_CHECKED : MF_UNCHECKED);
-		m_Settings.CompressThread = threadNum;
+        m_Settings.CompressThread = threadNum;
         break;
     }
 
@@ -804,9 +1821,9 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         const int strategy = 1;
         BYTE cmd[16] = { CMD_SCREEN_SIZE, (BYTE)strategy };
         m_ContextObject->Send2Client(cmd, sizeof(cmd));
-		m_Settings.ScreenStrategy = strategy;
-		SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_CHECKED);
-		SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_UNCHECKED);
+        m_Settings.ScreenStrategy = strategy;
+        SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_CHECKED);
+        SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_UNCHECKED);
         break;
     }
 
@@ -815,8 +1832,38 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         BYTE cmd[16] = { CMD_SCREEN_SIZE, (BYTE)strategy };
         m_ContextObject->Send2Client(cmd, sizeof(cmd));
         m_Settings.ScreenStrategy = strategy;
-		SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_CHECKED);
-		SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCREEN_1080P, MF_CHECKED);
+        SysMenu->CheckMenuItem(IDM_ORIGINAL_SIZE, MF_UNCHECKED);
+        break;
+    }
+
+    case IDM_ENABLE_SSE2: {
+        BYTE cmd[4] = { CMD_INSTRUCTION_SET, m_Settings.CpuSpeedup = !m_Settings.CpuSpeedup };
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        SysMenu->CheckMenuItem(IDM_ENABLE_SSE2, m_Settings.CpuSpeedup == 1 ? MF_CHECKED : MF_UNCHECKED);
+        break;
+    }
+    case IDM_FAST_STRETCH: {
+        bool bFast = !GetFastStretchMode();
+        SetFastStretchMode(bFast);
+        SysMenu->CheckMenuItem(IDM_FAST_STRETCH, bFast ? MF_CHECKED : MF_UNCHECKED);
+        // 更新当前窗口的 StretchBltMode
+        SetStretchBltMode(m_hFullDC, bFast ? COLORONCOLOR : HALFTONE);
+        if (!bFast) SetBrushOrgEx(m_hFullDC, 0, 0, NULL);
+        break;
+    }
+    case IDM_CUSTOM_CURSOR: {
+        m_bUseCustomCursor = !m_bUseCustomCursor;
+        SysMenu->CheckMenuItem(IDM_CUSTOM_CURSOR, m_bUseCustomCursor ? MF_CHECKED : MF_UNCHECKED);
+        // 如果当前是自定义光标，立即更新显示
+        if (m_bCursorIndex == 254 && m_bIsCtrl) {
+            HCURSOR cursor = (m_bUseCustomCursor && m_hCustomCursor) ? m_hCustomCursor : LoadCursor(NULL, IDC_ARROW);
+            if (m_Settings.RemoteCursor) {
+                Invalidate(FALSE);
+            } else {
+                SetClassLongPtr(m_hWnd, GCLP_HCURSOR, (LONG_PTR)cursor);
+            }
+        }
         break;
     }
 
@@ -829,21 +1876,86 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         int fps = 10 + (nID - IDM_FPS_10) * 5;
         BYTE	bToken[2] = { CMD_FPS, nID == IDM_FPS_UNLIMITED ? 255 : fps };
         m_ContextObject->Send2Client(bToken, sizeof(bToken));
-		m_Settings.MaxFPS = nID == IDM_FPS_UNLIMITED ? 255 : fps;
+        m_Settings.MaxFPS = nID == IDM_FPS_UNLIMITED ? 255 : fps;
         for (int i = IDM_FPS_10; i <= IDM_FPS_UNLIMITED; i++) {
-			SysMenu->CheckMenuItem(i, MF_UNCHECKED);
-		}
-		SysMenu->CheckMenuItem(nID, MF_CHECKED);
+            SysMenu->CheckMenuItem(i, MF_UNCHECKED);
+        }
+        SysMenu->CheckMenuItem(nID, MF_CHECKED);
+        break;
+    }
+
+    case IDM_SCROLL_DETECT_OFF:
+    case IDM_SCROLL_DETECT_2:
+    case IDM_SCROLL_DETECT_4:
+    case IDM_SCROLL_DETECT_8: {
+        // 菜单ID到间隔值的映射
+        int interval = nID == IDM_SCROLL_DETECT_OFF ? 0 :
+                       nID == IDM_SCROLL_DETECT_2 ? 2 :
+                       nID == IDM_SCROLL_DETECT_4 ? 4 : 8;
+        m_Settings.ScrollDetectInterval = interval;
+        // 更新菜单选中状态
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_OFF, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_2, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_4, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(IDM_SCROLL_DETECT_8, MF_UNCHECKED);
+        SysMenu->CheckMenuItem(nID, MF_CHECKED);
+        // 实时通知客户端更新间隔
+        BYTE cmd[8] = { CMD_SCROLL_INTERVAL };
+        memcpy(cmd + 1, &interval, sizeof(int));
+        m_ContextObject->Send2Client(cmd, 1 + sizeof(int));
+        break;
+    }
+
+    case IDM_QUALITY_OFF: { // 关闭质量控制
+        m_AdaptiveQuality.enabled = false;
+        m_Settings.QualityLevel = QUALITY_DISABLED;
+        UpdateQualityMenuCheck(SysMenu);
+        // 发送给客户端保存 (QualityLevel=-2 表示关闭)
+        BYTE cmd[4] = { CMD_QUALITY_LEVEL, (BYTE)QUALITY_DISABLED, 1 };  // persist=1
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        UpdateWindowTitle();
+        Mprintf("关闭质量控制，使用原有算法设置\n");
+        break;
+    }
+
+    case IDM_ADAPTIVE_QUALITY: { // 自适应质量开关
+        m_AdaptiveQuality.enabled = true;
+        m_Settings.QualityLevel = QUALITY_ADAPTIVE;
+        UpdateQualityMenuCheck(SysMenu);
+        // 发送给客户端保存 (QualityLevel=-1 表示自适应)
+        BYTE cmd[4] = { CMD_QUALITY_LEVEL, (BYTE)QUALITY_ADAPTIVE, 1 };  // persist=1
+        m_ContextObject->Send2Client(cmd, sizeof(cmd));
+        // 启用时立即评估一次
+        EvaluateQuality();
+        UpdateWindowTitle();
+        break;
+    }
+
+    case IDM_QUALITY_ULTRA:
+    case IDM_QUALITY_HIGH:
+    case IDM_QUALITY_GOOD:
+    case IDM_QUALITY_MEDIUM:
+    case IDM_QUALITY_LOW:
+    case IDM_QUALITY_MINIMAL: {
+        // 手动设置质量等级
+        int level = nID - IDM_QUALITY_ULTRA;
+        // 关闭自适应模式
+        m_AdaptiveQuality.enabled = false;
+        m_Settings.QualityLevel = level;
+        // 应用选择的等级 (persist=true 保存到客户端)
+        ApplyQualityLevel(level, true);
+        UpdateQualityMenuCheck(SysMenu);
+        UpdateWindowTitle();
+        Mprintf("手动设置质量: %s\n", GetQualityName(level));
         break;
     }
 
     case IDM_TRACE_CURSOR: { // 跟踪被控端鼠标
-        m_bIsTraceCursor = !m_bIsTraceCursor; //这里在改变数据
-        SysMenu->CheckMenuItem(IDM_TRACE_CURSOR, m_bIsTraceCursor ? MF_CHECKED : MF_UNCHECKED);//在菜单打钩不打钩
-        m_bAdaptiveSize = !m_bIsTraceCursor;
-        ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);
+        m_bIsTraceCursor = !m_bIsTraceCursor;
+        SysMenu->CheckMenuItem(IDM_TRACE_CURSOR, m_bIsTraceCursor ? MF_CHECKED : MF_UNCHECKED);
+        // 不再强制切换自适应模式，两种模式都支持跟踪光标
         // 重绘消除或显示鼠标
-        OnPaint();
+        Invalidate(FALSE);
         break;
     }
     case IDM_BLOCK_INPUT: { // 锁定服务端鼠标和键盘
@@ -854,6 +1966,22 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
         bToken[0] = COMMAND_SCREEN_BLOCK_INPUT;
         bToken[1] = !bIsChecked;
         m_ContextObject->Send2Client(bToken, sizeof(bToken));
+
+        // 同步工具栏按钮状态
+        if (m_pToolbar) {
+            m_pToolbar->m_bBlockInput = !bIsChecked;
+            m_pToolbar->UpdateButtonIcons();
+        }
+        break;
+    }
+    case IDM_RESTORE_CONSOLE: { // RDP会话归位
+        BYTE bToken = CMD_RESTORE_CONSOLE;
+        m_ContextObject->Send2Client(&bToken, 1);
+        break;
+    }
+    case IDM_RESET_VIRTUAL_DESKTOP: { // 重置虚拟桌面
+        BYTE bToken = CMD_RESET_VIRTUAL_DESKTOP;
+        m_ContextObject->Send2Client(&bToken, 1);
         break;
     }
     case IDM_GET_CLIPBOARD: { //想要Client的剪贴板内容
@@ -867,8 +1995,21 @@ void CScreenSpyDlg::OnSysCommand(UINT nID, LPARAM lParam)
     }
     case IDM_ADAPTIVE_SIZE: {
         m_bAdaptiveSize = !m_bAdaptiveSize;
+        if (!m_bAdaptiveSize && m_BitmapInfor_Full) {
+            SetScrollRange(SB_HORZ, 0, m_BitmapInfor_Full->bmiHeader.biWidth);
+            SetScrollRange(SB_VERT, 0, m_BitmapInfor_Full->bmiHeader.biHeight);
+        }
         ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);
         SysMenu->CheckMenuItem(IDM_ADAPTIVE_SIZE, m_bAdaptiveSize ? MF_CHECKED : MF_UNCHECKED);
+        break;
+    }
+    case IDM_AUDIO_TOGGLE: {
+        m_Settings.AudioEnabled = !m_Settings.AudioEnabled;
+        SendAudioCtrl(m_Settings.AudioEnabled ? CYCLEAUDIO_ENABLE : CYCLEAUDIO_DISABLE, 1);
+        SysMenu->CheckMenuItem(IDM_AUDIO_TOGGLE, m_Settings.AudioEnabled ? MF_CHECKED : MF_UNCHECKED);
+        if (!m_Settings.AudioEnabled) {
+            StopAudioPlayback();
+        }
         break;
     }
     }
@@ -897,16 +2038,210 @@ void CScreenSpyDlg::OnTimer(UINT_PTR nIDEvent)
         }
         CWnd* pMain = AfxGetMainWnd();
         if (pMain)
-            ::PostMessageA(pMain->GetSafeHwnd(), WM_SHOWNOTIFY, (WPARAM)new CharMsg("连接已断开"), 
-                (LPARAM)new CharMsg(m_IPAddress + " - 远程桌面连接已断开"));
+            ::PostMessageA(pMain->GetSafeHwnd(), WM_SHOWNOTIFY, (WPARAM)new CharMsg(_TR("连接已断开")),
+                           (LPARAM)new CharMsg(m_IPAddress + _TR(" - 远程桌面连接已断开")));
         this->PostMessageA(WM_CLOSE, 0, 0);
         return;
-	}
+    }
     if (nIDEvent == 3) {
         KillTimer(3);
         PostMessageA(WM_PAINT);
     }
+    if (nIDEvent == 4) {
+        // 计算传输速率并更新标题
+        m_dTransferRate = m_ulBytesThisSecond / 1024.0;  // KB/s
+        m_ulBytesThisSecond = 0;
+        // 使用EMA平滑帧率 (alpha=0.3)，避免跳跃
+        double currentFPS = (double)m_ulFramesThisSecond;
+        if (m_dFrameRate == 0) {
+            m_dFrameRate = currentFPS;  // 首次直接赋值
+        } else {
+            m_dFrameRate = 0.3 * currentFPS + 0.7 * m_dFrameRate;
+        }
+        m_ulFramesThisSecond = 0;
+        // 自适应质量评估
+        EvaluateQuality();
+        UpdateWindowTitle();
+
+        // 更新全屏状态信息窗口
+        if (m_pStatusInfoWnd && m_pStatusInfoWnd->IsVisible()) {
+            CString qualityName = m_Settings.QualityLevel == QUALITY_DISABLED ? _T("Off") :
+                CString(GetQualityName(m_AdaptiveQuality.currentLevel));
+            m_pStatusInfoWnd->UpdateInfo(m_dFrameRate, m_dTransferRate, qualityName);
+        }
+    }
     __super::OnTimer(nIDEvent);
+}
+
+void CScreenSpyDlg::UpdateWindowTitle()
+{
+    if (!m_BitmapInfor_Full) return;
+
+    int width = m_BitmapInfor_Full->bmiHeader.biWidth;
+    int height = m_BitmapInfor_Full->bmiHeader.biHeight;
+
+    // 构建质量名称：关闭显示 "Off"，自适应和手动都会显示 "当前等级"
+    CString qualityName = m_Settings.QualityLevel == QUALITY_DISABLED ? "" : 
+            CString(" | ") + GetQualityName(m_AdaptiveQuality.currentLevel);
+
+    CString strTitle;
+    UINT fps = (UINT)(m_dFrameRate + 0.5);  // 四舍五入显示
+    if (m_dTransferRate >= 1024) {
+        strTitle.FormatL("%s - 远程桌面控制 %d×%d | %u FPS | %.1f MB/s%s",
+            m_IPAddress, width, height, fps, m_dTransferRate / 1024, qualityName.GetString());
+    } else {
+        strTitle.FormatL("%s - 远程桌面控制 %d×%d | %u FPS | %.0f KB/s%s",
+            m_IPAddress, width, height, fps, m_dTransferRate, qualityName.GetString());
+    }
+    // 追加剪贴板操作提示
+    strTitle += (m_Settings.ScreenType == 2) ?
+        _TR(" [远程右键复制, 本地 Ctrl+V 粘贴]") : _TR(" [远程 Ctrl+C 复制, 本地 Ctrl+V 粘贴]");
+    SetWindowText(strTitle);
+}
+
+const char* CScreenSpyDlg::GetQualityName(int level)
+{
+    static const char* names[] = {
+        "Ultra", "High", "Good", "Medium", "Low", "Minimal"
+    };
+    if (level == QUALITY_DISABLED)
+        return "Off";
+    if (level == QUALITY_ADAPTIVE)
+        return "Auto";
+    if (level >= 0 && level < QUALITY_COUNT)
+        return names[level];
+    return "Unknown";
+}
+
+void CScreenSpyDlg::UpdateQualityMenuCheck(CMenu* SysMenu)
+{
+    if (!SysMenu) SysMenu = GetSystemMenu(FALSE);
+    // 先全部取消勾选
+    SysMenu->CheckMenuItem(IDM_QUALITY_OFF, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_ADAPTIVE_QUALITY, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_ULTRA, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_HIGH, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_GOOD, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_MEDIUM, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_LOW, MF_UNCHECKED);
+    SysMenu->CheckMenuItem(IDM_QUALITY_MINIMAL, MF_UNCHECKED);
+    // 勾选当前项
+    if (m_Settings.QualityLevel == QUALITY_DISABLED) {
+        SysMenu->CheckMenuItem(IDM_QUALITY_OFF, MF_CHECKED);
+    } else if (m_AdaptiveQuality.enabled) {
+        SysMenu->CheckMenuItem(IDM_ADAPTIVE_QUALITY, MF_CHECKED);
+    } else if (m_AdaptiveQuality.currentLevel >= 0 && m_AdaptiveQuality.currentLevel < QUALITY_COUNT) {
+        SysMenu->CheckMenuItem(IDM_QUALITY_ULTRA + m_AdaptiveQuality.currentLevel, MF_CHECKED);
+    }
+}
+
+int CScreenSpyDlg::GetClientRTT()
+{
+    if (!m_pParent || !m_ClientID) return 0;
+
+    // 遍历列表查找对应的 ClientID
+    auto ctx = m_pParent->FindHost(m_ClientID);
+    if (ctx) {
+        auto pingStr = ctx->GetClientData(ONLINELIST_PING);
+        return _ttoi(pingStr);
+    }
+    return 0;
+}
+
+void CScreenSpyDlg::EvaluateQuality()
+{
+    if (!m_AdaptiveQuality.enabled) return;
+
+    // 0. 启动延迟：1分钟内不进行自适应调整
+    ULONGLONG now = GetTickCount64();
+    if (now - m_AdaptiveQuality.startTime < 60000) return;
+
+    // 1. 获取RTT
+    int rtt = GetClientRTT();
+    if (rtt <= 0) return;
+    m_AdaptiveQuality.lastRTT = rtt;
+
+    // 2. 计算目标等级
+    int targetLevel = GetTargetQualityLevel(rtt, m_bUsingFRP);
+    int currentLevel = m_AdaptiveQuality.currentLevel;
+
+    if (targetLevel == currentLevel) {
+        m_AdaptiveQuality.stableCount = 0;
+        return;
+    }
+
+    // 3. 检查是否涉及分辨率变化
+    int currentMaxWidth = GetQualityProfile(currentLevel).maxWidth;
+    int targetMaxWidth = GetQualityProfile(targetLevel).maxWidth;
+    bool resolutionChange = (currentMaxWidth != targetMaxWidth);
+
+    // 4. 冷却时间检查
+    // - 分辨率变化：降级15秒，升级30秒
+    // - 纯FPS/算法变化：3秒
+    ULONGLONG cooldown = 3000;
+    if (resolutionChange) {
+        cooldown = (targetLevel > currentLevel) ? 15000 : 30000;
+        if (now - m_AdaptiveQuality.lastResChangeTime < cooldown)
+            return;
+    } else {
+        if (now - m_AdaptiveQuality.lastChangeTime < cooldown)
+            return;
+    }
+
+    // 5. 降级：快速响应 (连续2次)
+    if (targetLevel > currentLevel) {
+        m_AdaptiveQuality.stableCount++;
+        if (m_AdaptiveQuality.stableCount >= 2) {
+            ApplyQualityLevel(targetLevel);
+        }
+    }
+    // 6. 升级：谨慎处理 (连续5次，且只升一级)
+    else if (targetLevel < currentLevel) {
+        m_AdaptiveQuality.stableCount++;
+        if (m_AdaptiveQuality.stableCount >= 5) {
+            ApplyQualityLevel(currentLevel - 1);
+        }
+    }
+}
+
+void CScreenSpyDlg::ApplyQualityLevel(int level, bool persist)
+{
+    if (level < 0 || level >= QUALITY_COUNT) return;
+
+    const QualityProfile& profile = GetQualityProfile(level);
+    int oldMaxWidth = m_AdaptiveQuality.currentMaxWidth;
+    int newMaxWidth = profile.maxWidth;
+
+    Mprintf("ApplyQualityLevel: level=%d, oldMaxWidth=%d, newMaxWidth=%d, algo=%d\n",
+            level, oldMaxWidth, newMaxWidth, profile.algorithm);
+
+    m_AdaptiveQuality.currentLevel = level;
+    m_AdaptiveQuality.lastChangeTime = GetTickCount64();
+    m_AdaptiveQuality.stableCount = 0;
+
+    // 1. 发送 FPS 和算法 (persist=1 表示手动选择需要保存)
+    BYTE cmd[4] = { CMD_QUALITY_LEVEL, (BYTE)level, (BYTE)persist };
+    m_ContextObject->Send2Client(cmd, sizeof(cmd));
+
+    // 2. 如果分辨率变化，发送 CMD_SCREEN_SIZE
+    if (newMaxWidth != oldMaxWidth) {
+        // 标记分辨率切换中，阻止 Decode 访问旧缓冲区
+        m_bResolutionChanging = true;
+        // 自适应调整且分辨率变化时不显示"请等待"，手动切换时显示
+        if (!persist) m_bQualitySwitch = true;
+        m_AdaptiveQuality.currentMaxWidth = newMaxWidth;
+        m_AdaptiveQuality.lastResChangeTime = GetTickCount64();
+
+        BYTE sizeCmd[16] = { CMD_SCREEN_SIZE, 2 };  // strategy=2 表示自定义maxWidth
+        memcpy(sizeCmd + 2, &newMaxWidth, sizeof(int));
+        m_ContextObject->Send2Client(sizeCmd, 10);
+
+        Mprintf("发送 CMD_SCREEN_SIZE: strategy=2, maxWidth=%d\n", newMaxWidth);
+    } else {
+        Mprintf("分辨率未变化，不发送 CMD_SCREEN_SIZE\n");
+    }
+
+    Mprintf("质量切换: %s (FPS=%d, Algo=%d)\n", GetQualityName(level), profile.maxFPS, profile.algorithm);
 }
 
 BOOL CScreenSpyDlg::PreTranslateMessage(MSG* pMsg)
@@ -923,8 +2258,15 @@ BOOL CScreenSpyDlg::PreTranslateMessage(MSG* pMsg)
     case WM_MBUTTONDOWN:
     case WM_MBUTTONUP:
     case WM_MOUSEMOVE:
-    case WM_MOUSEWHEEL: {
         SendScaledMouseMessage(pMsg, true);
+        break;
+    case WM_MOUSEWHEEL: {
+        // WM_MOUSEWHEEL 的 lParam 是屏幕坐标，需要转换为客户区坐标
+        POINT pt = { GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam) };
+        ScreenToClient(&pt);
+        MSG wheelMsg = *pMsg;
+        wheelMsg.lParam = MAKELPARAM(pt.x, pt.y);
+        SendScaledMouseMessage(&wheelMsg, true);
     }
     break;
     case WM_KEYDOWN:
@@ -937,13 +2279,13 @@ BOOL CScreenSpyDlg::PreTranslateMessage(MSG* pMsg)
                 (GetKeyState(VK_CONTROL) & 0x8000) &&
                 (GetKeyState(VK_MENU) & 0x8000)) {
                 LeaveFullScreen();
-				BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = FALSE };
-				m_ContextObject->Send2Client(cmd, sizeof(cmd));
+                BYTE cmd[4] = { CMD_FULL_SCREEN, m_Settings.FullScreen = FALSE };
+                m_ContextObject->Send2Client(cmd, sizeof(cmd));
                 return TRUE;
             }
         }
         if (pMsg->wParam != VK_LWIN && pMsg->wParam != VK_RWIN) {
-            SendScaledMouseMessage(pMsg, true);
+            SendScaledMouseMessage(pMsg, false);  // false: 保留键盘 lParam
         }
         if (pMsg->message == WM_SYSKEYDOWN && pMsg->wParam == VK_F4) {
             return TRUE; // 屏蔽 Alt + F4
@@ -1002,15 +2344,17 @@ VOID CScreenSpyDlg::SendCommand(const MYMSG* Msg)
     m_ContextObject->Send2Client(szData, length);
 }
 
-BOOL CScreenSpyDlg::SaveSnapshot(void)
+void CScreenSpyDlg::SaveSnapshot(void)
 {
-    auto path = GetScreenShotPath(this, m_IPAddress, "位图文件(*.bmp)|*.bmp|", "bmp");
+    auto path = GetScreenShotPath(this, m_IPAddress, _TR("位图文件(*.bmp)|*.bmp|"), "bmp");
     if (path.empty())
-        return FALSE;
+        return;
 
-    WriteBitmap(m_BitmapInfor_Full, m_BitmapData_Full, path.c_str());
+    if (!WriteBitmap(m_BitmapInfor_Full, m_BitmapData_Full, path.c_str()))
+        return;
 
-    return true;
+    m_strSaveNotice = path;
+    m_nSaveNoticeTime = GetTickCount64();
 }
 
 
@@ -1160,12 +2504,8 @@ void CScreenSpyDlg::OnVScroll(UINT nSBCode, UINT nPos, CScrollBar* pScrollBar)
 void CScreenSpyDlg::EnterFullScreen()
 {
     if (1) {
-        // 1. 获取鼠标位置
-        POINT pt;
-        GetCursorPos(&pt);
-
-        // 2. 获取鼠标所在显示器
-        HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        // 1. 获取对话框当前所在的显示器
+        HMONITOR hMonitor = MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi = { sizeof(mi) };
         if (!GetMonitorInfo(hMonitor, &mi))
             return;
@@ -1180,8 +2520,8 @@ void CScreenSpyDlg::EnterFullScreen()
         lStyle &= ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER);
         SetWindowLong(m_hWnd, GWL_STYLE, lStyle);
 
-        // 5. 隐藏滚动条
-        ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);  // 隐藏水平和垂直滚动条
+        // 5. 全屏无条件隐藏滚动条
+        ShowScrollBar(SB_BOTH, FALSE);
 
         // 6. 重新调整窗口大小并更新
         SetWindowPos(&CWnd::wndTop, rcMonitor.left, rcMonitor.top, rcMonitor.right - rcMonitor.left,
@@ -1190,14 +2530,54 @@ void CScreenSpyDlg::EnterFullScreen()
         if (!m_pToolbar) {
             m_pToolbar = new CToolbarDlg(this);
             m_pToolbar->Create(IDD_TOOLBAR_DLG, this);
-            // OnInitDialog() 会根据 m_bLocked 和 m_bOnTop 设置正确的位置和可见性
-            // 如果未锁定，初始隐藏在屏幕外
+            // OnInitDialog() 会根据 m_bLocked 和 m_nPosition 设置正确的位置和可见性
+            // 如果未锁定，隐藏在屏幕边缘（尺寸为1像素，不跑到相邻屏幕）
             if (!m_pToolbar->m_bLocked) {
-                int cx = GetSystemMetrics(SM_CXSCREEN);
-                int cy = GetSystemMetrics(SM_CYSCREEN);
-                int y = m_pToolbar->m_bOnTop ? -40 : cy;  // 根据位置设置隐藏在上方或下方
-                m_pToolbar->SetWindowPos(&wndTopMost, 0, y, cx, 40, SWP_HIDEWINDOW);
+                int monWidth = rcMonitor.right - rcMonitor.left;
+                int monHeight = rcMonitor.bottom - rcMonitor.top;
+                int hw = 480; // 水平工具栏宽度
+                int vh = 480; // 垂直工具栏高度
+                int hx = rcMonitor.left + (monWidth - hw) / 2;
+                switch (m_pToolbar->m_nPosition) {
+                case 0:
+                    m_pToolbar->SetWindowPos(&wndTopMost, hx, rcMonitor.top, hw, 1, SWP_HIDEWINDOW);
+                    break;
+                case 1:
+                    m_pToolbar->SetWindowPos(&wndTopMost, hx, rcMonitor.bottom - 1, hw, 1, SWP_HIDEWINDOW);
+                    break;
+                case 2: {
+                    int vy = rcMonitor.top + (monHeight - vh) / 2;
+                    m_pToolbar->SetWindowPos(&wndTopMost, rcMonitor.left, vy, 1, vh, SWP_HIDEWINDOW);
+                    break;
+                }
+                case 3: {
+                    int vy = rcMonitor.top + (monHeight - vh) / 2;
+                    m_pToolbar->SetWindowPos(&wndTopMost, rcMonitor.right - 1, vy, 1, vh, SWP_HIDEWINDOW);
+                    break;
+                }
+                }
             }
+            // 同步系统菜单的锁定输入状态到工具栏
+            CMenu* pSysMenu = GetSystemMenu(FALSE);
+            if (pSysMenu) {
+                BOOL bBlockInput = pSysMenu->GetMenuState(IDM_BLOCK_INPUT, MF_BYCOMMAND) & MF_CHECKED;
+                m_pToolbar->m_bBlockInput = (bBlockInput != 0);
+                m_pToolbar->UpdateButtonIcons();
+            }
+        }
+
+        // 创建状态信息窗口
+        if (!m_pStatusInfoWnd) {
+            m_pStatusInfoWnd = new CStatusInfoWnd();
+            m_pStatusInfoWnd->Create(this);
+        }
+        m_pStatusInfoWnd->UpdatePosition(rcMonitor);
+        // 同步工具栏透明度
+        if (m_pToolbar) {
+            m_pStatusInfoWnd->SetOpacityLevel(m_pToolbar->m_nOpacityLevel);
+        }
+        if (m_pToolbar && m_pToolbar->m_bShowStatusInfo) {
+            m_pStatusInfoWnd->Show();
         }
 
         // 7. 标记全屏模式
@@ -1210,12 +2590,17 @@ void CScreenSpyDlg::EnterFullScreen()
 // 全屏退出成功则返回true
 bool CScreenSpyDlg::LeaveFullScreen()
 {
-    if (1){
+    if (1) {
         KillTimer(1);
         if (m_pToolbar) {
             m_pToolbar->DestroyWindow();
             delete m_pToolbar;
             m_pToolbar = nullptr;
+        }
+
+        // 隐藏状态信息窗口
+        if (m_pStatusInfoWnd) {
+            m_pStatusInfoWnd->Hide();
         }
 
         // 1. 恢复窗口样式
@@ -1227,8 +2612,12 @@ bool CScreenSpyDlg::LeaveFullScreen()
         SetWindowPlacement(&m_struOldWndpl);
         SetWindowPos(&CWnd::wndTop, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
-        // 3. 显示滚动条
-        ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);  // 显示水平和垂直滚动条
+        // 3. 显示滚动条（全屏期间可能发生了质量切换，需要补设范围）
+        if (!m_bAdaptiveSize && m_BitmapInfor_Full) {
+            SetScrollRange(SB_HORZ, 0, m_BitmapInfor_Full->bmiHeader.biWidth);
+            SetScrollRange(SB_VERT, 0, m_BitmapInfor_Full->bmiHeader.biHeight);
+        }
+        ShowScrollBar(SB_BOTH, !m_bAdaptiveSize);
 
         // 4. 标记退出全屏
         m_Settings.FullScreen = false;
@@ -1262,14 +2651,12 @@ BOOL CScreenSpyDlg::OnMouseWheel(UINT nFlags, short zDelta, CPoint pt)
 void CScreenSpyDlg::OnMouseMove(UINT nFlags, CPoint point)
 {
     if (m_Settings.RemoteCursor) {
-        if (m_pToolbar != NULL && ::IsWindow(m_pToolbar->m_hWnd) && m_pToolbar->IsWindowVisible())
-        {
+        if (m_pToolbar != NULL && ::IsWindow(m_pToolbar->m_hWnd) && m_pToolbar->IsWindowVisible()) {
             CRect rcToolbar;
             m_pToolbar->GetWindowRect(&rcToolbar);
             ScreenToClient(&rcToolbar); // 转换到主窗口坐标系
 
-            if (rcToolbar.PtInRect(point))
-            {
+            if (rcToolbar.PtInRect(point)) {
                 // 如果鼠标在工具栏区域，直接显示本地光标并返回，不发送远程指令
                 ::SetCursor(LoadCursor(NULL, IDC_ARROW));
                 return;
@@ -1279,7 +2666,7 @@ void CScreenSpyDlg::OnMouseMove(UINT nFlags, CPoint point)
             // 关键：在控制模式下，强制设置光标为空，隐藏本地物理箭头
             ::SetCursor(NULL);
         }
-    }else if (!m_bMouseTracking) {
+    } else if (!m_bMouseTracking) {
         m_bMouseTracking = true;
         SetClassLongPtr(m_hWnd, GCLP_HCURSOR, m_bIsCtrl ? (LONG_PTR)m_hRemoteCursor : (LONG_PTR)LoadCursor(NULL, IDC_NO));
     }
@@ -1298,6 +2685,20 @@ void CScreenSpyDlg::OnMouseLeave()
 void CScreenSpyDlg::OnKillFocus(CWnd* pNewWnd)
 {
     __super::OnKillFocus(pNewWnd);
+
+    // 清理远程修饰键状态，防止 Alt/Ctrl/Shift 卡住
+    // 场景：用户按住 Alt 后切换窗口，KEYUP 不会发送到远程，导致修饰键卡住
+    if (m_bIsCtrl && m_ContextObject) {
+        static const WORD modifierKeys[] = { VK_MENU, VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN };
+        for (WORD vk : modifierKeys) {
+            MYMSG msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.message = WM_KEYUP;
+            msg.wParam = vk;
+            msg.lParam = (MapVirtualKey(vk, MAPVK_VK_TO_VSC) << 16) | 0xC0000001; // 扫描码 + 释放标志
+            SendCommand(&msg);
+        }
+    }
 }
 
 
@@ -1332,6 +2733,8 @@ void CScreenSpyDlg::UpdateCtrlStatus(BOOL ctrl)
 {
     m_bIsCtrl = ctrl;
     SetClassLongPtr(m_hWnd, GCLP_HCURSOR, m_bIsCtrl ? (LONG_PTR)m_hRemoteCursor : (LONG_PTR)LoadCursor(NULL, IDC_NO));
+    // 控制模式：禁用本地 IME；查看模式：启用本地 IME
+    ImmAssociateContext(m_hWnd, m_bIsCtrl ? NULL : m_hOldIMC);
 }
 
 void CScreenSpyDlg::OnDropFiles(HDROP hDropInfo)
@@ -1347,21 +2750,300 @@ void CScreenSpyDlg::OnDropFiles(HDROP hDropInfo)
         std::string GetPwdHash();
         std::string GetHMAC(int offset);
         auto files = PreprocessFilesSimple(list);
-        auto str = BuildMultiStringPath(files);
-        BYTE* szBuffer = new BYTE[1 + 80 + str.size()];
-        szBuffer[0] = { COMMAND_GET_FOLDER };
-        std::string masterId = GetPwdHash(), hmac = GetHMAC(100);
-        memcpy((char*)szBuffer + 1, masterId.c_str(), masterId.length());
-        memcpy((char*)szBuffer + 1 + masterId.length(), hmac.c_str(), hmac.length());
-        memcpy(szBuffer + 1 + 80, str.data(), str.size());
-        auto md5 = CalcMD5FromBytes((BYTE*)str.data(), str.size());
-        m_pParent->m_CmdList.PutCmd(md5);
-        m_ContextObject->Send2Client(szBuffer, 81 + str.size());
-        Mprintf("【Ctrl+V】 从本地拖拽文件到远程: %s \n", md5.c_str());
-        SAFE_DELETE_ARRAY(szBuffer);
+
+        // 检查客户端是否支持 V2
+        uint64_t clientID = GetClientID();
+        context* mainCtx = m_pParent->FindHost(clientID);
+
+        if (mainCtx && SupportsFileTransferV2(mainCtx)) {
+            // V2 传输
+            m_pParent->SendFilesToClientV2(mainCtx, files);
+            Mprintf("【拖拽】 [本地 -> 远程] V2 传输: %zu 个文件\n", files.size());
+        } else {
+            // V1 传输（兼容旧客户端）
+            auto str = BuildMultiStringPath(files);
+            BYTE* szBuffer = new BYTE[1 + 80 + str.size()];
+            szBuffer[0] = { COMMAND_GET_FOLDER };
+            std::string masterId = GetPwdHash(), hmac = GetHMAC(100);
+            memcpy((char*)szBuffer + 1, masterId.c_str(), masterId.length());
+            memcpy((char*)szBuffer + 1 + masterId.length(), hmac.c_str(), hmac.length());
+            memcpy(szBuffer + 1 + 80, str.data(), str.size());
+            auto md5 = CalcMD5FromBytes((BYTE*)str.data(), str.size());
+            m_pParent->m_CmdList.PutCmd(md5);
+            m_ContextObject->Send2Client(szBuffer, 81 + str.size());
+            Mprintf("【拖拽】 [本地 -> 远程] V1 传输: %s\n", md5.c_str());
+            SAFE_DELETE_ARRAY(szBuffer);
+        }
     }
 
     DragFinish(hDropInfo);
 
     CDialogBase::OnDropFiles(hDropInfo);
+}
+
+// ========== 音频播放实现 ==========
+
+void CScreenSpyDlg::SendAudioCtrl(BYTE enable, BYTE persist)
+{
+    AudioCtrlCmd cmd;
+    cmd.cmd = CMD_AUDIO_CTRL;
+    cmd.enable = enable;
+    cmd.persist = persist;
+    m_ContextObject->Send2Client((LPBYTE)&cmd, sizeof(cmd));
+    Mprintf("[ScreenSpy] 发送音频控制: enable=%d, persist=%d\n", enable, persist);
+}
+
+#if USING_OPUS
+#include "../../compress/opus/opus_wrapper.h"
+#endif
+
+BOOL CScreenSpyDlg::InitAudioPlayback(const AudioFormat* fmt)
+{
+    if (m_bAudioPlaying) return TRUE;
+
+    // 保存压缩类型
+    m_nAudioCompression = fmt->compression;
+
+    // 设置波形格式 (waveOut 始终使用 PCM)
+    memset(&m_AudioFormat, 0, sizeof(m_AudioFormat));
+    m_AudioFormat.wFormatTag = WAVE_FORMAT_PCM;
+    m_AudioFormat.nChannels = fmt->channels;
+    m_AudioFormat.nSamplesPerSec = fmt->sampleRate;
+    m_AudioFormat.wBitsPerSample = fmt->bitsPerSample;
+    m_AudioFormat.nBlockAlign = fmt->blockAlign;
+    m_AudioFormat.nAvgBytesPerSec = fmt->sampleRate * fmt->blockAlign;
+    m_AudioFormat.cbSize = 0;
+
+    // 打开波形输出设备 (使用 CALLBACK_WINDOW 接收播放完成通知)
+    MMRESULT result = waveOutOpen(&m_hWaveOut, WAVE_MAPPER, &m_AudioFormat,
+                                   (DWORD_PTR)m_hWnd, 0, CALLBACK_WINDOW);
+    if (result != MMSYSERR_NOERROR) {
+        Mprintf("[ScreenSpy] waveOutOpen 失败: %d\n", result);
+        return FALSE;
+    }
+
+    // 分配 waveOut 缓冲区
+    for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
+        m_pAudioBuf[i] = new BYTE[AUDIO_BUF_SIZE];
+        memset(&m_WaveHdr[i], 0, sizeof(WAVEHDR));
+        m_WaveHdr[i].lpData = (LPSTR)m_pAudioBuf[i];
+        m_WaveHdr[i].dwBufferLength = AUDIO_BUF_SIZE;
+        waveOutPrepareHeader(m_hWaveOut, &m_WaveHdr[i], sizeof(WAVEHDR));
+    }
+
+    // 分配环形缓冲区
+    m_pRingBuf = new BYTE[RING_BUF_SIZE];
+    m_nRingHead = m_nRingTail = m_nRingDataLen = 0;
+    m_nPrebufferCount = 0;
+
+#if USING_OPUS
+    // 初始化 Opus 解码器
+    if (m_nAudioCompression == AUDIO_COMPRESS_OPUS) {
+        COpusDecoder* pDecoder = new COpusDecoder();
+        if (pDecoder->Init(fmt->sampleRate, fmt->channels)) {
+            m_pOpusDecoder = pDecoder;
+            m_pOpusDecodeBuffer = new short[960 * 2 * 2];  // 最大 960 samples * 2 channels * 2 (安全余量)
+            Mprintf("[ScreenSpy] Opus 解码器初始化成功\n");
+        } else {
+            delete pDecoder;
+            Mprintf("[ScreenSpy] Opus 解码器初始化失败\n");
+        }
+    }
+#endif
+
+    m_nAudioBufIndex = 0;
+    m_bAudioPlaying = TRUE;
+    Mprintf("[ScreenSpy] 音频播放已初始化: %d Hz, %d ch, %d bit, 压缩=%d\n",
+            fmt->sampleRate, fmt->channels, fmt->bitsPerSample, fmt->compression);
+    return TRUE;
+}
+
+void CScreenSpyDlg::StopAudioPlayback()
+{
+    if (!m_bAudioPlaying) return;
+
+    m_bAudioPlaying = FALSE;
+
+    if (m_hWaveOut) {
+        waveOutReset(m_hWaveOut);
+        for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
+            if (m_pAudioBuf[i]) {
+                waveOutUnprepareHeader(m_hWaveOut, &m_WaveHdr[i], sizeof(WAVEHDR));
+                delete[] m_pAudioBuf[i];
+                m_pAudioBuf[i] = nullptr;
+            }
+        }
+        waveOutClose(m_hWaveOut);
+        m_hWaveOut = NULL;
+    }
+
+    // 清理环形缓冲区
+    if (m_pRingBuf) {
+        delete[] m_pRingBuf;
+        m_pRingBuf = nullptr;
+    }
+    m_nRingHead = m_nRingTail = m_nRingDataLen = 0;
+    m_nPrebufferCount = 0;
+
+#if USING_OPUS
+    // 清理 Opus 解码器
+    if (m_pOpusDecoder) {
+        delete (COpusDecoder*)m_pOpusDecoder;
+        m_pOpusDecoder = nullptr;
+    }
+    if (m_pOpusDecodeBuffer) {
+        delete[] m_pOpusDecodeBuffer;
+        m_pOpusDecodeBuffer = nullptr;
+    }
+#endif
+    m_nAudioCompression = 0;
+
+    Mprintf("[ScreenSpy] 音频播放已停止\n");
+}
+
+void CScreenSpyDlg::OnAudioData(BYTE* pData, UINT32 len)
+{
+    if (len < 1) return;
+
+    // 包计数（仅用于调试，可移除）
+    // static int s_audioPacketCount = 0;
+    // if (++s_audioPacketCount <= 5 || s_audioPacketCount % 500 == 0) {
+    //     Mprintf("[Audio] 收到音频包 #%d, len=%u\n", s_audioPacketCount, len);
+    // }
+
+    BYTE hasFormat = pData[0];
+    UINT32 offset = 1;
+
+    // 如果带有格式信息，初始化播放
+    if (hasFormat && len >= 1 + sizeof(AudioFormat)) {
+        AudioFormat* fmt = (AudioFormat*)(pData + 1);
+        if (!m_bAudioPlaying) {
+            InitAudioPlayback(fmt);
+        }
+        offset = 1 + sizeof(AudioFormat);
+
+        // 检测到音频数据，更新菜单状态
+        if (!m_Settings.AudioEnabled) {
+            m_Settings.AudioEnabled = TRUE;
+            CMenu* SysMenu = GetSystemMenu(FALSE);
+            if (SysMenu) {
+                SysMenu->CheckMenuItem(IDM_AUDIO_TOGGLE, MF_CHECKED);
+            }
+        }
+    }
+
+    if (!m_bAudioPlaying || !m_hWaveOut || !m_pRingBuf) return;
+
+    // 获取音频数据
+    BYTE* pAudioData = pData + offset;
+    UINT32 audioLen = len - offset;
+    if (audioLen == 0) return;
+
+    // 帧对齐参数
+    DWORD blockAlign = m_AudioFormat.nBlockAlign;
+    if (blockAlign == 0) blockAlign = 4;  // 默认 stereo 16-bit
+
+#if USING_OPUS
+    // Opus 解码
+    if (m_nAudioCompression == AUDIO_COMPRESS_OPUS && m_pOpusDecoder && m_pOpusDecodeBuffer) {
+        COpusDecoder* pDecoder = (COpusDecoder*)m_pOpusDecoder;
+        int decodedSamples = pDecoder->Decode(pAudioData, audioLen, m_pOpusDecodeBuffer, 960 * 2);
+        if (decodedSamples > 0) {
+            pAudioData = (BYTE*)m_pOpusDecodeBuffer;
+            audioLen = decodedSamples * m_AudioFormat.nChannels * sizeof(short);
+        } else {
+            return;  // 解码失败，丢弃此包
+        }
+    }
+#endif
+
+    // 帧对齐：确保数据量是 blockAlign 的整数倍
+    audioLen = (audioLen / blockAlign) * blockAlign;
+    if (audioLen == 0) return;
+
+    // 检查环形缓冲区是否有足够空间
+    DWORD freeSpace = RING_BUF_SIZE - m_nRingDataLen;
+    if (audioLen > freeSpace) {
+        // 缓冲区满了，丢弃新数据（避免打断正在播放的音频）
+        audioLen = (freeSpace / blockAlign) * blockAlign;
+        if (audioLen == 0) return;
+    }
+
+    // 写入数据（可能需要分两次写入，处理环绕）
+    DWORD firstPart = min(audioLen, RING_BUF_SIZE - m_nRingHead);
+    memcpy(m_pRingBuf + m_nRingHead, pAudioData, firstPart);
+    if (audioLen > firstPart) {
+        memcpy(m_pRingBuf, pAudioData + firstPart, audioLen - firstPart);
+    }
+    m_nRingHead = (m_nRingHead + audioLen) % RING_BUF_SIZE;
+    m_nRingDataLen += audioLen;
+
+    // 预缓冲：等待积累足够数据再开始播放
+    if (m_nPrebufferCount < PREBUFFER_TARGET) {
+        m_nPrebufferCount++;
+        if (m_nPrebufferCount < PREBUFFER_TARGET) {
+            return;  // 还没积累够，等待
+        }
+        Mprintf("[Audio] 预缓冲完成，开始播放 (缓冲: %u bytes)\n", m_nRingDataLen);
+    }
+
+    // 填充可用的 waveOut 缓冲区
+    FeedAudioBuffers();
+}
+
+void CScreenSpyDlg::FeedAudioBuffers()
+{
+    if (!m_bAudioPlaying || !m_hWaveOut || !m_pRingBuf) return;
+
+    // 帧对齐参数
+    DWORD blockAlign = m_AudioFormat.nBlockAlign;
+    if (blockAlign == 0) blockAlign = 4;  // 默认 stereo 16-bit
+
+    // 尽可能填满所有空闲的 waveOut 缓冲区
+    for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
+        int bufIdx = (m_nAudioBufIndex + i) % AUDIO_BUFFER_COUNT;
+        WAVEHDR* pHdr = &m_WaveHdr[bufIdx];
+
+        // 如果缓冲区正在使用，跳过
+        if (pHdr->dwFlags & WHDR_INQUEUE) continue;
+
+        // 检查环形缓冲区是否有足够数据（至少一帧）
+        if (m_nRingDataLen < blockAlign) break;
+
+        // 计算要读取的数据量（对齐到帧边界）
+        DWORD readLen = min(m_nRingDataLen, (DWORD)AUDIO_BUF_SIZE);
+        readLen = (readLen / blockAlign) * blockAlign;  // 截断到帧边界
+        if (readLen == 0) break;
+
+        // 从环形缓冲区读取（可能需要分两次读取，处理环绕）
+        DWORD firstPart = min(readLen, RING_BUF_SIZE - m_nRingTail);
+        memcpy(m_pAudioBuf[bufIdx], m_pRingBuf + m_nRingTail, firstPart);
+        if (readLen > firstPart) {
+            memcpy(m_pAudioBuf[bufIdx] + firstPart, m_pRingBuf, readLen - firstPart);
+        }
+        m_nRingTail = (m_nRingTail + readLen) % RING_BUF_SIZE;
+        m_nRingDataLen -= readLen;
+
+        // 播放
+        pHdr->dwBufferLength = readLen;
+        MMRESULT mr = waveOutWrite(m_hWaveOut, pHdr, sizeof(WAVEHDR));
+        if (mr != MMSYSERR_NOERROR) {
+            Mprintf("[Audio] waveOutWrite 失败: %d\n", mr);
+        }
+    }
+
+    // 更新下一个缓冲区索引（找到第一个空闲的）
+    for (int i = 0; i < AUDIO_BUFFER_COUNT; i++) {
+        if (!(m_WaveHdr[m_nAudioBufIndex].dwFlags & WHDR_INQUEUE)) break;
+        m_nAudioBufIndex = (m_nAudioBufIndex + 1) % AUDIO_BUFFER_COUNT;
+    }
+}
+
+LRESULT CScreenSpyDlg::OnWaveOutDone(WPARAM wParam, LPARAM lParam)
+{
+    // waveOut 缓冲区播放完成，尝试填充更多数据
+    if (m_bAudioPlaying && m_nRingDataLen > 0) {
+        FeedAudioBuffers();
+    }
+    return 0;
 }
